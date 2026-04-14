@@ -214,3 +214,4 @@ __marimo__/
 *.jpg
 .DS_store
 log
+tests
