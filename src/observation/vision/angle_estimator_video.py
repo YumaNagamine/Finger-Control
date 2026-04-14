@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
-import pandas as pd
 
 # Ensure repository root is importable when running as a script.
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,9 +47,13 @@ def store_video(frames: list, fps: float, output_path: Path) -> None:
 
 
 def store_csv(measure: list, fps: float, output_path: Path) -> None:
-    df = pd.DataFrame(measure, columns=["frame", "angle_0", "angle_1", "angle_2"])
-    df["time"] = df["frame"] / fps
-    df.to_csv(output_path, index=False)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["frame", "angle_0", "angle_1", "angle_2", "time"])
+        for row in measure:
+            frame, angle_0, angle_1, angle_2 = row
+            time_s = float(frame) / float(fps)
+            writer.writerow([frame, angle_0, angle_1, angle_2, time_s])
 
 
 def main() -> None:
