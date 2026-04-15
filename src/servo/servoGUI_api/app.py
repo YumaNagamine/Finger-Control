@@ -67,7 +67,7 @@ class ServoControlGUIAPI:
         self.root.geometry("900x950")
         self.logger = _build_logger()
 
-        self.port = os.getenv("SERVOGUI_PORT", "COM7")
+        self.port = os.getenv("SERVOGUI_PORT", "COM4")
         self.baud_rate = int(os.getenv("SERVOGUI_BAUD", "921600"))
         self.timeout = float(os.getenv("SERVOGUI_TIMEOUT", "0.03"))
         self.mock_mode = _env_truthy("SERVOGUI_MOCK")
