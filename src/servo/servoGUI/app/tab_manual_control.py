@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk
+import time
 
 class ManualControlTab:
     def __init__(self, parent, app):
