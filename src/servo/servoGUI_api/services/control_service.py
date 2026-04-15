@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from servo.servoGUI_api.infra.servo_session import ServoSession
+from servo.core.session import ServoSession
 
 
 class ControlService:

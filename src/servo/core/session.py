@@ -2,19 +2,35 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from typing import Optional, Protocol
 
-from servo.servoGUI_api.app_state import AppState
-from servo.servoGUI_api.event_bus import EventBus
-from servo.servoGUI_api.infra.line_parser import parse_line
-from servo.servoGUI_api.infra.mock_backend import MockServoAPI
+from servo.core.line_parser import parse_line
+from servo.core.mock_backend import MockServoAPI
+
+
+class AppStateLike(Protocol):
+    num_motors: int
+
+    def set_connected(self, connected: bool) -> None:
+        ...
+
+    def set_error(self, message: Optional[str]) -> None:
+        ...
+
+    def update_telemetry(self, timestamp_ms: int, positions, loads, speeds) -> None:
+        ...
+
+
+class EventBusLike(Protocol):
+    def publish(self, event_name: str, payload) -> None:
+        ...
 
 
 class ServoSession:
     def __init__(
         self,
-        app_state: AppState,
-        event_bus: EventBus,
+        app_state: AppStateLike,
+        event_bus: EventBusLike,
         port: str,
         baud_rate: int,
         timeout: float,

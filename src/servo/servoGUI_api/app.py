@@ -9,7 +9,7 @@ from tkinter import ttk
 
 from servo.servoGUI_api.app_state import AppState
 from servo.servoGUI_api.event_bus import EventBus
-from servo.servoGUI_api.infra.servo_session import ServoSession
+from servo.core.session import ServoSession
 from servo.servoGUI_api.services.control_service import ControlService
 from servo.servoGUI_api.services.id_service import IDService
 from servo.servoGUI_api.services.record_service import RecordService
