@@ -212,6 +212,7 @@ __marimo__/
 *.csv
 *.txt
 *.jpg
+*.png
 .DS_store
 log
 tests
