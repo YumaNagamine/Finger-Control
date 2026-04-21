@@ -18,21 +18,13 @@ if str(ROOT) not in sys.path:
 from observation.camera.camera_utils import apply_camera_settings, resolve_backend
 from observation.vision.weight_displacement_processor import WeightDisplacementProcessor
 from utils.config_loader import load_config
+from utils.path_utils import resolve_path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config_weight_displacement.json"
 DEFAULT_CAMERA_CONFIG = SCRIPT_DIR.parent / "camera" / "camera_config.json"
 DEFAULT_SCALE_CONFIG = SCRIPT_DIR.parent / "camera" / "scale_params.json"
-
-
-def _resolve_path(raw_path: str | None, base_dir: Path) -> Path | None:
-    if not raw_path:
-        return None
-    path = Path(raw_path)
-    if path.is_absolute():
-        return path
-    return (base_dir / path).resolve()
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,7 +70,7 @@ def main() -> None:
     output_cfg = config["output"]
 
     if not args.video and input_cfg.get("video_path"):
-        resolved_video = _resolve_path(str(input_cfg.get("video_path")), config_path.parent)
+        resolved_video = resolve_path(str(input_cfg.get("video_path")), config_path.parent)
         if resolved_video is not None:
             input_cfg = dict(input_cfg)
             input_cfg["video_path"] = str(resolved_video)
@@ -96,8 +88,8 @@ def main() -> None:
     pipeline_name = str(measurement_cfg.get("pipeline", "weight_marker"))
     camera_id = str(measurement_cfg.get("camera_id", "cam0"))
 
-    csv_dir = _resolve_path(output_cfg.get("csv_dir", "output/weight_csv"), config_path.parent)
-    video_dir = _resolve_path(output_cfg.get("overlay_video_dir", "output/weight_video"), config_path.parent)
+    csv_dir = resolve_path(output_cfg.get("csv_dir", "output/weight_csv"), config_path.parent)
+    video_dir = resolve_path(output_cfg.get("overlay_video_dir", "output/weight_video"), config_path.parent)
     if csv_dir is None or video_dir is None:
         raise ValueError("output.csv_dir and output.overlay_video_dir must be provided.")
     csv_dir.mkdir(parents=True, exist_ok=True)
