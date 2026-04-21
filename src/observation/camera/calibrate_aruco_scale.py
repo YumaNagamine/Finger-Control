@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+from observation.camera.camera_utils import apply_camera_settings, resolve_backend
 from utils.config_loader import load_config
 
 
@@ -24,42 +25,14 @@ DEFAULT_ARUCO_CONFIG = SCRIPT_DIR / "aruco_config.json"
 DEFAULT_OUTPUT_CONFIG = SCRIPT_DIR / "scale_params.json"
 
 
-def _resolve_backend(backend_name: str | None) -> int | None:
-    if not backend_name:
-        return None
-    return {
-        "CAP_DSHOW": cv2.CAP_DSHOW,
-        "CAP_ANY": cv2.CAP_ANY,
-    }.get(backend_name)
-
-
-def _fourcc_from_str(code: str | None) -> int | None:
-    if not code or len(code) != 4:
-        return None
-    return cv2.VideoWriter_fourcc(*code)
-
-
-def _apply_camera_settings(cap: cv2.VideoCapture, camera_cfg: dict) -> None:
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(camera_cfg.get("width", 1600)))
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(camera_cfg.get("height", 1200)))
-    cap.set(cv2.CAP_PROP_FPS, float(camera_cfg.get("target_fps", 90)))
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, int(camera_cfg.get("buffersize", 0)))
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(camera_cfg.get("auto_exposure", 1)))
-    cap.set(cv2.CAP_PROP_GAIN, float(camera_cfg.get("gain", 0)))
-    cap.set(cv2.CAP_PROP_EXPOSURE, float(camera_cfg.get("exposure", -11)))
-    capture_fourcc = _fourcc_from_str(camera_cfg.get("capture_fourcc", "MJPG"))
-    if capture_fourcc is not None:
-        cap.set(cv2.CAP_PROP_FOURCC, capture_fourcc)
-
-
 def _capture_single_frame(camera_cfg: dict, read_attempts: int = 30) -> tuple:
     cam_num = int(camera_cfg.get("index", 0))
-    backend = _resolve_backend(camera_cfg.get("backend"))
+    backend = resolve_backend(camera_cfg.get("backend"))
     cap = cv2.VideoCapture(cam_num, backend) if backend is not None else cv2.VideoCapture(cam_num)
     if not cap.isOpened():
         raise RuntimeError("Camera not available.")
 
-    _apply_camera_settings(cap, camera_cfg)
+    apply_camera_settings(cap, camera_cfg)
 
     frame = None
     try:
