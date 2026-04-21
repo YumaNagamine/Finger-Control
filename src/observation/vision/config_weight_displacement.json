@@ -1,0 +1,52 @@
+{
+  "input": {
+    "mode": "camera",
+    "video_path": ""
+  },
+  "measurement": {
+    "pipeline": "weight_marker",
+    "camera_id": "cam0",
+    "num_weights": 6,
+    "baseline_frames": 30,
+    "positive_direction": "up"
+  },
+  "processing": {
+    "color": {
+      "mode": "target_tolerance",
+      "lab_target": {
+        "l": 150,
+        "a": 170,
+        "b": 150
+      },
+      "lab_tolerance": {
+        "l": 60,
+        "ab": 20
+      }
+    },
+    "morphology": {
+      "kernel_size": 5,
+      
+      "open_iterations": 1,
+      "close_iterations": 1
+    },
+    "components": {
+      "min_area": 80,
+      "max_area": 6000
+    },
+    "tracking": {
+      "hold_last_value_on_missing": true
+    },
+    "lanes": {
+      "x_ranges": [],
+      "y_range": []
+    }
+  },
+  "output": {
+    "csv_dir": "output/weight_csv",
+    "overlay_video_dir": "output/weight_video",
+    "filename_prefix": "weight_disp",
+    "save_overlay_video": true,
+    "show_window": true,
+    "fallback_fps": 30.0
+  }
+}

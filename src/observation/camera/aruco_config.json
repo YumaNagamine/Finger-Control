@@ -1,0 +1,10 @@
+{
+  "marker_length_mm": 20.0,
+  "marker_id": 0,
+  "dictionary": "DICT_4X4_50",
+  "camera_read_attempts": 30,
+  "quality": {
+    "min_edge_px": 80.0,
+    "max_edge_ratio": 0.03
+  }
+}
