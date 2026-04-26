@@ -9,5 +9,7 @@
   "gain": 0,
   "exposure": -11,
   "capture_fourcc": "MJPG",
-  "writer_fourcc": "mp4v"
+  "writer_fourcc": "mp4v",
+  "use_chessboard_calibration": false,
+  "calibration_path": "camera_calibration.json"
 }

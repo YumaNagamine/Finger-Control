@@ -15,7 +15,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from observation.camera.camera_utils import apply_camera_settings, resolve_backend
+from observation.camera.camera_utils import (
+    apply_camera_settings,
+    resolve_backend,
+    setup_undistortion_from_config,
+    undistort_frame,
+)
 from observation.vision.dlc_angle_processor import DLCAngleProcessor
 from utils.config_loader import load_config
 from utils.path_utils import resolve_path
@@ -109,6 +114,7 @@ def main() -> None:
         raise ValueError("Input mode must be either 'camera' or 'video'.")
 
     cap, source_name = _open_capture(mode, input_cfg, camera_cfg, args.video)
+    calibration = setup_undistortion_from_config(camera_cfg, log_prefix="[dlc-angle]") if mode == "camera" else None
 
     csv_dir = resolve_path(output_cfg.get("csv_dir", "logs/deeplabcut_test/csv"), config_path.parent)
     video_dir = resolve_path(output_cfg.get("overlay_video_dir", "logs/deeplabcut_test/video"), config_path.parent)
@@ -146,6 +152,7 @@ def main() -> None:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                frame = undistort_frame(frame, calibration)
 
                 elapsed_s = time.perf_counter() - start_time
                 result, overlay = processor.process_frame(frame_bgr=frame, frame_idx=frame_idx)

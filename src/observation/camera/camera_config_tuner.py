@@ -14,7 +14,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from observation.camera.camera_utils import apply_camera_settings, resolve_backend
+from observation.camera.camera_utils import (
+    apply_camera_settings,
+    resolve_backend,
+    setup_undistortion_from_config,
+    undistort_frame,
+)
 from utils.config_loader import load_config
 
 
@@ -78,6 +83,7 @@ class CameraConfigTunerApp:
         self.config_path = config_path
         self.camera_cfg = load_config(config_path)
         self.cap: cv2.VideoCapture | None = None
+        self.calibration = None
         self._closing = False
         self._after_id: str | None = None
         self.photo = None
@@ -227,6 +233,7 @@ class CameraConfigTunerApp:
 
         self.camera_cfg["index"] = cam_index
         self.camera_cfg["backend"] = backend_name or "CAP_ANY"
+        self.calibration = setup_undistortion_from_config(self.camera_cfg, log_prefix="[camera-tuner]")
         self.status_var.set(f"Opened camera index={cam_index}, backend={backend_name or 'default'}")
 
     def _apply_live_settings(self) -> None:
@@ -244,6 +251,7 @@ class CameraConfigTunerApp:
         ok, frame = self.cap.read()
         if ok:
             try:
+                frame = undistort_frame(frame, self.calibration)
                 display_frame = _resize_preview(frame, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
                 self.photo = _to_photo_image_bgr(display_frame)
                 self.preview_label.configure(image=self.photo, text="")

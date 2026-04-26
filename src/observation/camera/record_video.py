@@ -8,10 +8,22 @@ from pathlib import Path
 import cv2
 
 try:
-    from observation.camera.camera_utils import apply_camera_settings, fourcc_from_str, resolve_backend
+    from observation.camera.camera_utils import (
+        apply_camera_settings,
+        fourcc_from_str,
+        resolve_backend,
+        setup_undistortion_from_config,
+        undistort_frame,
+    )
 except ModuleNotFoundError:
     # Supports running this script directly from the camera directory.
-    from camera_utils import apply_camera_settings, fourcc_from_str, resolve_backend
+    from camera_utils import (
+        apply_camera_settings,
+        fourcc_from_str,
+        resolve_backend,
+        setup_undistortion_from_config,
+        undistort_frame,
+    )
 
 from utils.config_loader import load_config
 
@@ -42,6 +54,7 @@ def main() -> None:
     height = int(camera_cfg.get("height", 1200))
     target_fps = float(camera_cfg.get("target_fps", 90))
     apply_camera_settings(cap, camera_cfg)
+    calibration = setup_undistortion_from_config(camera_cfg)
 
     TEST_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -56,6 +69,7 @@ def main() -> None:
             ret, frame = cap.read()
             if not ret:
                 continue
+            frame = undistort_frame(frame, calibration)
             writer.write(frame)
             frame_count += 1
             if args.frame_limit and frame_count >= args.frame_limit:

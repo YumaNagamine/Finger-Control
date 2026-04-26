@@ -14,6 +14,7 @@ import ttkbootstrap as ttk
 from ttkbootstrap.widgets.scrolled import ScrolledText
 
 from controller.interface import build_interface
+from observation.camera.camera_utils import setup_undistortion_from_config, undistort_frame
 from utils.config_loader import load_config
 
 
@@ -225,6 +226,7 @@ def camera_process(shared, camera_cfg: dict):
     cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
     if capture_fourcc is not None:
         cap.set(cv2.CAP_PROP_FOURCC, capture_fourcc)
+    calibration = setup_undistortion_from_config(camera_cfg, log_prefix="[controller-gui]")
 
     RAW_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -237,6 +239,7 @@ def camera_process(shared, camera_cfg: dict):
             ret, frame = cap.read()
             if not ret:
                 continue
+            frame = undistort_frame(frame, calibration)
             writer.write(frame)
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             shared["photo"] = Image.fromarray(image)

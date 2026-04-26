@@ -15,7 +15,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from observation.camera.camera_utils import apply_camera_settings, resolve_backend
+from observation.camera.camera_utils import (
+    apply_camera_settings,
+    resolve_backend,
+    setup_undistortion_from_config,
+    undistort_frame,
+)
 from utils.config_loader import load_config
 
 
@@ -33,13 +38,14 @@ def _capture_single_frame(camera_cfg: dict, read_attempts: int = 30) -> tuple:
         raise RuntimeError("Camera not available.")
 
     apply_camera_settings(cap, camera_cfg)
+    calibration = setup_undistortion_from_config(camera_cfg, log_prefix="[aruco-scale]")
 
     frame = None
     try:
         for _ in range(max(1, read_attempts)):
             ret, maybe_frame = cap.read()
             if ret:
-                frame = maybe_frame
+                frame = undistort_frame(maybe_frame, calibration)
                 break
             time.sleep(0.03)
     finally:
