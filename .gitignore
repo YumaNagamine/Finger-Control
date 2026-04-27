@@ -216,3 +216,5 @@ __marimo__/
 .DS_store
 log
 tests
+src/obeservation/camera/scale_params.json
+deeplabcut
