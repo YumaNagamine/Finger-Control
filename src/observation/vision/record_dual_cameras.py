@@ -64,12 +64,9 @@ def _optional_list_value(values: object, idx: int) -> object | None:
 def _join_preview(frame0: np.ndarray, frame1: np.ndarray) -> np.ndarray:
     h0, w0 = frame0.shape[:2]
     h1, w1 = frame1.shape[:2]
-    if h0 == h1:
-        return cv2.hconcat([frame0, frame1])
-    target_h = min(h0, h1)
-    resized0 = cv2.resize(frame0, (int(w0 * (target_h / h0)), target_h), interpolation=cv2.INTER_AREA)
-    resized1 = cv2.resize(frame1, (int(w1 * (target_h / h1)), target_h), interpolation=cv2.INTER_AREA)
-    return cv2.hconcat([resized0, resized1])
+    if h0 != h1:
+        frame1 = cv2.resize(frame1, (w1, h0), interpolation=cv2.INTER_AREA)
+    return cv2.hconcat([frame0, frame1])
 
 
 def main() -> None:
@@ -120,8 +117,8 @@ def main() -> None:
     frame_limit = int(capture_cfg.get("frame_limit", 0))
     target_fps = float(capture_cfg.get("target_fps", 0.0))
     warmup_frames = max(0, int(capture_cfg.get("warmup_frames", 5)))
-    if target_fps < 0.0:
-        raise ValueError("capture.target_fps must be >= 0.0")
+    if target_fps <= 0.0:
+        raise ValueError("capture.target_fps must be > 0.0")
 
     record_dir = resolve_path(output_cfg.get("record_dir", "logs/dual_camera/recordings"), PROJECT_ROOT)
     if record_dir is None:
@@ -173,8 +170,7 @@ def main() -> None:
 
         h0, w0 = frame0.shape[:2]
         h1, w1 = frame1.shape[:2]
-        fallback_fps = float(output_cfg.get("fallback_fps", 30.0))
-        out_fps = target_fps if target_fps > 0.0 else fallback_fps
+        out_fps = target_fps
 
         cam0_video_path = session_dir / "cam0.mp4"
         cam1_video_path = session_dir / "cam1.mp4"
@@ -192,6 +188,8 @@ def main() -> None:
 
         if show_window:
             cv2.namedWindow(preview_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(preview_name, max(1, (w0 + w1) // 2), max(1, h0 // 2))
+            print("Press ESC in the preview window to stop recording.")
 
         with (
             cam0_csv_path.open("w", newline="", encoding="utf-8") as f_cam0,
