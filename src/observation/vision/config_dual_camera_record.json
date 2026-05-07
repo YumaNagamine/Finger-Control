@@ -1,0 +1,19 @@
+{
+  "camera": {
+    "indices": [0, 1],
+    "names": ["cam_dlc", "cam_weight"]
+  },
+  "capture": {
+    "target_fps": 60,
+    "duration_s": 0.0,
+    "frame_limit": 0,
+    "warmup_frames": 5
+  },
+  "output": {
+    "record_dir": "logs/dual_camera/recordings",
+    "filename_prefix": "dual_record",
+    "writer_fourcc": "mp4v",
+    "show_window": true,
+    "fallback_fps": 30.0
+  }
+}
