@@ -16,7 +16,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from observation.camera.camera_utils import apply_camera_settings, fourcc_from_str, resolve_backend
+from observation.camera.camera_utils import (
+    apply_camera_settings,
+    fourcc_from_str,
+    resolve_backend,
+    setup_undistortion_from_config,
+    undistort_frame,
+)
 from utils.config_loader import load_config
 from utils.path_utils import resolve_path
 
@@ -49,6 +55,12 @@ def _open_camera(camera_cfg: dict, fallback_name: str) -> tuple[cv2.VideoCapture
     return cap, str(camera_cfg.get("name", fallback_name))
 
 
+def _optional_list_value(values: object, idx: int) -> object | None:
+    if isinstance(values, list) and len(values) == 2:
+        return values[idx]
+    return None
+
+
 def _join_preview(frame0: np.ndarray, frame1: np.ndarray) -> np.ndarray:
     h0, w0 = frame0.shape[:2]
     h1, w1 = frame1.shape[:2]
@@ -72,14 +84,28 @@ def main() -> None:
     camera_names = dual_camera_cfg.get("names", ["cam0", "cam1"])
     if not isinstance(camera_names, list) or len(camera_names) != 2:
         raise ValueError("camera.names must be a list with exactly 2 strings.")
+    calibration_paths = dual_camera_cfg.get("calibration_paths", None)
+    calibration_enabled = dual_camera_cfg.get("use_chessboard_calibration", None)
 
     camera_cfg_0 = dict(base_camera_cfg)
     camera_cfg_0["index"] = int(camera_indices[0])
     camera_cfg_0["name"] = str(camera_names[0])
+    cam0_calib_path = _optional_list_value(calibration_paths, 0)
+    cam0_calib_enable = _optional_list_value(calibration_enabled, 0)
+    if cam0_calib_path is not None:
+        camera_cfg_0["calibration_path"] = str(cam0_calib_path)
+    if cam0_calib_enable is not None:
+        camera_cfg_0["use_chessboard_calibration"] = bool(cam0_calib_enable)
 
     camera_cfg_1 = dict(base_camera_cfg)
     camera_cfg_1["index"] = int(camera_indices[1])
     camera_cfg_1["name"] = str(camera_names[1])
+    cam1_calib_path = _optional_list_value(calibration_paths, 1)
+    cam1_calib_enable = _optional_list_value(calibration_enabled, 1)
+    if cam1_calib_path is not None:
+        camera_cfg_1["calibration_path"] = str(cam1_calib_path)
+    if cam1_calib_enable is not None:
+        camera_cfg_1["use_chessboard_calibration"] = bool(cam1_calib_enable)
 
     capture_cfg = dict(config["capture"])
     output_cfg = dict(config["output"])
@@ -119,6 +145,8 @@ def main() -> None:
     cap1 = None
     writer0 = None
     writer1 = None
+    calibration0 = None
+    calibration1 = None
 
     cam0_csv_path = session_dir / "cam0_timestamps.csv"
     cam1_csv_path = session_dir / "cam1_timestamps.csv"
@@ -127,6 +155,8 @@ def main() -> None:
     try:
         cap0, cam0_name = _open_camera(dict(camera_cfg_0), fallback_name="cam0")
         cap1, cam1_name = _open_camera(dict(camera_cfg_1), fallback_name="cam1")
+        calibration0 = setup_undistortion_from_config(camera_cfg_0, log_prefix="[record-dual-cam0]")
+        calibration1 = setup_undistortion_from_config(camera_cfg_1, log_prefix="[record-dual-cam1]")
 
         for _ in range(warmup_frames):
             cap0.read()
@@ -138,6 +168,8 @@ def main() -> None:
             raise RuntimeError("Failed to read initial frame from cam0.")
         if not ok1 or frame1 is None:
             raise RuntimeError("Failed to read initial frame from cam1.")
+        frame0 = undistort_frame(frame0, calibration0)
+        frame1 = undistort_frame(frame1, calibration1)
 
         h0, w0 = frame0.shape[:2]
         h1, w1 = frame1.shape[:2]
@@ -198,6 +230,10 @@ def main() -> None:
 
                 ok0, frame0 = cap0.read()
                 ok1, frame1 = cap1.read()
+                if ok0 and frame0 is not None:
+                    frame0 = undistort_frame(frame0, calibration0)
+                if ok1 and frame1 is not None:
+                    frame1 = undistort_frame(frame1, calibration1)
 
                 row_cam0_idx = ""
                 row_cam1_idx = ""
@@ -262,6 +298,12 @@ def main() -> None:
             "camera_names": {"cam0": cam0_name, "cam1": cam1_name},
             "camera_config_path": str(Path(args.camera_config).resolve()),
             "camera_configs": {"cam0": camera_cfg_0, "cam1": camera_cfg_1},
+            "calibration": {
+                "cam0_enabled": bool(camera_cfg_0.get("use_chessboard_calibration", False)),
+                "cam1_enabled": bool(camera_cfg_1.get("use_chessboard_calibration", False)),
+                "cam0_path": str(camera_cfg_0.get("calibration_path", "")),
+                "cam1_path": str(camera_cfg_1.get("calibration_path", "")),
+            },
             "saved_frames": {"cam0": frame_idx0, "cam1": frame_idx1, "pair_rows": pair_idx},
         }
         manifest_path = session_dir / "session_manifest.json"

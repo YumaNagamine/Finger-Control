@@ -1,7 +1,9 @@
 {
   "camera": {
     "indices": [0, 1],
-    "names": ["cam_dlc", "cam_weight"]
+    "names": ["cam_dlc", "cam_weight"],
+    "use_chessboard_calibration": [true, true],
+    "calibration_paths": ["camera_calibration_dlc.json", "camera_calibration_weight.json"]
   },
   "capture": {
     "target_fps": 60,
