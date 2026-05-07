@@ -53,12 +53,21 @@ class CaptureApp:
         self.capture_button.pack(pady=(0, 6))
 
         self.status_var = tk.StringVar(
-            value=f"Save dir: {self.save_dir} | Click 'Capture' to save an image."
+            value=f"Save dir: {self.save_dir} | Click 'Capture' or press Enter to save an image."
         )
         self.status_label = tk.Label(self.root, textvariable=self.status_var, anchor="w", justify="left")
         self.status_label.pack(fill="x", padx=8, pady=(0, 8))
 
+        self._bind_shortcuts()
         self._update_frame()
+
+    def _bind_shortcuts(self):
+        self.root.bind_all("<Return>", self._on_enter_capture)
+        self.root.bind_all("<KP_Enter>", self._on_enter_capture)
+
+    def _on_enter_capture(self, _event):
+        self.capture()
+        return "break"
 
     def _open_camera(self):
         cam_num = int(self.camera_cfg.get("index", 0))

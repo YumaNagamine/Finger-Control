@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--square-size-mm",
         type=float,
-        default=25.0,
+        default=15.0,
         help="Chessboard square size in millimeters.",
     )
     parser.add_argument(
