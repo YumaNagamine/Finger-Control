@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import sys
 import time
 from pathlib import Path
 
 import cv2
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
 try:
     from observation.camera.camera_utils import (
@@ -37,12 +42,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
     parser.add_argument("--duration-s", type=float, default=5.0, help="Recording duration in seconds.")
     parser.add_argument("--frame-limit", type=int, default=0, help="Stop after N frames (0 = ignore).")
+    parser.add_argument("--no-window", action="store_true", help="Disable realtime preview window.")
+    parser.add_argument("--window-name", type=str, default="Record Preview", help="Preview window title.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     camera_cfg = load_config(args.config)
+    show_window = not args.no_window
 
     cam_num = int(camera_cfg.get("index", 0))
     backend = resolve_backend(camera_cfg.get("backend"))
@@ -50,9 +58,9 @@ def main() -> None:
     if not cap.isOpened():
         raise RuntimeError("Camera not available.")
 
-    width = int(camera_cfg.get("width", 1600))
-    height = int(camera_cfg.get("height", 1200))
-    target_fps = float(camera_cfg.get("target_fps", 90))
+    width = int(camera_cfg.get("width", 800))
+    height = int(camera_cfg.get("height", 600))
+    target_fps = float(camera_cfg.get("target_fps", 60))
     apply_camera_settings(cap, camera_cfg)
     calibration = setup_undistortion_from_config(camera_cfg)
 
@@ -65,12 +73,21 @@ def main() -> None:
     start = time.time()
     frame_count = 0
     try:
+        if show_window:
+            cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 continue
             frame = undistort_frame(frame, calibration)
             writer.write(frame)
+
+            if show_window:
+                cv2.imshow(args.window_name, frame)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+
             frame_count += 1
             if args.frame_limit and frame_count >= args.frame_limit:
                 break
@@ -79,6 +96,8 @@ def main() -> None:
     finally:
         cap.release()
         writer.release()
+        if show_window:
+            cv2.destroyAllWindows()
 
     print(f"Saved test video to {filename}")
 
