@@ -1,0 +1,17 @@
+{
+  "input": {
+    "cam0_video_path": "logs/dual_camera/recordings/dual_record_YYYYMMDD_HHMMSS/cam0.mp4",
+    "cam1_video_path": "logs/dual_camera/recordings/dual_record_YYYYMMDD_HHMMSS/cam1.mp4",
+    "pair_timestamps_csv": "logs/dual_camera/recordings/dual_record_YYYYMMDD_HHMMSS/pair_timestamps.csv"
+  },
+  "processors": {
+    "dlc_config_path": "src/observation/vision/config_deeplabcut_angle.json",
+    "weight_config_path": "src/observation/vision/config_weight_displacement.json",
+    "mm_per_pixel": 1.0,
+    "expected_num_weights": 6
+  },
+  "output": {
+    "csv_dir": "logs/dual_camera/processed_csv",
+    "filename_prefix": "dual_processed"
+  }
+}
