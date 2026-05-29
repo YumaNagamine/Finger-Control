@@ -1,0 +1,13 @@
+{
+  "active_profile": "high",
+  "profiles": {
+    "middle": {
+      "param_dir": "params",
+      "resolution": [800, 600]
+    },
+    "high": {
+      "param_dir": "paramsHighResolution",
+      "resolution": [1600, 1200]
+    }
+  }
+}

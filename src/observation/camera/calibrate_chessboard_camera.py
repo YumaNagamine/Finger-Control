@@ -13,11 +13,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+from observation.camera.camera_param_resolver import resolve_param_path
+
 # Set params such as cols and rows etc. before doing this!!!!
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGES_DIR = SCRIPT_DIR / "chessboard_imgs"
-DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "camera_calibration.json"
+DEFAULT_OUTPUT_PATH = resolve_param_path("camera_calibration.json")
 
 
 def parse_args() -> argparse.Namespace:

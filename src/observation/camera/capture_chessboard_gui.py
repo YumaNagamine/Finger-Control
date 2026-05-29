@@ -12,11 +12,12 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from observation.camera.camera_utils import apply_camera_settings, resolve_backend
+from observation.camera.camera_param_resolver import resolve_param_path
 from utils.config_loader import load_config
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CAMERA_CONFIG = SCRIPT_DIR / "camera_config.json"
+DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config.json")
 
 # Change this path if you want to save captured images elsewhere.
 SAVE_DIR = SCRIPT_DIR / "chessboard_imgs"

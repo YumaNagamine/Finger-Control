@@ -1,0 +1,15 @@
+{
+  "index": 0,
+  "backend": "CAP_DSHOW",
+  "width": 1600,
+  "height": 1200,
+  "target_fps": 60.0,
+  "buffersize": 0,
+  "auto_exposure": 0.0,
+  "gain": 0.0,
+  "exposure": -7.0,
+  "capture_fourcc": "MJPG",
+  "writer_fourcc": "mp4v",
+  "use_chessboard_calibration": true,
+  "calibration_path": "camera_calibration_weight.json"
+}

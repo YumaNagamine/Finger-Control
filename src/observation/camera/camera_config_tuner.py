@@ -20,11 +20,12 @@ from observation.camera.camera_utils import (
     setup_undistortion_from_config,
     undistort_frame,
 )
+from observation.camera.camera_param_resolver import resolve_param_path
 from utils.config_loader import load_config
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CAMERA_CONFIG = SCRIPT_DIR / "camera_config.json"
+DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config.json")
 WINDOW_TITLE = "Camera Config Tuner"
 WINDOW_GEOMETRY = "1000x760"
 BACKEND_OPTIONS = ("CAP_DSHOW", "CAP_ANY", "")

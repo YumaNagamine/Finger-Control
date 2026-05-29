@@ -31,16 +31,16 @@ except ModuleNotFoundError:
     )
 
 from utils.config_loader import load_config
+from observation.camera.camera_param_resolver import resolve_param_path
 
 
 TEST_VIDEO_DIR = Path(__file__).with_name("test_video")
-DEFAULT_CONFIG = Path(__file__).with_name("camera_config.json")
-
+DEFAULT_CONFIG = resolve_param_path("camera_config_dlc.json")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record a test video from camera_config.json.")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
-    parser.add_argument("--duration-s", type=float, default=5.0, help="Recording duration in seconds.")
+    parser.add_argument("--duration-s", type=float, default=0.0, help="Recording duration in seconds.")
     parser.add_argument("--frame-limit", type=int, default=0, help="Stop after N frames (0 = ignore).")
     parser.add_argument("--no-window", action="store_true", help="Disable realtime preview window.")
     parser.add_argument("--window-name", type=str, default="Record Preview", help="Preview window title.")

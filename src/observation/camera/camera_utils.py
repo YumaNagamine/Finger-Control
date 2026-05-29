@@ -6,9 +6,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from observation.camera.camera_param_resolver import get_active_param_dir, resolve_param_path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CALIBRATION_PATH = SCRIPT_DIR / "camera_calibration.json"
+DEFAULT_CALIBRATION_PATH = resolve_param_path("camera_calibration.json")
 CalibrationParams = tuple[np.ndarray, np.ndarray]
 
 
@@ -49,14 +50,13 @@ def calibration_path_from_config(camera_cfg: dict) -> Path:
     if not raw_path:
         return DEFAULT_CALIBRATION_PATH
 
-    path = Path(str(raw_path))
-    if not path.is_absolute():
-        path = SCRIPT_DIR / path
-    return path
+    return resolve_param_path(str(raw_path))
 
 
 def load_chessboard_calibration(calibration_path: str | Path) -> CalibrationParams:
     path = Path(calibration_path)
+    if not path.is_absolute():
+        path = (get_active_param_dir() / path).resolve()
     if not path.exists():
         raise FileNotFoundError(f"Calibration file not found: {path}")
 

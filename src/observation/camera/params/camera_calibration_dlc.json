@@ -1,0 +1,83 @@
+{
+  "camera_model": "opencv_pinhole",
+  "image_size": [
+    800,
+    600
+  ],
+  "camera_matrix": [
+    [
+      781.0432466574861,
+      0.0,
+      389.3739013499716
+    ],
+    [
+      0.0,
+      779.8961175955486,
+      281.12438473266656
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "distortion_coefficients": [
+    -0.4476259622239671,
+    0.3212931816549191,
+    0.0005881055423002555,
+    -0.0011293576790965998,
+    -0.15037550216733842
+  ],
+  "rms_reprojection_error": 0.5440365221281406,
+  "mean_reprojection_error": 0.5440365409287085,
+  "chessboard": {
+    "inner_corners": [
+      9,
+      6
+    ],
+    "square_size_mm": 15.0
+  },
+  "num_images_found": 38,
+  "num_images_used": 38,
+  "used_image_files": [
+    "chessboard_20260521_170544_572357.png",
+    "chessboard_20260521_170547_891012.png",
+    "chessboard_20260521_170551_962993.png",
+    "chessboard_20260521_170553_595415.png",
+    "chessboard_20260521_170555_604055.png",
+    "chessboard_20260521_170558_627070.png",
+    "chessboard_20260521_170600_250888.png",
+    "chessboard_20260521_170602_207492.png",
+    "chessboard_20260521_170605_267375.png",
+    "chessboard_20260521_170608_149177.png",
+    "chessboard_20260521_170610_051200.png",
+    "chessboard_20260521_170614_235976.png",
+    "chessboard_20260521_170622_971559.png",
+    "chessboard_20260521_170626_451732.png",
+    "chessboard_20260521_170640_818965.png",
+    "chessboard_20260521_170642_667840.png",
+    "chessboard_20260521_170645_008078.png",
+    "chessboard_20260521_170646_747741.png",
+    "chessboard_20260521_170649_019114.png",
+    "chessboard_20260521_170653_963901.png",
+    "chessboard_20260521_170657_012122.png",
+    "chessboard_20260521_170700_604289.png",
+    "chessboard_20260521_170702_395967.png",
+    "chessboard_20260521_170704_658448.png",
+    "chessboard_20260521_170706_444200.png",
+    "chessboard_20260521_170712_308192.png",
+    "chessboard_20260521_170717_191679.png",
+    "chessboard_20260521_170722_373638.png",
+    "chessboard_20260521_170727_016852.png",
+    "chessboard_20260521_170730_148527.png",
+    "chessboard_20260521_170734_036152.png",
+    "chessboard_20260521_170741_271988.png",
+    "chessboard_20260521_170744_188782.png",
+    "chessboard_20260521_170748_411719.png",
+    "chessboard_20260521_170751_591709.png",
+    "chessboard_20260521_170753_647804.png",
+    "chessboard_20260521_170755_506288.png",
+    "chessboard_20260521_170757_787918.png"
+  ],
+  "generated_at": "2026-05-21T17:08:11"
+}
