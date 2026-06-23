@@ -84,10 +84,13 @@ def _draw_detection_table(overlay: "cv2.typing.MatLike", results: list[dict]) ->
     )
     for i, row in enumerate(rows):
         marker_id = int(row.get("marker_id", -1))
-        x_px = float(row.get("x_px", 0.0))
-        y_px = float(row.get("y_px", 0.0))
-        disp_mm = float(row.get("disp_mm", 0.0))
-        text = f"{marker_id:>2d}  {x_px:>7.1f}  {y_px:>7.1f}  {disp_mm:>+8.3f}"
+        x_raw = row.get("x_px")
+        y_raw = row.get("y_px")
+        disp_raw = row.get("disp_mm")
+        x_txt = "   --  " if x_raw is None else f"{float(x_raw):>7.1f}"
+        y_txt = "   --  " if y_raw is None else f"{float(y_raw):>7.1f}"
+        disp_txt = "   --   " if disp_raw is None else f"{float(disp_raw):>+8.3f}"
+        text = f"{marker_id:>2d}  {x_txt}  {y_txt}  {disp_txt}"
         y = 28 + line_h * (i + 1)
         cv2.putText(out, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 255, 220), 1, cv2.LINE_AA)
     return out
@@ -224,8 +227,8 @@ def main() -> None:
                 for row in results:
                     marker_id = int(row["marker_id"])
                     xy_history[marker_id]["frame"].append(float(frame_idx))
-                    xy_history[marker_id]["x"].append(float(row["x_px"]))
-                    xy_history[marker_id]["y"].append(float(row["y_px"]))
+                    xy_history[marker_id]["x"].append(float("nan") if row["x_px"] is None else float(row["x_px"]))
+                    xy_history[marker_id]["y"].append(float("nan") if row["y_px"] is None else float(row["y_px"]))
                 writer_csv.writerow(
                     [
                         now_iso,
