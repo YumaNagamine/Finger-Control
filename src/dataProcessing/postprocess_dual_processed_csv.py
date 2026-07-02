@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import math
@@ -50,8 +50,8 @@ DISP_MM_RENAME_MAP = {
     "weight_0_disp_mm": "FDP",
     "weight_1_disp_mm": "FDS",
     "weight_2_disp_mm": "EI",
-    "weight_3_disp_mm": "DI",
-    "weight_4_disp_mm": "PI",
+    "weight_3_disp_mm": "PI",
+    "weight_4_disp_mm": "DI",
     "weight_5_disp_mm": "LUM",
 }
 
@@ -342,3 +342,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import math
@@ -9,6 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 import numpy as np
 import pandas as pd
 
@@ -21,13 +22,14 @@ TARGET_INPUT_CSV = (
     / "logs"
     / "dual_camera"
     / "processed_csv"
-    / "ValidateSeriesMotion.csv" ### INPUT TARGET CSV FILENAME LOCATED IN processed_csv directory
+    / "dual_processed_momentarmValidation (6)_20260702_175638.csv" ### INPUT TARGET CSV FILENAME LOCATED IN processed_csv directory
 )
 MOMENT_ARM_AVERAGE_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "moment_arm_average"
 OUTPUT_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "momentarm_validation"
 OUTPUT_FILE_PREFIX = TARGET_INPUT_CSV.stem
 OUTPUT_PLOT_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_excursion.png"
 OUTPUT_CSV_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_excursion.csv"
+OUTPUT_TIME_ANGLE_PLOT_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_time_vs_joint_angle.png"
 
 TENDON_COLUMNS = ["FDP", "FDS", "EI", "DI", "PI", "LUM"]
 JOINT_COLUMNS = ["DIP", "PIP", "MCP"]
@@ -40,8 +42,8 @@ DISP_MM_RENAME_MAP = {
     "weight_0_disp_mm": "FDP",
     "weight_1_disp_mm": "FDS",
     "weight_2_disp_mm": "EI",
-    "weight_3_disp_mm": "DI",
-    "weight_4_disp_mm": "PI",
+    "weight_3_disp_mm": "PI",
+    "weight_4_disp_mm": "DI",
     "weight_5_disp_mm": "LUM",
 }
 MOTION_NAMES = ("flexion", "extension")
@@ -184,7 +186,10 @@ def _build_prediction_dataframe(
         smoothed_angles = _smooth_angle_series(df[FLEXION_RAD_COLUMNS[joint]])
         delta_angles, midpoint_angles, directions = _infer_motion_direction(smoothed_angles)
 
+        comparison_df[f"{joint}_actual_angle_rad"] = pd.to_numeric(df[FLEXION_RAD_COLUMNS[joint]], errors="coerce")
+        comparison_df[f"{joint}_actual_angle_deg"] = np.rad2deg(comparison_df[f"{joint}_actual_angle_rad"])
         comparison_df[f"{joint}_smoothed_angle_rad"] = smoothed_angles
+        comparison_df[f"{joint}_smoothed_angle_deg"] = np.rad2deg(smoothed_angles)
         comparison_df[f"{joint}_delta_angle_rad"] = delta_angles
         comparison_df[f"{joint}_direction"] = directions
 
@@ -283,6 +288,61 @@ def _plot_excursion_comparison(comparison_df: pd.DataFrame, output_path: Path) -
     plt.close(fig)
 
 
+def _plot_time_vs_joint_angle(comparison_df: pd.DataFrame, output_path: Path) -> None:
+    elapsed_s = comparison_df["elapsed_s"].to_numpy(dtype=np.float64)
+    use_elapsed_time = np.isfinite(elapsed_s).all()
+    x_values = elapsed_s if use_elapsed_time else np.arange(len(comparison_df), dtype=np.int32)
+    x_label = "Elapsed time [s]" if use_elapsed_time else "Frame index"
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    line_colors = {
+        ("DIP", "actual"): "#1f77b4",
+        ("DIP", "smoothed"): "#17becf",
+        ("PIP", "actual"): "#ff7f0e",
+        ("PIP", "smoothed"): "#d62728",
+        ("MCP", "actual"): "#2ca02c",
+        ("MCP", "smoothed"): "#9467bd",
+    }
+
+    for joint in JOINT_COLUMNS:
+        actual_deg = comparison_df[f"{joint}_actual_angle_deg"].to_numpy(dtype=np.float64)
+        smoothed_deg = comparison_df[f"{joint}_smoothed_angle_deg"].to_numpy(dtype=np.float64)
+        actual_color = line_colors[(joint, "actual")]
+        smoothed_color = line_colors[(joint, "smoothed")]
+
+        actual_valid = np.isfinite(actual_deg)
+        smoothed_valid = np.isfinite(smoothed_deg)
+
+        ax.plot(
+            x_values[actual_valid],
+            actual_deg[actual_valid],
+            color=actual_color,
+            linestyle="-",
+            linewidth=2.2,
+            alpha=0.95,
+            label=f"{joint} actual",
+        )
+        smoothed_line, = ax.plot(
+            x_values[smoothed_valid],
+            smoothed_deg[smoothed_valid],
+            color=smoothed_color,
+            linestyle="--",
+            linewidth=2.4,
+            alpha=1.0,
+            label=f"{joint} smoothed",
+        )
+        smoothed_line.set_path_effects([pe.Stroke(linewidth=3.6, foreground="white"), pe.Normal()])
+
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Flexion angle [deg]")
+    ax.set_title("Time vs joint flexion angle")
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 def main() -> None:
     if not TARGET_INPUT_CSV.exists():
         raise FileNotFoundError(f"Target input CSV not found: {TARGET_INPUT_CSV}")
@@ -296,11 +356,14 @@ def main() -> None:
     OUTPUT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     comparison_df.to_csv(OUTPUT_CSV_PATH, index=False)
     _plot_excursion_comparison(comparison_df, OUTPUT_PLOT_PATH)
+    _plot_time_vs_joint_angle(comparison_df, OUTPUT_TIME_ANGLE_PLOT_PATH)
 
     print(f"Loaded input CSV: {TARGET_INPUT_CSV}")
     print(f"Saved comparison CSV: {OUTPUT_CSV_PATH}")
     print(f"Saved comparison plot: {OUTPUT_PLOT_PATH}")
+    print(f"Saved time-angle plot: {OUTPUT_TIME_ANGLE_PLOT_PATH}")
 
 
 if __name__ == "__main__":
     main()
+
