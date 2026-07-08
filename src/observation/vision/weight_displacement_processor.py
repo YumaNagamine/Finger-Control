@@ -123,6 +123,7 @@ class WeightDisplacementProcessor:
         baseline_y = state["baseline_y"]
         disp_px: float | None = 0.0
         disp_mm: float | None = 0.0
+
         if baseline_y is not None and mm_per_px is not None:
             delta = float(y_value - baseline_y)
             if self.positive_direction == "up":
@@ -146,17 +147,35 @@ class WeightDisplacementProcessor:
             "quality": quality,
         }
 
+    def _missing_row(self, marker_id: int) -> dict:
+        state = self._states[marker_id]
+        baseline_y = state["baseline_y"]
+        mm_per_px = state["mm_per_px"]
+        quality = "missing"
+        if baseline_y is None or mm_per_px is None:
+            quality = "missing_warming_up"
+        return {
+            "weight_id": marker_id,
+            "marker_id": marker_id,
+            "detected": False,
+            "x_px": None,
+            "y_px": None,
+            "baseline_y_px": None if baseline_y is None else float(baseline_y),
+            "disp_px": None,
+            "disp_mm": None,
+            "mm_per_px": None if mm_per_px is None else float(mm_per_px),
+            "quality": quality,
+        }
+
     def process_frame(self, frame_bgr: np.ndarray, frame_idx: int) -> tuple[list[dict], np.ndarray]:
         detected = self._detect_markers(frame_bgr)
         results: list[dict] = []
         for marker_id in self.marker_ids:
             marker = detected.get(marker_id)
             if marker is None:
-                raise RuntimeError(
-                    f"Marker id={marker_id} was not detected at frame {frame_idx}. "
-                    "Current configuration assumes all markers are always visible."
-                )
-            row = self._update_state(marker_id, marker)
+                row = self._missing_row(marker_id)
+            else:
+                row = self._update_state(marker_id, marker)
             row["frame_idx"] = frame_idx
             results.append(row)
 
@@ -171,9 +190,11 @@ class WeightDisplacementProcessor:
     ) -> np.ndarray:
         out = frame_bgr.copy()
         result_map = {int(row["marker_id"]): row for row in results}
+        missing_ids: list[int] = []
         for marker_id in self.marker_ids:
             marker = detected.get(marker_id)
             if marker is None:
+                missing_ids.append(marker_id)
                 continue
             res = result_map.get(marker_id, {})
             quality = str(res.get("quality", "warming_up"))
@@ -197,6 +218,19 @@ class WeightDisplacementProcessor:
                 0.5,
                 (255, 255, 0),
                 1,
+                cv2.LINE_AA,
+            )
+
+        if missing_ids:
+            text = "missing ids: " + ", ".join(str(marker_id) for marker_id in missing_ids)
+            cv2.putText(
+                out,
+                text,
+                (12, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2,
                 cv2.LINE_AA,
             )
 

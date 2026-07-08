@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import csv
@@ -369,7 +369,12 @@ def process_dual_recording_config(
         config_base_dir,
     )
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename_prefix = str(output_cfg.get("filename_prefix", "dual_processed"))
+    base_prefix = str(output_cfg.get("filename_prefix", "dual_processed")).strip()
+    recording_name = cam0_video_path.parent.name.strip()
+    if recording_name:
+        filename_prefix = f"{base_prefix}_{recording_name}" if base_prefix else recording_name
+    else:
+        filename_prefix = base_prefix or "dual_processed"
     out_csv_path = csv_dir / f"{filename_prefix}_{ts}.csv"
     out_dlc_overlay_path = overlay_video_dir / f"{filename_prefix}_{ts}_cam0_dlc_overlay.mp4"
     out_weight_overlay_path = overlay_video_dir / f"{filename_prefix}_{ts}_cam1_weight_overlay.mp4"
@@ -566,3 +571,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

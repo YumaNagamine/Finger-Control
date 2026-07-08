@@ -1,4 +1,4 @@
-### Batch processing script for dual-camera recording directories.
+﻿### Batch processing script for dual-camera recording directories.
 
 import argparse
 import copy
@@ -62,11 +62,6 @@ def build_session_config(base_cfg: dict, session_dir: Path) -> dict:
     input_cfg["cam1_video_path"] = str(session_dir / "cam1.mp4")
     input_cfg["pair_timestamps_csv"] = str(session_dir / "pair_timestamps.csv")
     cfg["input"] = input_cfg
-
-    output_cfg = dict(cfg["output"])
-    base_prefix = str(output_cfg.get("filename_prefix", "dual_processed")).strip()
-    output_cfg["filename_prefix"] = f"{base_prefix}_{session_dir.name}" if base_prefix else session_dir.name
-    cfg["output"] = output_cfg
     return cfg
 
 
@@ -117,3 +112,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
