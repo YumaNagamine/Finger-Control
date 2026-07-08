@@ -1,4 +1,4 @@
-# This script predicts tendon excursion from a processed csv file created by process_dual_recording.py.
+﻿# This script predicts tendon excursion from a processed csv file created by process_dual_recording.py.
 from __future__ import annotations
 
 import argparse
@@ -28,6 +28,13 @@ from utils.path_utils import resolve_path
 PROJECT_ROOT = SRC_ROOT.parent
 MOMENT_ARM_AVERAGE_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "moment_arm_average"
 OUTPUT_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "excursion_predictions"
+TARGET_INPUT_CSV = (
+    PROJECT_ROOT
+    / "logs"
+    / "dual_camera"
+    / "processed_csv"
+    / "dual_processed_controlTest_20260708_132620.csv"
+)
 
 TENDON_COLUMNS = ["FDP", "FDS", "EI", "DI", "PI", "LUM"]
 JOINT_COLUMNS = ["DIP", "PIP", "MCP"]
@@ -61,13 +68,6 @@ EXCURSION_SMOOTHING_WINDOW = 5
 DIRECTION_DEADBAND_RAD = math.radians(0.2)
 DEFAULT_DIRECTION = "flexion"
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Predict tendon excursion for a single processed dual-camera CSV."
-    )
-    parser.add_argument("--csv", type=str, required=True, help="Input CSV produced by process_dual_recording.py")
-    return parser.parse_args()
 
 
 def _resolve_existing_file(raw_path: str, base_dir: Path) -> Path:
@@ -383,8 +383,7 @@ def process_csv(input_csv_path: Path) -> dict[str, Path]:
 
 
 def main() -> None:
-    args = parse_args()
-    input_csv_path = _resolve_existing_file(args.csv, Path.cwd())
+    input_csv_path = _resolve_existing_file(str(TARGET_INPUT_CSV), Path.cwd())
     result = process_csv(input_csv_path)
 
     print(f"Loaded input CSV: {result['input_csv_path']}")
@@ -394,3 +393,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
