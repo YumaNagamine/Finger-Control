@@ -5,62 +5,69 @@
   },
   "dlc": {
     "third_party_path": "third_party/deeplabcut",
-    "model_path": "models/deeplabcut_export",
+    "model_path": "deeplabcut_export",
+    "model_type": "pytorch",
     "pcutoff": 0.0,
     "default_likelihood": 0.0,
     "convert_bgr_to_rgb": true
   },
   "keypoints": {
     "names": [
-      "distal_tip",
-      "distal_base",
-      "medial_tip",
-      "medial_base",
-      "proximal_tip",
-      "proximal_base",
-      "palm_tip",
-      "palm_base"
+      "fingertip",
+      "distal1",
+      "middle1",
+      "middle2",
+      "proximal1",
+      "proximal2",
+      "meta1"
     ],
     "segments": {
       "distal": [
-        "distal_tip",
-        "distal_base"
+        "fingertip",
+        "distal1"
       ],
       "medial": [
-        "medial_tip",
-        "medial_base"
+        "middle1",
+        "middle2"
       ],
       "proximal": [
-        "proximal_tip",
-        "proximal_base"
+        "proximal1",
+        "proximal2"
       ],
       "palm": [
-        "palm_tip",
-        "palm_base"
+        "meta1",
+        "meta1"
       ]
     }
   },
   "angles": [
     {
-      "name": "angle_0",
+      "name": "DIP",
       "segment_a": "distal",
       "segment_b": "medial"
     },
     {
-      "name": "angle_1",
+      "name": "PIP",
       "segment_a": "medial",
       "segment_b": "proximal"
     },
     {
-      "name": "angle_2",
+      "name": "MCP",
       "segment_a": "proximal",
       "segment_b": "palm"
     }
   ],
   "processing": {
-    "confidence_threshold": 0.6,
-    "ema_alpha": 0.4,
-    "hold_last_frames": 4
+    "confidence_threshold": 0.3,
+    "ema_alpha": 0.0,
+    "hold_last_frames": 0,
+    "adjustments": {
+      "theta_rad": 0.45,
+      "distance_shift": -20.0,
+      "joint_shifters": [15.0, 95.0],
+      "mcp_offset": [-110.0, 0.0],
+      "palm_horizontal_offset_px": 100.0
+    }
   },
   "draw": {
     "show_keypoint_labels": true,

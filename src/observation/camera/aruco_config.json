@@ -1,5 +1,5 @@
 {
-  "marker_length_mm": 20.0,
+  "marker_length_mm": 18.0,
   "marker_id": 0,
   "dictionary": "DICT_4X4_50",
   "camera_read_attempts": 30,

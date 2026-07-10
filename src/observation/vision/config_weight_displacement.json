@@ -9,7 +9,7 @@
     "num_weights": 6,
     "marker_ids": [0, 1, 2, 3, 4, 5],
     "baseline_frames": 3,
-    "positive_direction": "up"
+    "positive_direction": "down"
   },
   "processing": {
     "aruco": {
