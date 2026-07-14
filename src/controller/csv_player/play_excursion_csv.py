@@ -29,11 +29,11 @@ from pathlib import Path
 from typing import Sequence
 
 
-SRC_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = Path(__file__).resolve().parents[2]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
-from controller.excursion_player import ExcursionPlayer, load_position_calibration
+from controller.csv_player.excursion_player import ExcursionPlayer, load_position_calibration
 
 
 TENDONS = ("FDP", "FDS", "EI", "DI", "PI", "LUM")
@@ -58,7 +58,7 @@ PREDICTION_CSV_PATH = (
 # Required signed tendon calibration is shared by all excursion players.
 # Edit the JSON file when the measured mechanism calibration changes.
 CALIBRATION_PATH = (
-    SRC_ROOT / "controller" / "config" / "excursion_servo_calibration.json"
+    SRC_ROOT / "controller" / "excursion_servo_calibration.json"
 ) # 直径40mmなので 1周125mm, 4096stepあるので0.030679mm/step, 32.595 step/mm
 
 SERVO_IDS = (0, 1, 2, 3, 4, 5)

@@ -18,11 +18,11 @@ from pathlib import Path
 import cv2
 
 
-SRC_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = Path(__file__).resolve().parents[2]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
-from controller.excursion_player import (
+from controller.csv_player.excursion_player import (
     ExcursionPlayer,
     PlaybackStatus,
     TENDONS,
@@ -52,7 +52,7 @@ PREDICTION_CSV_PATH = (
     / "dual_processed_controlTest_20260708_111151_prediction_20260708.csv"
 )
 
-CALIBRATION_PATH = SRC_ROOT / "controller" / "config" / "excursion_servo_calibration.json"
+CALIBRATION_PATH = SRC_ROOT / "controller" / "excursion_servo_calibration.json"
 SERVO_IDS = (0, 1, 2, 3, 4, 5)
 START_POSITIONS: tuple[int, ...] | None = (2048, 2048, 2048, 2048, 2048, 2048)
 
