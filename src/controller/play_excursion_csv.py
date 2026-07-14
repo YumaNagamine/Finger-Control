@@ -12,6 +12,9 @@ rotation direction winds the corresponding tendon.  It must be measured for
 the actual spool/tendon mechanism; this script deliberately does not guess it.
 
 The tendon order used by all six-value settings is: FDP, FDS, EI, DI, PI, LUM.
+
+Set ``EXECUTE = True`` in the user settings block to send commands to the
+physical servos. Leave it ``False`` for a dry-run simulation.
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ PREDICTION_CSV_PATH = (
     / "logs"
     / "dual_camera"
     / "excursion_predictions"
-    / "REPLACE_WITH_PREDICTION_CSV.csv"
+    / "dual_processed_controlTest_20260708_111151_prediction_20260708.csv"
 )
 
 # Required calibration. Set signed servo position units per 1 mm of tendon
@@ -57,8 +60,8 @@ POSITION_UNITS_PER_MM: tuple[float, ...] | None = (
 
 SERVO_IDS = (0, 1, 2, 3, 4, 5)
 
-# For dry-run, specify six representative raw positions. During hardware
-# execution, None reads the actual starting positions from servo telemetry.
+# Dry-run-only representative raw positions. Hardware execution always reads
+# the actual starting positions from servo telemetry.
 START_POSITIONS: tuple[int, ...] | None = (2048, 2048, 2048, 2048, 2048, 2048)
 
 TIME_SCALE = 1.0
@@ -176,13 +179,18 @@ def build_command_frames(
     return frames
 
 
-def read_start_positions(api, timeout_s: float) -> tuple[int, ...]:
+def read_start_positions(
+    api,
+    timeout_s: float,
+    servo_ids: Sequence[int],
+) -> tuple[int, ...]:
+    _six_values(servo_ids, "servo IDs")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         frame = api.try_read_telemetry()
         if frame is not None:
             _six_values(frame.positions, "telemetry positions")
-            return tuple(frame.positions)
+            return tuple(frame.positions[servo_id] for servo_id in servo_ids)
     raise TimeoutError(f"No valid six-servo telemetry received within {timeout_s:.1f} s")
 
 
@@ -263,11 +271,7 @@ def main() -> None:
         baud_rate=BAUD_RATE,
         timeout=SERIAL_TIMEOUT_S,
     ) as api:
-        start_positions = (
-            START_POSITIONS
-            if START_POSITIONS is not None
-            else read_start_positions(api, TELEMETRY_WAIT_S)
-        )
+        start_positions = read_start_positions(api, TELEMETRY_WAIT_S, SERVO_IDS)
         # Validate the complete trajectory before issuing its first motor command.
         frames = build_command_frames(
             elapsed_times,
