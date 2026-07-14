@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import math
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,8 @@ from typing import Sequence
 SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
+
+from controller.excursion_player import ExcursionPlayer, load_position_calibration
 
 
 TENDONS = ("FDP", "FDS", "EI", "DI", "PI", "LUM")
@@ -52,10 +55,10 @@ PREDICTION_CSV_PATH = (
     / "dual_processed_controlTest_20260708_111151_prediction_20260708.csv"
 )
 
-# Required calibration. Set signed servo position units per 1 mm of tendon
-# excursion. A positive/negative sign selects the winding direction.
-POSITION_UNITS_PER_MM: tuple[float, ...] | None = (
-    32.595,32.595,32.595,32.595,32.595,32.595
+# Required signed tendon calibration is shared by all excursion players.
+# Edit the JSON file when the measured mechanism calibration changes.
+CALIBRATION_PATH = (
+    SRC_ROOT / "controller" / "config" / "excursion_servo_calibration.json"
 ) # 直径40mmなので 1周125mm, 4096stepあるので0.030679mm/step, 32.595 step/mm
 
 SERVO_IDS = (0, 1, 2, 3, 4, 5)
@@ -71,6 +74,12 @@ BAUD_RATE = 921600
 SERIAL_TIMEOUT_S = 0.2
 TELEMETRY_WAIT_S = 3.0
 MAX_LAG_S = 0.5
+LIVE_DISPLAY_INTERVAL_S = 0.1
+TELEMETRY_STALE_S = 0.5
+RETURN_TO_START = True
+RETURN_TO_START_TIME_MS = 2000
+RETURN_TO_START_TOLERANCE = 10
+RETURN_TO_START_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,74 @@ class CommandFrame:
     elapsed_s: float
     positions: tuple[int, ...]
     move_time_ms: int
+
+
+@dataclass(frozen=True)
+class TelemetrySnapshot:
+    received_at: float
+    positions: tuple[int, ...]
+
+
+class TelemetryMonitor:
+    def __init__(self, api) -> None:
+        self._api = api
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._latest: TelemetrySnapshot | None = None
+        self._error: Exception | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            name="servo-telemetry",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=SERIAL_TIMEOUT_S + 1.0)
+
+    def raise_if_failed(self) -> None:
+        with self._lock:
+            error = self._error
+        if error is not None:
+            raise RuntimeError("Telemetry reader failed") from error
+
+    def latest_positions(
+        self,
+        servo_ids: Sequence[int],
+        max_age_s: float,
+    ) -> tuple[tuple[int, ...] | None, float | None]:
+        with self._lock:
+            snapshot = self._latest
+        if snapshot is None:
+            return None, None
+
+        age_s = max(0.0, time.monotonic() - snapshot.received_at)
+        if age_s > max_age_s:
+            return None, age_s
+        return tuple(snapshot.positions[servo_id] for servo_id in servo_ids), age_s
+
+    def _read_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                frame = self._api.try_read_telemetry()
+                if frame is None:
+                    continue
+                _six_values(frame.positions, "telemetry positions")
+                snapshot = TelemetrySnapshot(
+                    received_at=time.monotonic(),
+                    positions=tuple(frame.positions),
+                )
+                with self._lock:
+                    self._latest = snapshot
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                with self._lock:
+                    self._error = exc
 
 
 def _six_values(values: Sequence[float | int], option_name: str) -> None:
@@ -194,9 +271,19 @@ def read_start_positions(
     raise TimeoutError(f"No valid six-servo telemetry received within {timeout_s:.1f} s")
 
 
-def play_frames(api, frames: Sequence[CommandFrame], servo_ids: Sequence[int], max_lag_s: float) -> None:
+def play_frames(
+    api,
+    frames: Sequence[CommandFrame],
+    servo_ids: Sequence[int],
+    max_lag_s: float,
+    telemetry_monitor: TelemetryMonitor,
+    display_interval_s: float,
+    telemetry_stale_s: float,
+) -> None:
     _six_values(servo_ids, "servo IDs")
     started_at = time.monotonic()
+    next_display_at = started_at
+    last_row_index = len(frames) - 1
 
     for row_index, frame in enumerate(frames):
         deadline = started_at + frame.elapsed_s
@@ -211,8 +298,92 @@ def play_frames(api, frames: Sequence[CommandFrame], servo_ids: Sequence[int], m
                 f"exceeding --max-lag-s={max_lag_s:.3f}"
             )
 
+        telemetry_monitor.raise_if_failed()
         for servo_id, position in zip(servo_ids, frame.positions):
             api.set_position(servo_id, position, time_ms=frame.move_time_ms)
+
+        now = time.monotonic()
+        if now >= next_display_at or row_index == last_row_index:
+            actual_positions, telemetry_age_s = telemetry_monitor.latest_positions(
+                servo_ids,
+                telemetry_stale_s,
+            )
+            print_live_status(
+                row_index,
+                frame,
+                servo_ids,
+                actual_positions,
+                telemetry_age_s,
+            )
+            next_display_at = now + display_interval_s
+
+
+def return_to_start(
+    api,
+    telemetry_monitor: TelemetryMonitor,
+    servo_ids: Sequence[int],
+    start_positions: Sequence[int],
+    move_time_ms: int,
+    tolerance: int,
+    timeout_s: float,
+    display_interval_s: float,
+    telemetry_stale_s: float,
+) -> None:
+    _six_values(servo_ids, "servo IDs")
+    _six_values(start_positions, "start positions")
+
+    print(f"Returning all servos to their initial positions over {move_time_ms} ms.")
+    for servo_id, position in zip(servo_ids, start_positions):
+        api.set_position(servo_id, position, time_ms=move_time_ms)
+
+    deadline = time.monotonic() + timeout_s
+    next_display_at = 0.0
+    while True:
+        telemetry_monitor.raise_if_failed()
+        actual_positions, telemetry_age_s = telemetry_monitor.latest_positions(
+            servo_ids,
+            telemetry_stale_s,
+        )
+        now = time.monotonic()
+
+        if now >= next_display_at:
+            if actual_positions is None:
+                status = " | ".join(
+                    f"{tendon}(servo {servo_id})={target}/N/A"
+                    for tendon, servo_id, target in zip(TENDONS, servo_ids, start_positions)
+                )
+            else:
+                status = " | ".join(
+                    f"{tendon}(servo {servo_id})={target}/{actual}({target - actual:+d})"
+                    for tendon, servo_id, target, actual in zip(
+                        TENDONS,
+                        servo_ids,
+                        start_positions,
+                        actual_positions,
+                    )
+                )
+            telemetry_age = (
+                "N/A" if telemetry_age_s is None else f"{telemetry_age_s:.3f}s"
+            )
+            print(
+                f"RETURN telemetry_age={telemetry_age} target/actual(error): {status}",
+                flush=True,
+            )
+            next_display_at = now + display_interval_s
+
+        if actual_positions is not None and all(
+            abs(target - actual) <= tolerance
+            for target, actual in zip(start_positions, actual_positions)
+        ):
+            print("All servos returned to their initial positions.")
+            return
+
+        if now >= deadline:
+            raise TimeoutError(
+                f"Servos did not return within {timeout_s:.1f} s "
+                f"and tolerance +/-{tolerance} position units"
+            )
+        time.sleep(min(0.02, max(0.0, deadline - now)))
 
 
 def print_summary(
@@ -233,11 +404,56 @@ def print_summary(
         print(f"  {tendon}: target range {min(targets)}..{max(targets)}")
 
 
-def main() -> None:
-    if POSITION_UNITS_PER_MM is None:
-        raise ValueError(
-            "Set POSITION_UNITS_PER_MM in the user settings block before running this script"
+def print_simulation_commands(
+    frames: Sequence[CommandFrame],
+    servo_ids: Sequence[int],
+) -> None:
+    print("Simulation command preview (no serial commands will be sent):")
+    for row_index, frame in enumerate(frames):
+        targets = ", ".join(
+            f"{tendon}(servo {servo_id})={position}"
+            for tendon, servo_id, position in zip(TENDONS, servo_ids, frame.positions)
         )
+        print(
+            f"SIM row={row_index} t={frame.elapsed_s:.3f}s "
+            f"move={frame.move_time_ms}ms {targets}"
+        )
+
+
+def print_live_status(
+    row_index: int,
+    frame: CommandFrame,
+    servo_ids: Sequence[int],
+    actual_positions: Sequence[int] | None,
+    telemetry_age_s: float | None,
+) -> None:
+    status_parts: list[str] = []
+    if actual_positions is None:
+        status_parts.extend(
+            f"{tendon}(servo {servo_id})={target}/N/A"
+            for tendon, servo_id, target in zip(TENDONS, servo_ids, frame.positions)
+        )
+    else:
+        status_parts.extend(
+            f"{tendon}(servo {servo_id})={target}/{actual}({target - actual:+d})"
+            for tendon, servo_id, target, actual in zip(
+                TENDONS,
+                servo_ids,
+                frame.positions,
+                actual_positions,
+            )
+        )
+
+    telemetry_age = "N/A" if telemetry_age_s is None else f"{telemetry_age_s:.3f}s"
+    print(
+        f"LIVE row={row_index} t={frame.elapsed_s:.3f}s "
+        f"move={frame.move_time_ms}ms telemetry_age={telemetry_age} "
+        "target/actual(error): " + " | ".join(status_parts),
+        flush=True,
+    )
+
+
+def main() -> None:
     _six_values(SERVO_IDS, "SERVO_IDS")
     if len(set(SERVO_IDS)) != len(SERVO_IDS):
         raise ValueError("SERVO_IDS must not contain duplicates")
@@ -245,22 +461,40 @@ def main() -> None:
         raise ValueError("Every SERVO_IDS value must be in the firmware range 0-5")
     if MAX_LAG_S < 0.0 or not math.isfinite(MAX_LAG_S):
         raise ValueError("MAX_LAG_S must be finite and non-negative")
+    if LIVE_DISPLAY_INTERVAL_S <= 0.0 or not math.isfinite(LIVE_DISPLAY_INTERVAL_S):
+        raise ValueError("LIVE_DISPLAY_INTERVAL_S must be finite and greater than zero")
+    if TELEMETRY_STALE_S <= 0.0 or not math.isfinite(TELEMETRY_STALE_S):
+        raise ValueError("TELEMETRY_STALE_S must be finite and greater than zero")
+    if RETURN_TO_START:
+        if not 1 <= RETURN_TO_START_TIME_MS <= 65535:
+            raise ValueError("RETURN_TO_START_TIME_MS must be in the range 1-65535")
+        if RETURN_TO_START_TOLERANCE < 0:
+            raise ValueError("RETURN_TO_START_TOLERANCE must be non-negative")
+        if RETURN_TO_START_TIMEOUT_S <= 0.0 or not math.isfinite(RETURN_TO_START_TIMEOUT_S):
+            raise ValueError("RETURN_TO_START_TIMEOUT_S must be finite and greater than zero")
+        if RETURN_TO_START_TIMEOUT_S < RETURN_TO_START_TIME_MS / 1000.0:
+            raise ValueError("RETURN_TO_START_TIMEOUT_S must cover RETURN_TO_START_TIME_MS")
+    position_units_per_mm = load_position_calibration(CALIBRATION_PATH)
+    player = ExcursionPlayer(
+        servo_ids=SERVO_IDS,
+        position_units_per_mm=position_units_per_mm,
+        time_scale=TIME_SCALE,
+        max_lag_s=MAX_LAG_S,
+        live_display_interval_s=LIVE_DISPLAY_INTERVAL_S,
+        telemetry_stale_s=TELEMETRY_STALE_S,
+    )
+
+
 
     csv_path = PREDICTION_CSV_PATH.expanduser().resolve()
-    elapsed_times, excursions = load_excursions(csv_path)
 
     if not EXECUTE:
         if START_POSITIONS is None:
             raise ValueError("Dry-run requires START_POSITIONS because no telemetry is opened")
-        frames = build_command_frames(
-            elapsed_times,
-            excursions,
-            START_POSITIONS,
-            POSITION_UNITS_PER_MM,
-            TIME_SCALE,
-        )
+        frames = player.load_and_build(csv_path, START_POSITIONS)
         print("DRY RUN: no serial commands will be sent")
-        print_summary(csv_path, frames, START_POSITIONS, SERVO_IDS)
+        player.print_summary(csv_path, frames, START_POSITIONS)
+        player.print_simulation_commands(frames)
         return
 
     # Delay importing pyserial-backed code until hardware execution is requested.
@@ -271,21 +505,35 @@ def main() -> None:
         baud_rate=BAUD_RATE,
         timeout=SERIAL_TIMEOUT_S,
     ) as api:
-        start_positions = read_start_positions(api, TELEMETRY_WAIT_S, SERVO_IDS)
-        # Validate the complete trajectory before issuing its first motor command.
-        frames = build_command_frames(
-            elapsed_times,
-            excursions,
-            start_positions,
-            POSITION_UNITS_PER_MM,
-            TIME_SCALE,
-        )
-        print_summary(csv_path, frames, start_positions, SERVO_IDS)
-        print("Executing servo trajectory. Press Ctrl-C to stop all servos.")
+        start_positions = player.read_start_positions(api, TELEMETRY_WAIT_S)
+        frames = player.load_and_build(csv_path, start_positions)
+        player.print_summary(csv_path, frames, start_positions)
+        telemetry_monitor = player.create_telemetry_monitor(api, SERIAL_TIMEOUT_S)
+        telemetry_monitor.start()
+        experiment_started_at = time.monotonic()
         try:
-            play_frames(api, frames, SERVO_IDS, MAX_LAG_S)
+            print("Executing servo trajectory. Press Ctrl-C to stop all servos.")
+            player.play(
+                api,
+                frames,
+                telemetry_monitor,
+                started_at=experiment_started_at,
+            )
+            if RETURN_TO_START:
+                player.return_to_start(
+                    api,
+                    start_positions,
+                    telemetry_monitor,
+                    experiment_started_at=experiment_started_at,
+                    move_time_ms=RETURN_TO_START_TIME_MS,
+                    tolerance=RETURN_TO_START_TOLERANCE,
+                    timeout_s=RETURN_TO_START_TIMEOUT_S,
+                )
         finally:
-            api.stop_all()
+            try:
+                api.stop_all()
+            finally:
+                telemetry_monitor.stop()
 
     print("Playback completed; stop_all() was sent.")
 
