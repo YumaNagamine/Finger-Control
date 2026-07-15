@@ -1,10 +1,11 @@
-"""Move one tendon by a fixed signed excursion each time Enter is pressed.
+"""Move one tendon by a fixed signed excursion from the terminal.
 
 This is an interactive terminal tool for the physical servo system.  Hardware
 mode currently supports Windows.  Dry-run mode supports Windows and macOS and
 prints the serial command without opening a port.  In hardware mode, each
 movement starts from the latest measured absolute servo position.  Press Esc
-at any time to stop and exit.
+at any time to stop and exit.  Enter moves in the configured direction;
+Backspace moves by the same distance in the opposite direction.
 
 The signed position-units-per-mm calibration is shared with the excursion CSV
 players.  Its sign defines which servo-position direction corresponds to a
@@ -58,6 +59,7 @@ BAUD_RATE = 921600
 SERIAL_TIMEOUT_S = 0.05
 
 ENTER_KEYS = {"\r", "\n"}
+BACKSPACE_KEYS = {"\x08", "\x7f"}
 ESC_KEY = "\x1b"
 
 
@@ -116,6 +118,14 @@ def calculate_target_position(
             f"{actual_position} and requested delta is {position_delta:+d} units."
         )
     return target_position, position_delta
+
+
+def excursion_for_key(key: str | None) -> float | None:
+    if key in ENTER_KEYS:
+        return EXCURSION_MM
+    if key in BACKSPACE_KEYS:
+        return -EXCURSION_MM
+    return None
 
 
 def load_windows_key_poller() -> Callable[[], str | None]:
@@ -232,20 +242,24 @@ def run_dry_run(units_per_mm: float, poll_key: Callable[[], str | None]) -> None
         f"simulated_absolute_position={simulated_position}"
     )
     print("No serial port will be opened and no command will be sent.")
-    print("Press Enter to print one command. Press Esc to exit.")
+    print(
+        "Press Enter for the configured direction, Backspace for the opposite "
+        "direction, or Esc to exit."
+    )
 
     while True:
         key = poll_key()
         if key == ESC_KEY:
             print("DRY RUN: Esc pressed; exiting without sending a command.")
             return
-        if key not in ENTER_KEYS:
+        requested_excursion_mm = excursion_for_key(key)
+        if requested_excursion_mm is None:
             time.sleep(0.01)
             continue
 
         target_position, actual_delta = calculate_target_position(
             simulated_position,
-            EXCURSION_MM,
+            requested_excursion_mm,
             units_per_mm,
         )
         command = f"x,{SERVO_ID},{target_position},{MOVE_TIME_MS}"
@@ -266,7 +280,10 @@ def run_manual_control(api, units_per_mm: float, poll_key: Callable[[], str | No
         f"Ready: {TENDON} (servo {SERVO_ID}), excursion={EXCURSION_MM:+.3f} mm, "
         f"delta={position_delta:+d} units, absolute_position={initial_position}"
     )
-    print("Press Enter to move once. Press Esc to stop all servos and exit.")
+    print(
+        "Press Enter for the configured direction, Backspace for the opposite "
+        "direction, or Esc to stop all servos and exit."
+    )
 
     latest_frame = initial_frame
     while True:
@@ -277,13 +294,14 @@ def run_manual_control(api, units_per_mm: float, poll_key: Callable[[], str | No
         key = poll_key()
         if key == ESC_KEY:
             raise ExitRequested
-        if key not in ENTER_KEYS:
+        requested_excursion_mm = excursion_for_key(key)
+        if requested_excursion_mm is None:
             continue
 
         before_position = latest_frame.positions[SERVO_ID]
         target_position, actual_delta = calculate_target_position(
             before_position,
-            EXCURSION_MM,
+            requested_excursion_mm,
             units_per_mm,
         )
         print(
@@ -301,7 +319,10 @@ def run_manual_control(api, units_per_mm: float, poll_key: Callable[[], str | No
             f"target={target_position}, error={target_position - final_position:+d}, "
             f"speed={final_speed}"
         )
-        print("Press Enter to move again. Press Esc to stop all servos and exit.")
+        print(
+            "Press Enter for the configured direction, Backspace for the opposite "
+            "direction, or Esc to stop all servos and exit."
+        )
 
 
 def main() -> None:
