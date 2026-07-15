@@ -3,14 +3,11 @@
 import argparse
 import csv
 import datetime
-import inspect
 import sys
 from pathlib import Path
 
 import cv2
-import deeplabcut
 import numpy as np
-import pandas as pd
 
 # Ensure repository root is importable when running as a script.
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +15,10 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from observation.vision.dlc_angle_processor import DLCAngleProcessor
+from observation.vision.dlc_offline_inference import (
+    load_dlc_predictions,
+    prepare_dlc_prediction_file,
+)
 from observation.vision.weight_displacement_processor import WeightDisplacementProcessor
 from utils.config_loader import load_config
 from utils.path_utils import resolve_path
@@ -84,231 +85,6 @@ def _row_bool(value: str | int | None) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
-def _build_analyze_kwargs(inference_settings: dict, output_dir: Path) -> dict:
-    signature = inspect.signature(deeplabcut.analyze_videos)
-    accepted = set(signature.parameters.keys())
-
-    requested = {
-        "shuffle": inference_settings.get("shuffle"),
-        "trainingsetindex": inference_settings.get("trainingsetindex"),
-        "videotype": inference_settings.get("videotype"),
-        "save_as_csv": inference_settings.get("save_as_csv"),
-        "gputouse": inference_settings.get("gputouse"),
-        "batchsize": inference_settings.get("batchsize"),
-        "cropping": inference_settings.get("cropping"),
-        "dynamic": inference_settings.get("dynamic"),
-        "auto_track": inference_settings.get("auto_track"),
-        "n_tracks": inference_settings.get("n_tracks"),
-        "robust_nframes": inference_settings.get("robust_nframes"),
-        "snapshotindex": inference_settings.get("snapshotindex"),
-    }
-    if "destfolder" in accepted:
-        requested["destfolder"] = str(output_dir)
-
-    kwargs: dict[str, object] = {}
-    for key, value in requested.items():
-        if value is None:
-            continue
-        if key in accepted:
-            kwargs[key] = value
-    return kwargs
-
-
-def _find_prediction_file(video_path: Path, candidate_dirs: list[Path]) -> Path:
-    matches: list[Path] = []
-    for directory in candidate_dirs:
-        if not directory.exists():
-            continue
-        for candidate in directory.glob(f"{video_path.stem}*.h5"):
-            if "_filtered" in candidate.stem:
-                continue
-            matches.append(candidate)
-
-    if not matches:
-        raise FileNotFoundError(
-            f"Raw prediction .h5 file not found after analyze step. Looked in: {', '.join(str(d) for d in candidate_dirs)}"
-        )
-
-    return max(matches, key=lambda p: p.stat().st_mtime)
-
-
-def _extract_bodyparts(df: pd.DataFrame) -> tuple[str, list[str]]:
-    if not isinstance(df.columns, pd.MultiIndex) or df.columns.nlevels < 3:
-        raise ValueError("Unsupported prediction format: expected MultiIndex with x/y data")
-
-    scorer = str(df.columns.get_level_values(0)[0])
-    all_bodyparts = df.columns.get_level_values(1)
-    bodyparts = list(dict.fromkeys(str(bp) for bp in all_bodyparts))
-    return scorer, bodyparts
-
-
-def _prepare_keypoint_tracks(
-    df: pd.DataFrame,
-    scorer: str,
-    bodyparts: list[str],
-) -> list[tuple[str, np.ndarray, np.ndarray, np.ndarray]]:
-    tracks: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
-    for bodypart in bodyparts:
-        x_col = (scorer, bodypart, "x")
-        y_col = (scorer, bodypart, "y")
-        l_col = (scorer, bodypart, "likelihood")
-        if x_col not in df.columns or y_col not in df.columns:
-            continue
-
-        x_values = df[x_col].to_numpy(copy=False)
-        y_values = df[y_col].to_numpy(copy=False)
-        if l_col in df.columns:
-            likelihood_values = df[l_col].to_numpy(copy=False)
-        else:
-            likelihood_values = np.ones_like(x_values, dtype=np.float32)
-        tracks.append((bodypart, x_values, y_values, likelihood_values))
-    return tracks
-
-
-def _draw_keypoints_video(
-    video_path: Path,
-    prediction_h5: Path,
-    output_path: Path,
-    pcutoff: float,
-    dotsize: int,
-    color_bgr: tuple[int, int, int],
-    show_labels: bool,
-) -> None:
-    df = pd.read_hdf(prediction_h5)
-    scorer, bodyparts = _extract_bodyparts(df)
-    keypoint_tracks = _prepare_keypoint_tracks(df, scorer, bodyparts)
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    if fps <= 0.0:
-        fps = 30.0
-
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Failed to open output video writer: {output_path}")
-
-    max_frames = len(df.index)
-    frame_index = 0
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame_index >= max_frames:
-                break
-
-            for bodypart, x_values, y_values, likelihood_values in keypoint_tracks:
-                x = float(x_values[frame_index])
-                y = float(y_values[frame_index])
-                likelihood = float(likelihood_values[frame_index])
-
-                if np.isnan(x) or np.isnan(y) or likelihood < pcutoff:
-                    continue
-
-                center = (int(round(x)), int(round(y)))
-                cv2.circle(frame, center, dotsize, color_bgr, thickness=-1, lineType=cv2.LINE_AA)
-                if show_labels:
-                    cv2.putText(
-                        frame,
-                        bodypart,
-                        (center[0] + 6, center[1] - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        color_bgr,
-                        1,
-                        cv2.LINE_AA,
-                    )
-
-            writer.write(frame)
-            frame_index += 1
-    finally:
-        cap.release()
-        writer.release()
-
-
-def _prepare_dlc_prediction_file(
-    cam0_video_path: Path,
-    inference_settings_path: Path,
-) -> Path:
-    settings = load_config(inference_settings_path, required_keys=("deeplabcut_config_path", "inference"))
-    settings_dir = inference_settings_path.parent
-    config_path_raw = settings.get("deeplabcut_config_path")
-    if not isinstance(config_path_raw, str) or not config_path_raw.strip():
-        raise ValueError("`deeplabcut_config_path` is required in DLC inference settings")
-    dlc_project_config_path = resolve_path(config_path_raw, settings_dir)
-    if dlc_project_config_path is None or not dlc_project_config_path.exists():
-        raise FileNotFoundError(f"deeplabcut config not found: {dlc_project_config_path}")
-
-    inference = settings["inference"]
-    if not isinstance(inference, dict):
-        raise ValueError("`inference` must be a JSON object")
-
-    output_dir = cam0_video_path.parent / "dlc_inference"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    analyze_kwargs = _build_analyze_kwargs(inference, output_dir)
-    print(f"[analyze] config: {dlc_project_config_path}")
-    print(f"[analyze] kwargs: {analyze_kwargs}")
-    deeplabcut.analyze_videos(str(dlc_project_config_path), [str(cam0_video_path)], **analyze_kwargs)
-
-    prediction_h5 = _find_prediction_file(cam0_video_path, [output_dir, cam0_video_path.parent])
-    print(f"[analyze] prediction: {prediction_h5}")
-    if bool(inference.get("save_raw_labeled_video", True)):
-        raw_output_path = output_dir / f"{cam0_video_path.stem}_labeled.mp4"
-        color_raw = inference.get("color_bgr", [0, 255, 0])
-        if (
-            not isinstance(color_raw, list)
-            or len(color_raw) != 3
-            or not all(isinstance(v, (int, float)) for v in color_raw)
-        ):
-            raise ValueError("`inference.color_bgr` must be [b, g, r]")
-        color_bgr = tuple(int(max(0, min(255, v))) for v in color_raw)
-        _draw_keypoints_video(
-            video_path=cam0_video_path,
-            prediction_h5=prediction_h5,
-            output_path=raw_output_path,
-            pcutoff=float(inference.get("pcutoff", 0.6)),
-            dotsize=int(inference.get("dotsize", 6)),
-            color_bgr=color_bgr,
-            show_labels=bool(inference.get("show_labels", False)),
-        )
-        print(f"[analyze] labeled video: {raw_output_path}")
-    return prediction_h5
-
-
-def _load_prediction_tracks(prediction_h5_path: Path) -> tuple[str, dict[str, dict[str, np.ndarray]]]:
-    df = pd.read_hdf(prediction_h5_path)
-    scorer, bodyparts = _extract_bodyparts(df)
-    tracks: dict[str, dict[str, np.ndarray]] = {}
-    for bodypart in bodyparts:
-        x_col = (scorer, bodypart, "x")
-        y_col = (scorer, bodypart, "y")
-        l_col = (scorer, bodypart, "likelihood")
-        if x_col not in df.columns or y_col not in df.columns:
-            continue
-        x_values = df[x_col].to_numpy(copy=False)
-        y_values = df[y_col].to_numpy(copy=False)
-        if l_col in df.columns:
-            likelihood_values = df[l_col].to_numpy(copy=False)
-        else:
-            likelihood_values = np.ones_like(x_values, dtype=np.float32)
-        tracks[bodypart] = {
-            "x": x_values,
-            "y": y_values,
-            "likelihood": likelihood_values,
-        }
-    return scorer, tracks
-
-
 def process_dual_recording_config(
     cfg: dict,
     *,
@@ -353,8 +129,8 @@ def process_dual_recording_config(
         mm_per_pixel=mm_per_pixel,
     )
 
-    prediction_h5_path = _prepare_dlc_prediction_file(cam0_video_path, dlc_inference_settings_path)
-    _, prediction_tracks = _load_prediction_tracks(prediction_h5_path)
+    prediction_h5_path = prepare_dlc_prediction_file(cam0_video_path, dlc_inference_settings_path)
+    predictions = load_dlc_predictions(prediction_h5_path)
 
     cap0 = cv2.VideoCapture(str(cam0_video_path))
     cap1 = cv2.VideoCapture(str(cam1_video_path))
@@ -420,16 +196,15 @@ def process_dual_recording_config(
                         print("Stopping: cam0 video ended before pair CSV.")
                         break
                     frame0_idx = int(cam0_frame_idx_txt) if cam0_frame_idx_txt != "" else row_count
-                    raw_keypoints: dict[str, tuple[float, float, float]] = {}
-                    for name in dlc_processor.keypoint_names:
-                        track = prediction_tracks.get(name)
-                        if track is None or frame0_idx >= len(track["x"]):
-                            raw_keypoints[name] = (float("nan"), float("nan"), 0.0)
-                            continue
-                        raw_keypoints[name] = (
-                            float(track["x"][frame0_idx]),
-                            float(track["y"][frame0_idx]),
-                            float(track["likelihood"][frame0_idx]),
+                    if frame0_idx >= predictions.frame_count:
+                        raw_keypoints = {
+                            name: (float("nan"), float("nan"), 0.0)
+                            for name in dlc_processor.keypoint_names
+                        }
+                    else:
+                        raw_keypoints = predictions.keypoints_for_frame(
+                            frame0_idx,
+                            dlc_processor.keypoint_names,
                         )
                     dlc_result, dlc_overlay = dlc_processor.process_keypoints(
                         frame0,
@@ -571,4 +346,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
