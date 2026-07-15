@@ -3,17 +3,22 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sma-finger-control"
+name = "finger-control"
 version = "0.1.0"
 description = "SMA finger control and vision utilities"
 requires-python = ">=3.9"
 dependencies = [
-  "numpy",
-  "pandas",
-  "matplotlib",
-  "pillow",
-  "opencv-python",
-  "ttkbootstrap",
+  "numpy>=1.24,<2",
+  "pandas>=2.0",
+  "matplotlib>=3.7",
+  "opencv-python>=4.8",
+  "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dlc = [
+  "deeplabcut==3.0.0rc14",
+  "deeplabcut-live==1.1.0",
 ]
 
 [tool.setuptools]
