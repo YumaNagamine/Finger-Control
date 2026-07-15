@@ -1,7 +1,7 @@
 """Check each servo by moving it away from and back to its start position.
 
 The tendon/servo order is FDP, FDS, EI, DI, PI, LUM, mapped to servo IDs
-0, 1, 2, 3, 4, 5. Positive ``--distance-mm`` follows the signed conversion
+5, 4, 2, 3, 1, 0. Positive ``--distance-mm`` follows the signed conversion
 defined in ``excursion_servo_calibration.json``.
 
 By default this script moves the physical servos. Pass ``--dry-run`` to print
@@ -28,17 +28,20 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
+from controller.servo_mapping import (
+    SERVO_IDS_BY_TENDON,
+    TENDONS,
+)
 from controller.csv_player.excursion_player import (
     SERVO_POSITION_MAX,
     SERVO_POSITION_MIN,
-    TENDONS,
     TelemetryMonitor,
     load_position_calibration,
 )
 
 
 CALIBRATION_PATH = SRC_ROOT / "controller" / "excursion_servo_calibration.json"
-SERVO_IDS = (0, 1, 2, 3, 4, 5)
+SERVO_IDS = SERVO_IDS_BY_TENDON
 SIMULATION_START_POSITIONS = (2048, 2048, 2048, 2048, 2048, 2048)
 
 DEFAULT_DISTANCE_MM = 20
