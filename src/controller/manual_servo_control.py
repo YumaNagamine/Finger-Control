@@ -41,19 +41,22 @@ from controller.csv_player.excursion_player import (
 # ---------------------------------------------------------------------------
 TENDON = "FDP"
 SERVO_ID = TENDON_TO_SERVO_ID.get(TENDON, -1)
-EXCURSION_MM = +5.0
+EXCURSION_MM = +20.0
 DRY_RUN = False
 SIMULATION_START_POSITION = 2048
 
 CALIBRATION_PATH = SRC_ROOT / "controller" / "excursion_servo_calibration.json"
 
-MOVE_TIME_MS = 1000
+MOVE_TIME_MS = 0
 POSITION_TOLERANCE = 10
 SPEED_TOLERANCE = 5
 STABLE_FRAME_COUNT = 3
 ARRIVAL_TIMEOUT_S = 3.0
 TELEMETRY_WAIT_S = 3.0
 TELEMETRY_DISPLAY_INTERVAL_S = 0.1
+ID_MAP_RESET_WAIT_S = 0.1
+POSITION_MODE_PREPARE_WAIT_S = 0.2
+POSITION_MODE_PRIME_WAIT_S = 0.2
 
 SERIAL_PORT = "COM3"
 BAUD_RATE = 921600
@@ -85,8 +88,8 @@ def validate_settings() -> None:
             f"SIMULATION_START_POSITION must be in the range "
             f"{SERVO_POSITION_MIN}-{SERVO_POSITION_MAX}"
         )
-    if not 1 <= MOVE_TIME_MS <= 65535:
-        raise ValueError("MOVE_TIME_MS must be in the range 1-65535")
+    if not 0 <= MOVE_TIME_MS <= 65535:
+        raise ValueError("MOVE_TIME_MS must be in the range 0-65535")
     if POSITION_TOLERANCE < 0:
         raise ValueError("POSITION_TOLERANCE must be non-negative")
     if SPEED_TOLERANCE < 0:
@@ -106,6 +109,28 @@ def validate_settings() -> None:
         raise ValueError(
             "TELEMETRY_DISPLAY_INTERVAL_S must be finite and greater than zero"
         )
+    if (
+        not math.isfinite(ID_MAP_RESET_WAIT_S)
+        or ID_MAP_RESET_WAIT_S <= 0.0
+    ):
+        raise ValueError(
+            "ID_MAP_RESET_WAIT_S must be finite and greater than zero"
+        )
+    if (
+        not math.isfinite(POSITION_MODE_PREPARE_WAIT_S)
+        or POSITION_MODE_PREPARE_WAIT_S <= 0.0
+    ):
+        raise ValueError(
+            "POSITION_MODE_PREPARE_WAIT_S must be finite and greater than zero"
+        )
+    if (
+        not math.isfinite(POSITION_MODE_PRIME_WAIT_S)
+        or POSITION_MODE_PRIME_WAIT_S <= 0.0
+    ):
+        raise ValueError(
+            "POSITION_MODE_PRIME_WAIT_S must be finite and greater than zero"
+        )
+
     if BAUD_RATE <= 0:
         raise ValueError("BAUD_RATE must be greater than zero")
     if SERIAL_TIMEOUT_S <= 0.0:
@@ -293,9 +318,44 @@ def run_dry_run(units_per_mm: float, poll_key: Callable[[], str | None]) -> None
         simulated_position = target_position
 
 
+def prepare_position_control(api) -> None:
+    print(
+        "Resetting the firmware RAM ID map: "
+        f"wait={ID_MAP_RESET_WAIT_S:.3f}s"
+    )
+    api.reset_ids()
+    time.sleep(ID_MAP_RESET_WAIT_S)
+
+    print(
+        f"Preparing all {len(TENDONS)} servos for position control: "
+        f"speed=0, force_init=True, wait={POSITION_MODE_PREPARE_WAIT_S:.3f}s"
+    )
+    for servo_id in range(len(TENDONS)):
+        api.set_speed(servo_id, 0, force_init=True)
+    time.sleep(POSITION_MODE_PREPARE_WAIT_S)
+    print(f"Position-control preparation completed for {TENDON} (servo {SERVO_ID}).")
+
+
 def run_manual_control(api, units_per_mm: float, poll_key: Callable[[], str | None]) -> None:
     initial_frame = read_fresh_telemetry(api, TELEMETRY_WAIT_S)
     initial_position = initial_frame.positions[SERVO_ID]
+
+    # The first position command after switching from wheel mode to servo mode
+    # may only complete the mode transition. Prime the controller with a
+    # no-movement command, then use the resulting measured position as the
+    # reference for manual moves.
+    print(
+        "Priming position mode: "
+        f"servo={SERVO_ID}, target=current_position={initial_position}"
+    )
+    api.set_position(SERVO_ID, initial_position, time_ms=0)
+    time.sleep(POSITION_MODE_PRIME_WAIT_S)
+    initial_frame = read_fresh_telemetry(api, TELEMETRY_WAIT_S)
+    initial_position = initial_frame.positions[SERVO_ID]
+    print(
+        "Position mode ready: "
+        f"servo={SERVO_ID}, actual_position={initial_position}"
+    )
     position_delta = round(EXCURSION_MM * units_per_mm)
 
     print(
@@ -365,6 +425,7 @@ def main() -> None:
             timeout=SERIAL_TIMEOUT_S,
         ) as api:
             try:
+                prepare_position_control(api)
                 run_manual_control(api, units_per_mm, poll_key)
             except ExitRequested:
                 print("Esc pressed; stopping all servos.")
