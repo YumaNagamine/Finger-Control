@@ -10,9 +10,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
+from controller.servo_mapping import TENDONS
 
 
-TENDONS = ("FDP", "FDS", "EI", "DI", "PI", "LUM")
 EXCURSION_COLUMNS = tuple(f"{tendon}_predicted_excursion_mm" for tendon in TENDONS)
 SERVO_POSITION_MIN = 0
 SERVO_POSITION_MAX = 4095

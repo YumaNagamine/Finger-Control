@@ -17,10 +17,10 @@ SRC_ROOT = Path(__file__).resolve().parents[2]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
+from controller.servo_mapping import SERVO_IDS_BY_TENDON, TENDONS
 from controller.csv_player.excursion_player import (
     ExcursionPlayer,
     PlaybackStatus,
-    TENDONS,
     load_position_calibration,
 )
 from observation.camera.camera_recorder import CameraRecorder
@@ -42,7 +42,7 @@ PREDICTION_CSV_PATH = (
 )
 
 CALIBRATION_PATH = SRC_ROOT / "controller" / "excursion_servo_calibration.json"
-SERVO_IDS = (0, 1, 2, 3, 4, 5)
+SERVO_IDS = SERVO_IDS_BY_TENDON
 START_POSITIONS: tuple[int, ...] | None = (2048, 2048, 2048, 2048, 2048, 2048)
 
 TIME_SCALE = 1.0

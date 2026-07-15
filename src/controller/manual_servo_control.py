@@ -26,23 +26,23 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
+from controller.servo_mapping import TENDONS, TENDON_TO_SERVO_ID
 from controller.csv_player.excursion_player import (
     SERVO_POSITION_MAX,
     SERVO_POSITION_MIN,
-    TENDONS,
     load_position_calibration,
 )
 
 
 # ---------------------------------------------------------------------------
 # User settings
-# Servo IDs and tendon names currently use the same fixed order:
-# FDP, FDS, EI, DI, PI, LUM -> 0, 1, 2, 3, 4, 5.
+# GUI-compatible mapping: FDP->5, FDS->4, EI(ED)->2, DI->3, PI->1, LUM(LU)->0.
+# Change TENDON only; SERVO_ID is derived from the shared mapping.
 # ---------------------------------------------------------------------------
 TENDON = "FDP"
-SERVO_ID = 0
+SERVO_ID = TENDON_TO_SERVO_ID.get(TENDON, -1)
 EXCURSION_MM = +5.0
-DRY_RUN = True
+DRY_RUN = False
 SIMULATION_START_POSITION = 2048
 
 CALIBRATION_PATH = SRC_ROOT / "controller" / "excursion_servo_calibration.json"
@@ -53,8 +53,9 @@ SPEED_TOLERANCE = 5
 STABLE_FRAME_COUNT = 3
 ARRIVAL_TIMEOUT_S = 3.0
 TELEMETRY_WAIT_S = 3.0
+TELEMETRY_DISPLAY_INTERVAL_S = 0.1
 
-SERIAL_PORT = "COM7"
+SERIAL_PORT = "COM3"
 BAUD_RATE = 921600
 SERIAL_TIMEOUT_S = 0.05
 
@@ -72,7 +73,7 @@ def validate_settings() -> None:
         raise ValueError(f"TENDON must be one of {TENDONS}, got {TENDON!r}")
     if not 0 <= SERVO_ID < len(TENDONS):
         raise ValueError(f"SERVO_ID must be 0-{len(TENDONS) - 1}, got {SERVO_ID}")
-    expected_servo_id = TENDONS.index(TENDON)
+    expected_servo_id = TENDON_TO_SERVO_ID[TENDON]
     if SERVO_ID != expected_servo_id:
         raise ValueError(
             f"{TENDON} is mapped to servo {expected_servo_id}, not servo {SERVO_ID}"
@@ -98,6 +99,13 @@ def validate_settings() -> None:
         raise ValueError("ARRIVAL_TIMEOUT_S must cover MOVE_TIME_MS")
     if not math.isfinite(TELEMETRY_WAIT_S) or TELEMETRY_WAIT_S <= 0.0:
         raise ValueError("TELEMETRY_WAIT_S must be finite and greater than zero")
+    if (
+        not math.isfinite(TELEMETRY_DISPLAY_INTERVAL_S)
+        or TELEMETRY_DISPLAY_INTERVAL_S <= 0.0
+    ):
+        raise ValueError(
+            "TELEMETRY_DISPLAY_INTERVAL_S must be finite and greater than zero"
+        )
     if BAUD_RATE <= 0:
         raise ValueError("BAUD_RATE must be greater than zero")
     if SERIAL_TIMEOUT_S <= 0.0:
@@ -196,6 +204,7 @@ def wait_until_stopped(
 ):
     deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
     stable_frames = 0
+    next_display_at = 0.0
 
     while time.monotonic() < deadline:
         if poll_key() == ESC_KEY:
@@ -213,6 +222,7 @@ def wait_until_stopped(
             )
 
         actual_position = frame.positions[SERVO_ID]
+        actual_load = frame.loads[SERVO_ID]
         actual_speed = frame.speeds[SERVO_ID]
         position_reached = (
             abs(target_position - actual_position) <= POSITION_TOLERANCE
@@ -225,6 +235,18 @@ def wait_until_stopped(
                 return frame
         else:
             stable_frames = 0
+
+        now = time.monotonic()
+        if now >= next_display_at:
+            print(
+                f"Telemetry: servo={SERVO_ID}, target={target_position}, "
+                f"actual={actual_position}, "
+                f"error={target_position - actual_position:+d}, "
+                f"speed={actual_speed}, load={actual_load}, "
+                f"stable={stable_frames}/{STABLE_FRAME_COUNT}",
+                flush=True,
+            )
+            next_display_at = now + TELEMETRY_DISPLAY_INTERVAL_S
 
     raise TimeoutError(
         f"Servo {SERVO_ID} did not stop at target {target_position} within "

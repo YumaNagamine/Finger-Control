@@ -33,10 +33,13 @@ SRC_ROOT = Path(__file__).resolve().parents[2]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
-from controller.csv_player.excursion_player import ExcursionPlayer, load_position_calibration
+from controller.servo_mapping import SERVO_IDS_BY_TENDON, TENDONS
+from controller.csv_player.excursion_player import (
+    ExcursionPlayer,
+    load_position_calibration,
+)
 
 
-TENDONS = ("FDP", "FDS", "EI", "DI", "PI", "LUM")
 EXCURSION_COLUMNS = tuple(f"{tendon}_predicted_excursion_mm" for tendon in TENDONS)
 SERVO_POSITION_MIN = 0
 SERVO_POSITION_MAX = 4095
@@ -61,7 +64,7 @@ CALIBRATION_PATH = (
     SRC_ROOT / "controller" / "excursion_servo_calibration.json"
 ) # 直径40mmなので 1周125mm, 4096stepあるので0.030679mm/step, 32.595 step/mm
 
-SERVO_IDS = (0, 1, 2, 3, 4, 5)
+SERVO_IDS = SERVO_IDS_BY_TENDON
 
 # Dry-run-only representative raw positions. Hardware execution always reads
 # the actual starting positions from servo telemetry.
