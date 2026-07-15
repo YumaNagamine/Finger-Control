@@ -4,13 +4,14 @@ The tendon/servo order is FDP, FDS, EI, DI, PI, LUM, mapped to servo IDs
 0, 1, 2, 3, 4, 5. Positive ``--distance-mm`` follows the signed conversion
 defined in ``excursion_servo_calibration.json``.
 
-Without ``--execute`` this script only prints the planned commands. To move
-the physical servos, explicitly pass ``--execute``.
+By default this script moves the physical servos. Pass ``--dry-run`` to print
+the planned commands without opening the serial port or moving any servo.
+So MAKE SURE THAT YOU CONNNECT THE SERVOS AND EACH TENDONS CORRECTLY.
 
 Examples::
 
     python -m controller.check_servo_motion --distance-mm 2.0
-    python -m controller.check_servo_motion --execute --distance-mm 2.0
+    python -m controller.check_servo_motion --dry-run --distance-mm 2.0
 """
 
 from __future__ import annotations
@@ -61,9 +62,9 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--execute",
+        "--dry-run",
         action="store_true",
-        help="Send commands to the physical servos (default: simulation only).",
+        help="Print planned commands without opening the serial port or moving servos.",
     )
     parser.add_argument(
         "--distance-mm",
@@ -327,7 +328,7 @@ def main() -> None:
     validate_args(args)
     position_units_per_mm = load_position_calibration(CALIBRATION_PATH)
 
-    if not args.execute:
+    if args.dry_run:
         target_positions = build_target_positions(
             SIMULATION_START_POSITIONS,
             position_units_per_mm,
