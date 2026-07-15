@@ -41,7 +41,7 @@ from controller.csv_player.excursion_player import (
 # ---------------------------------------------------------------------------
 TENDON = "FDP"
 SERVO_ID = TENDON_TO_SERVO_ID.get(TENDON, -1)
-EXCURSION_MM = +20.0
+EXCURSION_MM = +5.0
 DRY_RUN = False
 SIMULATION_START_POSITION = 2048
 
