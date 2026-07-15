@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "position_units_per_mm": {
-    "FDP": 32.595,
-    "FDS": 32.595,
-    "EI": 32.595,
-    "DI": 32.595,
-    "PI": 32.595,
-    "LUM": 32.595
+    "FDP": 65.1898,
+    "FDS": 65.1898,
+    "EI": 65.1898,
+    "DI": 65.1898,
+    "PI": 65.1898,
+    "LUM": 65.1898
   },
   "metadata": {
     "spool_diameter_mm": 40.0,
