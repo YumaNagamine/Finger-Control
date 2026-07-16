@@ -32,6 +32,14 @@ from controller.csv_player.excursion_player import (
     SERVO_POSITION_MIN,
     load_position_calibration,
 )
+from servo.control import (
+    PositionControlCancelledError,
+    PositionControlConfig,
+    PositionProgress,
+    ReliablePositionController,
+    RetryPolicy,
+    TelemetryMonitor,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +65,10 @@ TELEMETRY_DISPLAY_INTERVAL_S = 0.1
 ID_MAP_RESET_WAIT_S = 0.1
 POSITION_MODE_PREPARE_WAIT_S = 0.2
 POSITION_MODE_PRIME_WAIT_S = 0.2
+POSITION_MODE_PRIME_COMMAND_COUNT = 2
+START_OBSERVATION_S = 0.3
+START_MIN_DELTA = 3
+MAX_START_RETRIES = 1
 
 SERIAL_PORT = "COM3"
 BAUD_RATE = 921600
@@ -125,11 +137,19 @@ def validate_settings() -> None:
         )
     if (
         not math.isfinite(POSITION_MODE_PRIME_WAIT_S)
-        or POSITION_MODE_PRIME_WAIT_S <= 0.0
+        or POSITION_MODE_PRIME_WAIT_S < 0.0
     ):
         raise ValueError(
-            "POSITION_MODE_PRIME_WAIT_S must be finite and greater than zero"
+            "POSITION_MODE_PRIME_WAIT_S must be finite and non-negative"
         )
+    if POSITION_MODE_PRIME_COMMAND_COUNT <= 0:
+        raise ValueError("POSITION_MODE_PRIME_COMMAND_COUNT must be greater than zero")
+    if not math.isfinite(START_OBSERVATION_S) or START_OBSERVATION_S <= 0.0:
+        raise ValueError("START_OBSERVATION_S must be finite and greater than zero")
+    if START_MIN_DELTA < 0:
+        raise ValueError("START_MIN_DELTA must be non-negative")
+    if MAX_START_RETRIES < 0:
+        raise ValueError("MAX_START_RETRIES must be non-negative")
 
     if BAUD_RATE <= 0:
         raise ValueError("BAUD_RATE must be greater than zero")
@@ -213,72 +233,6 @@ def open_key_poller(*, dry_run: bool) -> Iterator[Callable[[], str | None]]:
     )
 
 
-def read_fresh_telemetry(api, timeout_s: float):
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        frame = api.try_read_telemetry()
-        if frame is not None and len(frame.positions) == len(TENDONS):
-            return frame
-    raise TimeoutError(f"No valid six-servo telemetry received within {timeout_s:.1f} s")
-
-
-def wait_until_stopped(
-    api,
-    target_position: int,
-    poll_key: Callable[[], str | None],
-):
-    deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
-    stable_frames = 0
-    next_display_at = 0.0
-
-    while time.monotonic() < deadline:
-        if poll_key() == ESC_KEY:
-            raise ExitRequested
-
-        frame = api.try_read_telemetry()
-        if frame is None:
-            continue
-        if len(frame.positions) != len(TENDONS):
-            continue
-        if frame.speeds is None or len(frame.speeds) != len(TENDONS):
-            raise RuntimeError(
-                "Servo-stop detection requires the 19-field telemetry format "
-                "with speed values from the current V3 firmware"
-            )
-
-        actual_position = frame.positions[SERVO_ID]
-        actual_load = frame.loads[SERVO_ID]
-        actual_speed = frame.speeds[SERVO_ID]
-        position_reached = (
-            abs(target_position - actual_position) <= POSITION_TOLERANCE
-        )
-        speed_settled = abs(actual_speed) <= SPEED_TOLERANCE
-
-        if position_reached and speed_settled:
-            stable_frames += 1
-            if stable_frames >= STABLE_FRAME_COUNT:
-                return frame
-        else:
-            stable_frames = 0
-
-        now = time.monotonic()
-        if now >= next_display_at:
-            print(
-                f"Telemetry: servo={SERVO_ID}, target={target_position}, "
-                f"actual={actual_position}, "
-                f"error={target_position - actual_position:+d}, "
-                f"speed={actual_speed}, load={actual_load}, "
-                f"stable={stable_frames}/{STABLE_FRAME_COUNT}",
-                flush=True,
-            )
-            next_display_at = now + TELEMETRY_DISPLAY_INTERVAL_S
-
-    raise TimeoutError(
-        f"Servo {SERVO_ID} did not stop at target {target_position} within "
-        f"{ARRIVAL_TIMEOUT_S:.1f} s"
-    )
-
-
 def run_dry_run(units_per_mm: float, poll_key: Callable[[], str | None]) -> None:
     simulated_position = SIMULATION_START_POSITION
     position_delta = round(EXCURSION_MM * units_per_mm)
@@ -318,44 +272,50 @@ def run_dry_run(units_per_mm: float, poll_key: Callable[[], str | None]) -> None
         simulated_position = target_position
 
 
-def prepare_position_control(api) -> None:
-    print(
-        "Resetting the firmware RAM ID map: "
-        f"wait={ID_MAP_RESET_WAIT_S:.3f}s"
+def build_position_control_config() -> PositionControlConfig:
+    return PositionControlConfig(
+        telemetry_stale_s=max(0.5, SERIAL_TIMEOUT_S * 2.0),
+        telemetry_wait_s=TELEMETRY_WAIT_S,
+        id_map_reset_wait_s=ID_MAP_RESET_WAIT_S,
+        speed_init_wait_s=POSITION_MODE_PREPARE_WAIT_S,
+        prime_command_count=POSITION_MODE_PRIME_COMMAND_COUNT,
+        prime_interval_s=POSITION_MODE_PRIME_WAIT_S,
+        start_observation_s=START_OBSERVATION_S,
+        start_min_delta=START_MIN_DELTA,
+        position_tolerance=POSITION_TOLERANCE,
+        speed_tolerance=SPEED_TOLERANCE,
+        stable_frame_count=STABLE_FRAME_COUNT,
+        arrival_timeout_s=ARRIVAL_TIMEOUT_S,
+        max_start_retries=MAX_START_RETRIES,
+        reset_id_map_on_prepare=True,
+        position_min=SERVO_POSITION_MIN,
+        position_max=SERVO_POSITION_MAX,
     )
-    api.reset_ids()
-    time.sleep(ID_MAP_RESET_WAIT_S)
 
+
+def prepare_position_control(controller: ReliablePositionController) -> None:
     print(
-        f"Preparing all {len(TENDONS)} servos for position control: "
-        f"speed=0, force_init=True, wait={POSITION_MODE_PREPARE_WAIT_S:.3f}s"
+        "Preparing position control: "
+        f"reset_ids=True, speed_init_servos=0-{len(TENDONS) - 1}, "
+        f"position_servo={SERVO_ID}, "
+        f"prime_commands={POSITION_MODE_PRIME_COMMAND_COUNT}"
     )
-    for servo_id in range(len(TENDONS)):
-        api.set_speed(servo_id, 0, force_init=True)
-    time.sleep(POSITION_MODE_PREPARE_WAIT_S)
-    print(f"Position-control preparation completed for {TENDON} (servo {SERVO_ID}).")
-
-
-def run_manual_control(api, units_per_mm: float, poll_key: Callable[[], str | None]) -> None:
-    initial_frame = read_fresh_telemetry(api, TELEMETRY_WAIT_S)
-    initial_position = initial_frame.positions[SERVO_ID]
-
-    # The first position command after switching from wheel mode to servo mode
-    # may only complete the mode transition. Prime the controller with a
-    # no-movement command, then use the resulting measured position as the
-    # reference for manual moves.
+    controller.prepare(
+        (SERVO_ID,),
+        force_init_servo_ids=tuple(range(len(TENDONS))),
+    )
     print(
-        "Priming position mode: "
-        f"servo={SERVO_ID}, target=current_position={initial_position}"
+        "Position mode primed: "
+        f"servo={SERVO_ID}, actual_position={controller.current_position(SERVO_ID)}"
     )
-    api.set_position(SERVO_ID, initial_position, time_ms=0)
-    time.sleep(POSITION_MODE_PRIME_WAIT_S)
-    initial_frame = read_fresh_telemetry(api, TELEMETRY_WAIT_S)
-    initial_position = initial_frame.positions[SERVO_ID]
-    print(
-        "Position mode ready: "
-        f"servo={SERVO_ID}, actual_position={initial_position}"
-    )
+
+
+def run_manual_control(
+    controller: ReliablePositionController,
+    units_per_mm: float,
+    poll_key: Callable[[], str | None],
+) -> None:
+    initial_position = controller.current_position(SERVO_ID)
     position_delta = round(EXCURSION_MM * units_per_mm)
 
     print(
@@ -367,12 +327,7 @@ def run_manual_control(api, units_per_mm: float, poll_key: Callable[[], str | No
         "direction, or Esc to stop all servos and exit."
     )
 
-    latest_frame = initial_frame
     while True:
-        frame = api.try_read_telemetry()
-        if frame is not None and len(frame.positions) == len(TENDONS):
-            latest_frame = frame
-
         key = poll_key()
         if key == ESC_KEY:
             raise ExitRequested
@@ -380,7 +335,7 @@ def run_manual_control(api, units_per_mm: float, poll_key: Callable[[], str | No
         if requested_excursion_mm is None:
             continue
 
-        before_position = latest_frame.positions[SERVO_ID]
+        before_position = controller.current_position(SERVO_ID)
         target_position, actual_delta = calculate_target_position(
             before_position,
             requested_excursion_mm,
@@ -390,16 +345,41 @@ def run_manual_control(api, units_per_mm: float, poll_key: Callable[[], str | No
             f"Moving: servo={SERVO_ID}, {before_position} -> {target_position} "
             f"({actual_delta:+d} units)"
         )
-        api.set_position(SERVO_ID, target_position, time_ms=MOVE_TIME_MS)
+        next_display_at = 0.0
 
-        final_frame = wait_until_stopped(api, target_position, poll_key)
-        latest_frame = final_frame
-        final_position = final_frame.positions[SERVO_ID]
-        final_speed = final_frame.speeds[SERVO_ID]
+        def display_progress(progress: PositionProgress) -> None:
+            nonlocal next_display_at
+            now = time.monotonic()
+            if now < next_display_at:
+                return
+            print(
+                f"Telemetry: phase={progress.phase}, attempt={progress.attempt}, "
+                f"servo={progress.servo_id}, target={progress.target_position}, "
+                f"actual={progress.actual_position}, "
+                f"error={progress.target_position - progress.actual_position:+d}, "
+                f"speed={progress.speed}, load={progress.load}, "
+                f"stable={progress.stable_frames}/{STABLE_FRAME_COUNT}",
+                flush=True,
+            )
+            next_display_at = now + TELEMETRY_DISPLAY_INTERVAL_S
+
+        try:
+            result = controller.move_and_wait(
+                SERVO_ID,
+                target_position,
+                time_ms=MOVE_TIME_MS,
+                retry_policy=RetryPolicy.ON_NO_START,
+                progress_callback=display_progress,
+                cancel_check=lambda: poll_key() == ESC_KEY,
+            )
+        except PositionControlCancelledError as exc:
+            raise ExitRequested from exc
+
         print(
-            f"Stopped: servo={SERVO_ID}, absolute_position={final_position}, "
-            f"target={target_position}, error={target_position - final_position:+d}, "
-            f"speed={final_speed}"
+            f"Stopped: servo={SERVO_ID}, absolute_position={result.final_position}, "
+            f"target={target_position}, "
+            f"error={target_position - result.final_position:+d}, "
+            f"speed={result.final_speed}, retries={result.retries}"
         )
         print(
             "Press Enter for the configured direction, Backspace for the opposite "
@@ -424,15 +404,29 @@ def main() -> None:
             baud_rate=BAUD_RATE,
             timeout=SERIAL_TIMEOUT_S,
         ) as api:
+            telemetry = TelemetryMonitor(
+                api,
+                num_servos=len(TENDONS),
+                read_timeout_s=SERIAL_TIMEOUT_S,
+            )
+            controller = ReliablePositionController(
+                api,
+                telemetry,
+                build_position_control_config(),
+            )
+            telemetry.start()
             try:
-                prepare_position_control(api)
-                run_manual_control(api, units_per_mm, poll_key)
+                prepare_position_control(controller)
+                run_manual_control(controller, units_per_mm, poll_key)
             except ExitRequested:
                 print("Esc pressed; stopping all servos.")
             except KeyboardInterrupt:
                 print("\nCtrl-C received; stopping all servos.")
             finally:
-                api.stop_all()
+                try:
+                    controller.stop_all()
+                finally:
+                    telemetry.stop()
 
 
 if __name__ == "__main__":
