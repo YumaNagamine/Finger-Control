@@ -446,10 +446,19 @@ class ReliablePositionController:
             ) from exc
 
     def _fresh_snapshot(self) -> TelemetrySnapshot:
-        snapshot = self._telemetry.latest(self.config.telemetry_stale_s)
-        if snapshot is None:
-            raise TelemetryUnavailableError("Fresh servo telemetry is not available")
-        return snapshot
+        deadline = time.monotonic() + self.config.telemetry_wait_s
+        while True:
+            snapshot = self._telemetry.latest(self.config.telemetry_stale_s)
+            if snapshot is not None:
+                return snapshot
+
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                raise TelemetryUnavailableError(
+                    "Fresh servo telemetry is not available after waiting "
+                    f"{self.config.telemetry_wait_s:.3f} s"
+                )
+            self._sleep(min(0.01, remaining_s))
 
     def _wait_for_newer(self, sequence: int) -> TelemetrySnapshot:
         try:
