@@ -35,8 +35,14 @@ from controller.servo_mapping import (
 from controller.csv_player.excursion_player import (
     SERVO_POSITION_MAX,
     SERVO_POSITION_MIN,
-    TelemetryMonitor,
     load_position_calibration,
+)
+from servo.control import (
+    PositionControlConfig,
+    PositionProgress,
+    ReliablePositionController,
+    RetryPolicy,
+    TelemetryMonitor,
 )
 
 
@@ -44,7 +50,7 @@ CALIBRATION_PATH = SRC_ROOT / "controller" / "excursion_servo_calibration.json"
 SERVO_IDS = SERVO_IDS_BY_TENDON
 SIMULATION_START_POSITIONS = (2048, 2048, 2048, 2048, 2048, 2048)
 
-DEFAULT_DISTANCE_MM = 20
+DEFAULT_DISTANCE_MM = 10.0
 DEFAULT_MOVE_TIME_MS = 1000
 DEFAULT_HOLD_TIME_S = 0.5
 DEFAULT_TOLERANCE = 10
@@ -52,9 +58,18 @@ DEFAULT_ARRIVAL_TIMEOUT_S = 3.0
 DEFAULT_TELEMETRY_WAIT_S = 3.0
 DEFAULT_TELEMETRY_STALE_S = 0.5
 DEFAULT_DISPLAY_INTERVAL_S = 0.1
-DEFAULT_SERIAL_PORT = "COM7"
+DEFAULT_SERIAL_PORT = "COM3"
 DEFAULT_BAUD_RATE = 921600
 DEFAULT_SERIAL_TIMEOUT_S = 0.2
+DEFAULT_SPEED_TOLERANCE = 5
+DEFAULT_STABLE_FRAME_COUNT = 3
+DEFAULT_ID_MAP_RESET_WAIT_S = 0.1
+DEFAULT_POSITION_MODE_PREPARE_WAIT_S = 0.2
+DEFAULT_POSITION_MODE_PRIME_WAIT_S = 0.2
+DEFAULT_POSITION_MODE_PRIME_COMMAND_COUNT = 2
+DEFAULT_START_OBSERVATION_S = 0.3
+DEFAULT_START_MIN_DELTA = 3
+DEFAULT_MAX_START_RETRIES = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,13 +160,25 @@ def build_target_positions(
     return targets
 
 
-def read_start_positions(api, timeout_s: float) -> tuple[int, ...]:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        frame = api.try_read_telemetry()
-        if frame is not None and len(frame.positions) == len(TENDONS):
-            return tuple(frame.positions[servo_id] for servo_id in SERVO_IDS)
-    raise TimeoutError(f"No valid six-servo telemetry received within {timeout_s:.1f} s")
+def build_position_control_config(args: argparse.Namespace) -> PositionControlConfig:
+    return PositionControlConfig(
+        telemetry_stale_s=DEFAULT_TELEMETRY_STALE_S,
+        telemetry_wait_s=DEFAULT_TELEMETRY_WAIT_S,
+        id_map_reset_wait_s=DEFAULT_ID_MAP_RESET_WAIT_S,
+        speed_init_wait_s=DEFAULT_POSITION_MODE_PREPARE_WAIT_S,
+        prime_command_count=DEFAULT_POSITION_MODE_PRIME_COMMAND_COUNT,
+        prime_interval_s=DEFAULT_POSITION_MODE_PRIME_WAIT_S,
+        start_observation_s=DEFAULT_START_OBSERVATION_S,
+        start_min_delta=DEFAULT_START_MIN_DELTA,
+        position_tolerance=args.tolerance,
+        speed_tolerance=DEFAULT_SPEED_TOLERANCE,
+        stable_frame_count=DEFAULT_STABLE_FRAME_COUNT,
+        arrival_timeout_s=args.arrival_timeout_s,
+        max_start_retries=DEFAULT_MAX_START_RETRIES,
+        reset_id_map_on_prepare=True,
+        position_min=SERVO_POSITION_MIN,
+        position_max=SERVO_POSITION_MAX,
+    )
 
 
 def print_plan(
@@ -172,79 +199,80 @@ def print_plan(
         )
 
 
-def wait_for_positions(
-    telemetry_monitor: TelemetryMonitor,
-    servo_ids: Sequence[int],
-    targets: Sequence[int],
+def prepare_position_control(controller: ReliablePositionController) -> None:
+    print(
+        "Preparing position control: "
+        f"reset_ids=True, speed_init_servos=0-{len(TENDONS) - 1}, "
+        f"position_servos={SERVO_IDS}, "
+        f"prime_commands={DEFAULT_POSITION_MODE_PRIME_COMMAND_COUNT}"
+    )
+    controller.prepare(
+        SERVO_IDS,
+        force_init_servo_ids=tuple(range(len(TENDONS))),
+    )
+
+
+def read_prepared_positions(
+    controller: ReliablePositionController,
+) -> tuple[int, ...]:
+    return tuple(controller.current_position(servo_id) for servo_id in SERVO_IDS)
+
+
+def move_servo(
+    controller: ReliablePositionController,
+    servo_id: int,
+    target_position: int,
     *,
     phase: str,
-    tolerance: int,
-    timeout_s: float,
+    move_time_ms: int,
 ) -> None:
-    deadline = time.monotonic() + timeout_s
     next_display_at = 0.0
 
-    while True:
-        telemetry_monitor.raise_if_failed()
-        actual_positions, telemetry_age_s = telemetry_monitor.latest_positions(
-            servo_ids,
-            DEFAULT_TELEMETRY_STALE_S,
-        )
+    def display_progress(progress: PositionProgress) -> None:
+        nonlocal next_display_at
         now = time.monotonic()
-
-        if now >= next_display_at:
-            if actual_positions is None:
-                values = " | ".join(
-                    f"servo {servo_id}={target}/N/A"
-                    for servo_id, target in zip(servo_ids, targets)
-                )
-            else:
-                values = " | ".join(
-                    f"servo {servo_id}={target}/{actual}({target - actual:+d})"
-                    for servo_id, target, actual in zip(
-                        servo_ids, targets, actual_positions
-                    )
-                )
-            age = "N/A" if telemetry_age_s is None else f"{telemetry_age_s:.3f}s"
-            print(
-                f"{phase} telemetry_age={age} target/actual(error): {values}",
-                flush=True,
-            )
-            next_display_at = now + DEFAULT_DISPLAY_INTERVAL_S
-
-        if actual_positions is not None and all(
-            abs(target - actual) <= tolerance
-            for target, actual in zip(targets, actual_positions)
-        ):
+        if now < next_display_at:
             return
-        if now >= deadline:
-            raise TimeoutError(
-                f"{phase} did not arrive within {timeout_s:.1f} s "
-                f"and tolerance +/-{tolerance} position units"
-            )
-        time.sleep(min(0.02, max(0.0, deadline - now)))
+        print(
+            f"{phase} phase={progress.phase}, attempt={progress.attempt}, "
+            f"servo={progress.servo_id}, target={progress.target_position}, "
+            f"actual={progress.actual_position}, "
+            f"error={progress.target_position - progress.actual_position:+d}, "
+            f"speed={progress.speed}, load={progress.load}, "
+            f"stable={progress.stable_frames}/{DEFAULT_STABLE_FRAME_COUNT}",
+            flush=True,
+        )
+        next_display_at = now + DEFAULT_DISPLAY_INTERVAL_S
+
+    result = controller.move_and_wait(
+        servo_id,
+        target_position,
+        time_ms=move_time_ms,
+        retry_policy=RetryPolicy.ON_NO_START,
+        progress_callback=display_progress,
+    )
+    print(
+        f"{phase} stopped: servo={servo_id}, actual={result.final_position}, "
+        f"target={target_position}, error={target_position - result.final_position:+d}, "
+        f"speed={result.final_speed}, retries={result.retries}"
+    )
 
 
 def restore_all(
-    api,
-    telemetry_monitor: TelemetryMonitor,
+    controller: ReliablePositionController,
     start_positions: Sequence[int],
     *,
     move_time_ms: int,
-    tolerance: int,
-    timeout_s: float,
 ) -> None:
     print("Returning all servos to their measured start positions.")
-    for servo_id, start in zip(SERVO_IDS, start_positions):
-        api.set_position(servo_id, start, time_ms=move_time_ms)
-    wait_for_positions(
-        telemetry_monitor,
-        SERVO_IDS,
-        start_positions,
-        phase="RESTORE",
-        tolerance=tolerance,
-        timeout_s=timeout_s,
-    )
+    for tendon, servo_id, start in zip(TENDONS, SERVO_IDS, start_positions):
+        move_servo(
+            controller,
+            servo_id,
+            start,
+            phase=f"{tendon} RESTORE",
+            move_time_ms=move_time_ms,
+        )
 
 
 def execute_check(
@@ -259,66 +287,73 @@ def execute_check(
         baud_rate=args.baud_rate,
         timeout=DEFAULT_SERIAL_TIMEOUT_S,
     ) as api:
-        start_positions = read_start_positions(api, DEFAULT_TELEMETRY_WAIT_S)
-        target_positions = build_target_positions(
-            start_positions,
-            position_units_per_mm,
-            args.distance_mm,
+        telemetry_monitor = TelemetryMonitor(
+            api,
+            num_servos=len(TENDONS),
+            read_timeout_s=DEFAULT_SERIAL_TIMEOUT_S,
         )
-        print_plan(
-            start_positions,
-            target_positions,
-            args.distance_mm,
-            simulation=False,
+        controller = ReliablePositionController(
+            api,
+            telemetry_monitor,
+            build_position_control_config(args),
         )
-
-        telemetry_monitor = TelemetryMonitor(api, DEFAULT_SERIAL_TIMEOUT_S)
         telemetry_monitor.start()
+        start_positions: tuple[int, ...] | None = None
         completed = False
         try:
+            prepare_position_control(controller)
+            start_positions = read_prepared_positions(controller)
+            target_positions = build_target_positions(
+                start_positions,
+                position_units_per_mm,
+                args.distance_mm,
+            )
+            print_plan(
+                start_positions,
+                target_positions,
+                args.distance_mm,
+                simulation=False,
+            )
             print("Starting hardware check. Press Ctrl-C to return all servos and stop.")
             for tendon, servo_id, start, target in zip(
                 TENDONS, SERVO_IDS, start_positions, target_positions
             ):
                 print(f"\n[{tendon}] servo {servo_id}: moving {start} -> {target}")
-                api.set_position(servo_id, target, time_ms=args.move_time_ms)
-                wait_for_positions(
-                    telemetry_monitor,
-                    (servo_id,),
-                    (target,),
+                move_servo(
+                    controller,
+                    servo_id,
+                    target,
                     phase=f"{tendon} OUT",
-                    tolerance=args.tolerance,
-                    timeout_s=args.arrival_timeout_s,
+                    move_time_ms=args.move_time_ms,
                 )
                 if args.hold_time_s > 0.0:
                     time.sleep(args.hold_time_s)
 
                 print(f"[{tendon}] servo {servo_id}: returning {target} -> {start}")
-                api.set_position(servo_id, start, time_ms=args.move_time_ms)
-                wait_for_positions(
-                    telemetry_monitor,
-                    (servo_id,),
-                    (start,),
+                move_servo(
+                    controller,
+                    servo_id,
+                    start,
                     phase=f"{tendon} RETURN",
-                    tolerance=args.tolerance,
-                    timeout_s=args.arrival_timeout_s,
+                    move_time_ms=args.move_time_ms,
                 )
             completed = True
         finally:
             try:
-                restore_all(
-                    api,
-                    telemetry_monitor,
-                    start_positions,
-                    move_time_ms=args.move_time_ms,
-                    tolerance=args.tolerance,
-                    timeout_s=args.arrival_timeout_s,
-                )
+                if start_positions is not None:
+                    if not completed:
+                        controller.stop_all()
+                        prepare_position_control(controller)
+                    restore_all(
+                        controller,
+                        start_positions,
+                        move_time_ms=args.move_time_ms,
+                    )
             except Exception as restore_error:
                 print(f"WARNING: automatic restoration failed: {restore_error}")
             finally:
                 try:
-                    api.stop_all()
+                    controller.stop_all()
                 finally:
                     telemetry_monitor.stop()
 
