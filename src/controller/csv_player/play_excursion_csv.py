@@ -38,6 +38,11 @@ from controller.csv_player.excursion_player import (
     ExcursionPlayer,
     load_position_calibration,
 )
+from servo.control import (
+    PositionControlConfig,
+    ReliablePositionController,
+    TelemetryMonitor as PositionTelemetryMonitor,
+)
 
 
 EXCURSION_COLUMNS = tuple(f"{tendon}_predicted_excursion_mm" for tendon in TENDONS)
@@ -79,6 +84,14 @@ TELEMETRY_WAIT_S = 3.0
 MAX_LAG_S = 0.5
 LIVE_DISPLAY_INTERVAL_S = 0.1
 TELEMETRY_STALE_S = 0.5
+POSITION_MODE_PREPARE_WAIT_S = 0.2
+POSITION_MODE_PRIME_WAIT_S = 0.2
+POSITION_MODE_PRIME_COMMAND_COUNT = 2
+START_OBSERVATION_S = 0.3
+START_MIN_DELTA = 3
+SPEED_TOLERANCE = 5
+STABLE_FRAME_COUNT = 3
+MAX_START_RETRIES = 1
 RETURN_TO_START = True
 RETURN_TO_START_TIME_MS = 2000
 RETURN_TO_START_TOLERANCE = 10
@@ -456,6 +469,51 @@ def print_live_status(
     )
 
 
+def prepare_position_control(api) -> tuple[int, ...]:
+    telemetry = PositionTelemetryMonitor(
+        api,
+        num_servos=len(TENDONS),
+        read_timeout_s=SERIAL_TIMEOUT_S,
+    )
+    controller = ReliablePositionController(
+        api,
+        telemetry,
+        PositionControlConfig(
+            telemetry_stale_s=TELEMETRY_STALE_S,
+            telemetry_wait_s=TELEMETRY_WAIT_S,
+            id_map_reset_wait_s=0.1,
+            speed_init_wait_s=POSITION_MODE_PREPARE_WAIT_S,
+            prime_command_count=POSITION_MODE_PRIME_COMMAND_COUNT,
+            prime_interval_s=POSITION_MODE_PRIME_WAIT_S,
+            start_observation_s=START_OBSERVATION_S,
+            start_min_delta=START_MIN_DELTA,
+            position_tolerance=RETURN_TO_START_TOLERANCE,
+            speed_tolerance=SPEED_TOLERANCE,
+            stable_frame_count=STABLE_FRAME_COUNT,
+            arrival_timeout_s=TELEMETRY_WAIT_S,
+            max_start_retries=MAX_START_RETRIES,
+            reset_id_map_on_prepare=True,
+            position_min=SERVO_POSITION_MIN,
+            position_max=SERVO_POSITION_MAX,
+        ),
+    )
+    print(
+        "Preparing position control: "
+        f"reset_ids=True, speed_init_servos=0-{len(TENDONS) - 1}, "
+        f"position_servos={SERVO_IDS}, "
+        f"prime_commands={POSITION_MODE_PRIME_COMMAND_COUNT}"
+    )
+    telemetry.start()
+    try:
+        controller.prepare(
+            SERVO_IDS,
+            force_init_servo_ids=tuple(range(len(TENDONS))),
+        )
+        return tuple(controller.current_position(servo_id) for servo_id in SERVO_IDS)
+    finally:
+        telemetry.stop()
+
+
 def main() -> None:
     _six_values(SERVO_IDS, "SERVO_IDS")
     if len(set(SERVO_IDS)) != len(SERVO_IDS):
@@ -508,7 +566,7 @@ def main() -> None:
         baud_rate=BAUD_RATE,
         timeout=SERIAL_TIMEOUT_S,
     ) as api:
-        start_positions = player.read_start_positions(api, TELEMETRY_WAIT_S)
+        start_positions = prepare_position_control(api)
         frames = player.load_and_build(csv_path, start_positions)
         player.print_summary(csv_path, frames, start_positions)
         telemetry_monitor = player.create_telemetry_monitor(api, SERIAL_TIMEOUT_S)
