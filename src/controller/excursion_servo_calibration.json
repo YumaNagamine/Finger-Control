@@ -1,17 +1,17 @@
 {
   "schema_version": 1,
   "position_units_per_mm": {
-    "FDP": 65.1898,
-    "FDS": 65.1898,
-    "EI": 65.1898,
-    "DI": 65.1898,
-    "PI": 65.1898,
-    "LUM": 65.1898
+    "FDP": -65.1898,
+    "FDS": -65.1898,
+    "EI": -65.1898,
+    "DI": -65.1898,
+    "PI": -65.1898,
+    "LUM": -65.1898
   },
   "metadata": {
-    "spool_diameter_mm": 40.0,
+    "spool_diameter_mm": 20.0,
     "position_units_per_revolution": 4096,
-    "calculation": "4096 steps / (pi * 40 mm) = approximately 32.595 steps/mm",
+    "calculation": "4096 steps / (pi * 20 mm) = approximately 65.190 steps/mm",
     "notes": "Calibrate each tendon independently. The sign must match the actual winding direction."
   }
 }

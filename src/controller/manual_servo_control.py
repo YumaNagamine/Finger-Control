@@ -47,7 +47,7 @@ from servo.control import (
 # GUI-compatible mapping: FDP->5, FDS->4, EI(ED)->2, DI->3, PI->1, LUM(LU)->0.
 # Change TENDON only; SERVO_ID is derived from the shared mapping.
 # ---------------------------------------------------------------------------
-TENDON = "FDP"
+TENDON = "LUM"
 SERVO_ID = TENDON_TO_SERVO_ID.get(TENDON, -1)
 EXCURSION_MM = +5.0
 DRY_RUN = False
