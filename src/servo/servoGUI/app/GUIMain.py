@@ -25,7 +25,7 @@ from tab_fidelity_test import FidelityTestTab # Import Fidelity Test
 from tab_system_check import SystemCheckTab # Import System Check
 
 # --- グローバル設定 ---
-COM_PORT = "COM4"
+COM_PORT = "COM3"
 BAUD_RATE = 921600
 NUM_MOTORS = 6
 
