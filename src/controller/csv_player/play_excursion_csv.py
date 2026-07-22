@@ -567,12 +567,14 @@ def main() -> None:
         timeout=SERIAL_TIMEOUT_S,
     ) as api:
         start_positions = prepare_position_control(api)
-        frames = player.load_and_build(csv_path, start_positions)
-        player.print_summary(csv_path, frames, start_positions)
         telemetry_monitor = player.create_telemetry_monitor(api, SERIAL_TIMEOUT_S)
         telemetry_monitor.start()
         experiment_started_at = time.monotonic()
+        returned_to_start = False
+        active_error: BaseException | None = None
         try:
+            frames = player.load_and_build(csv_path, start_positions)
+            player.print_summary(csv_path, frames, start_positions)
             print("Executing servo trajectory. Press Ctrl-C to stop all servos.")
             player.play(
                 api,
@@ -590,11 +592,41 @@ def main() -> None:
                     tolerance=RETURN_TO_START_TOLERANCE,
                     timeout_s=RETURN_TO_START_TIMEOUT_S,
                 )
+                returned_to_start = True
+        except BaseException as exc:
+            active_error = exc
+            raise
         finally:
             try:
-                api.stop_all()
+                if RETURN_TO_START and not returned_to_start:
+                    try:
+                        print(
+                            "Playback did not complete normally; attempting to "
+                            "return all servos to their initial positions.",
+                            file=sys.stderr,
+                        )
+                        player.return_to_start(
+                            api,
+                            start_positions,
+                            telemetry_monitor,
+                            experiment_started_at=experiment_started_at,
+                            move_time_ms=RETURN_TO_START_TIME_MS,
+                            tolerance=RETURN_TO_START_TOLERANCE,
+                            timeout_s=RETURN_TO_START_TIMEOUT_S,
+                        )
+                    except BaseException as return_error:
+                        print(
+                            "Failed to return servos to their initial positions: "
+                            f"{type(return_error).__name__}: {return_error}",
+                            file=sys.stderr,
+                        )
+                        if active_error is None:
+                            raise
             finally:
-                telemetry_monitor.stop()
+                try:
+                    api.stop_all()
+                finally:
+                    telemetry_monitor.stop()
 
     print("Playback completed; stop_all() was sent.")
 
