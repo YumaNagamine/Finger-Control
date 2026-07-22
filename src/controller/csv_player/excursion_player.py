@@ -172,6 +172,7 @@ class ExcursionPlayer:
         max_lag_s: float = 0.5,
         live_display_interval_s: float = 0.1,
         telemetry_stale_s: float = 0.5,
+        allow_out_of_range_positions: bool = False,
     ) -> None:
         _six_values(servo_ids, "servo IDs")
         _six_values(position_units_per_mm, "position units per mm")
@@ -196,6 +197,7 @@ class ExcursionPlayer:
         self.max_lag_s = float(max_lag_s)
         self.live_display_interval_s = float(live_display_interval_s)
         self.telemetry_stale_s = float(telemetry_stale_s)
+        self.allow_out_of_range_positions = bool(allow_out_of_range_positions)
 
     @staticmethod
     def load_excursions(csv_path: Path) -> tuple[list[float], list[tuple[float, ...]]]:
@@ -260,7 +262,9 @@ class ExcursionPlayer:
             )
 
             for tendon, position in zip(TENDONS, positions):
-                if not SERVO_POSITION_MIN <= position <= SERVO_POSITION_MAX:
+                if not self.allow_out_of_range_positions and not (
+                    SERVO_POSITION_MIN <= position <= SERVO_POSITION_MAX
+                ):
                     raise ValueError(
                         f"Row {row_index}, {tendon}: target position {position} is outside "
                         f"the firmware range {SERVO_POSITION_MIN}-{SERVO_POSITION_MAX}. "

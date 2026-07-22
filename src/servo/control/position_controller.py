@@ -49,6 +49,14 @@ class PositionControlCancelledError(PositionControlError):
     pass
 
 
+class AccumulatedPositionNotInitializedError(PositionControlError):
+    pass
+
+
+class AccumulatedPositionAmbiguousError(PositionControlError):
+    pass
+
+
 @dataclass(frozen=True)
 class PositionControlConfig:
     telemetry_stale_s: float = 0.5
@@ -107,6 +115,76 @@ class PositionControlConfig:
 
 
 @dataclass(frozen=True)
+class AccumulatedPositionControlConfig:
+    encoder_period: int = 4096
+    switch_to_position_threshold: int = 150
+    wheel_kp: float = 0.5
+    wheel_kd: float = 0.1
+    wheel_min_speed: int = 30
+    wheel_max_speed: int = 400
+    wheel_command_lifetime_ms: int = 100
+    wheel_telemetry_timeout_s: float = 0.15
+    wheel_arrival_timeout_s: float = 15.0
+    wheel_stop_timeout_s: float = 1.0
+    wheel_stop_stable_frames: int = 3
+    max_abs_load: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.encoder_period <= 0 or self.encoder_period % 2 != 0:
+            raise ValueError("encoder_period must be a positive even integer")
+        if not 0 < self.switch_to_position_threshold < self.encoder_period // 2:
+            raise ValueError(
+                "switch_to_position_threshold must be between zero and half "
+                "the encoder period"
+            )
+        for name, value in {
+            "wheel_kp": self.wheel_kp,
+            "wheel_kd": self.wheel_kd,
+            "wheel_telemetry_timeout_s": self.wheel_telemetry_timeout_s,
+            "wheel_arrival_timeout_s": self.wheel_arrival_timeout_s,
+            "wheel_stop_timeout_s": self.wheel_stop_timeout_s,
+        }.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and greater than zero")
+        if self.wheel_min_speed <= 0:
+            raise ValueError("wheel_min_speed must be greater than zero")
+        if self.wheel_max_speed < self.wheel_min_speed:
+            raise ValueError("wheel_max_speed must be at least wheel_min_speed")
+        if not 1 <= self.wheel_command_lifetime_ms <= 65535:
+            raise ValueError("wheel_command_lifetime_ms must be in the range 1-65535")
+        if self.wheel_stop_stable_frames <= 0:
+            raise ValueError("wheel_stop_stable_frames must be greater than zero")
+        if self.max_abs_load is not None and self.max_abs_load <= 0:
+            raise ValueError("max_abs_load must be greater than zero or None")
+
+
+@dataclass
+class _AccumulatedPositionState:
+    last_raw_position: int
+    accumulated_position: int
+
+
+@dataclass(frozen=True)
+class AccumulatedMoveResult:
+    servo_id: int
+    start_position: int
+    target_position: int
+    final_position: int
+    final_raw_position: int
+    final_speed: int
+    wheel_commands: int
+    elapsed_s: float
+
+
+@dataclass(frozen=True)
+class AccumulatedCommandResult:
+    servo_ids: tuple[int, ...]
+    target_positions: tuple[int, ...]
+    actual_positions: tuple[int, ...]
+    speed_commands: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class PositionProgress:
     phase: str
     servo_id: int
@@ -141,12 +219,19 @@ class ReliablePositionController:
         api,
         telemetry: TelemetryMonitor,
         config: PositionControlConfig | None = None,
+        accumulated_config: AccumulatedPositionControlConfig | None = None,
     ) -> None:
         self._api = api
         self._telemetry = telemetry
         self.config = config or PositionControlConfig()
+        self.accumulated_config = (
+            accumulated_config or AccumulatedPositionControlConfig()
+        )
         self._states: dict[int, PositionControlState] = {}
         self._command_lock = threading.RLock()
+        self._accumulated_states: dict[int, _AccumulatedPositionState] = {}
+        self._accumulated_active_ids: tuple[int, ...] = ()
+        self._accumulated_sequence = 0
 
     def state(self, servo_id: int) -> PositionControlState:
         return self._states.get(servo_id, PositionControlState.UNPREPARED)
@@ -160,7 +245,260 @@ class ReliablePositionController:
         self._validate_servo_index(snapshot, servo_id)
         return snapshot.positions[servo_id]
 
+    def set_accumulated_reference(
+        self,
+        servo_id: int,
+        position: int = 0,
+    ) -> None:
+        with self._command_lock:
+            snapshot = self._fresh_snapshot()
+            self._validate_servo_index(snapshot, servo_id)
+            self._set_accumulated_state(servo_id, snapshot.positions[servo_id], position)
+
+    def current_accumulated_position(self, servo_id: int) -> int:
+        with self._command_lock:
+            snapshot = self._fresh_snapshot()
+            snapshot = self._wait_for_newer(snapshot.sequence)
+            self._validate_servo_index(snapshot, servo_id)
+            return self._update_accumulated_position(
+                servo_id,
+                snapshot.positions[servo_id],
+            )
+
+    def begin_accumulated_control(
+        self,
+        servo_ids: Sequence[int],
+    ) -> tuple[int, ...]:
+        ids = self._unique_servo_ids(servo_ids)
+        if not ids:
+            raise ValueError("servo_ids must not be empty")
+
+        with self._command_lock:
+            if self._accumulated_active_ids:
+                raise PositionControlError("Accumulated position control is already active")
+            for servo_id in ids:
+                if self.state(servo_id) is not PositionControlState.READY:
+                    raise PositionControlNotPreparedError(
+                        f"Servo {servo_id} is not ready for accumulated position control"
+                    )
+
+            try:
+                snapshot = self._fresh_snapshot()
+                self._validate_servo_ids(snapshot, ids)
+                self._require_speeds(snapshot)
+                actual_positions = []
+                for servo_id in ids:
+                    raw = snapshot.positions[servo_id]
+                    if servo_id not in self._accumulated_states:
+                        self._set_accumulated_state(servo_id, raw, raw)
+                    actual_positions.append(
+                        self._update_accumulated_position(servo_id, raw)
+                    )
+                    self._api.set_speed(servo_id, 0, force_init=True)
+                    self._states[servo_id] = PositionControlState.MOVING
+
+                self._sleep(self.config.speed_init_wait_s)
+                self._accumulated_active_ids = ids
+                self._accumulated_sequence = snapshot.sequence
+                return tuple(actual_positions)
+            except Exception:
+                self._accumulated_active_ids = ()
+                self._fail_safe_stop(ids)
+                raise
+
+    def command_accumulated_positions(
+        self,
+        servo_ids: Sequence[int],
+        target_positions: Sequence[int],
+    ) -> AccumulatedCommandResult:
+        ids = self._unique_servo_ids(servo_ids)
+        targets = tuple(int(value) for value in target_positions)
+        if len(ids) != len(targets):
+            raise ValueError("servo_ids and target_positions must have the same length")
+
+        with self._command_lock:
+            if ids != self._accumulated_active_ids:
+                raise PositionControlError(
+                    "servo_ids must match the active accumulated-control servos"
+                )
+            try:
+                snapshot = self._wait_for_wheel_snapshot()
+                actual_positions: list[int] = []
+                speed_commands: list[int] = []
+                for servo_id, target in zip(ids, targets):
+                    self._check_accumulated_load(snapshot, servo_id)
+                    actual = self._update_accumulated_position(
+                        servo_id,
+                        snapshot.positions[servo_id],
+                    )
+                    speed = self._calculate_wheel_speed(
+                        target,
+                        actual,
+                        snapshot.positions[servo_id],
+                        self._speed(snapshot, servo_id),
+                    )
+                    self._api.timed_run(
+                        servo_id,
+                        speed,
+                        self.accumulated_config.wheel_command_lifetime_ms,
+                    )
+                    actual_positions.append(actual)
+                    speed_commands.append(speed)
+
+                return AccumulatedCommandResult(
+                    servo_ids=ids,
+                    target_positions=targets,
+                    actual_positions=tuple(actual_positions),
+                    speed_commands=tuple(speed_commands),
+                )
+            except Exception:
+                self._accumulated_active_ids = ()
+                self._fail_safe_stop(ids)
+                raise
+
+    def end_accumulated_control(
+        self,
+        servo_ids: Sequence[int],
+        final_positions: Sequence[int] | None = None,
+    ) -> tuple[int, ...]:
+        ids = self._unique_servo_ids(servo_ids)
+        targets = (
+            None
+            if final_positions is None
+            else tuple(int(value) for value in final_positions)
+        )
+        if targets is not None and len(ids) != len(targets):
+            raise ValueError("servo_ids and final_positions must have the same length")
+
+        with self._command_lock:
+            if ids != self._accumulated_active_ids:
+                raise PositionControlError(
+                    "servo_ids must match the active accumulated-control servos"
+                )
+            try:
+                snapshot = self._stop_wheel_control(ids)
+                if targets is not None:
+                    threshold = (
+                        self.accumulated_config.switch_to_position_threshold
+                    )
+                    for servo_id, target in zip(ids, targets):
+                        actual = self._update_accumulated_position(
+                            servo_id,
+                            snapshot.positions[servo_id],
+                        )
+                        raw_target = (
+                            target % self.accumulated_config.encoder_period
+                        )
+                        if (
+                            abs(target - actual) > threshold
+                            or abs(
+                                raw_target - snapshot.positions[servo_id]
+                            ) > threshold
+                        ):
+                            raise PositionControlError(
+                                f"Servo {servo_id} is not close enough to "
+                                "the final accumulated target for a safe "
+                                "position-mode transition"
+                            )
+                self._accumulated_active_ids = ()
+                self._prepare_position(ids, force_init_servo_ids=ids)
+                if targets is not None:
+                    snapshot = self._finish_raw_positions(ids, targets)
+                else:
+                    snapshot = self._fresh_snapshot()
+                return tuple(
+                    self._update_accumulated_position(
+                        servo_id,
+                        snapshot.positions[servo_id],
+                    )
+                    for servo_id in ids
+                )
+            except Exception:
+                self._accumulated_active_ids = ()
+                self._fail_safe_stop(ids)
+                raise
+
+    def move_accumulated_and_wait(
+        self,
+        servo_id: int,
+        target_position: int,
+        *,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCheck | None = None,
+    ) -> AccumulatedMoveResult:
+        target = int(target_position)
+        started_at = time.monotonic()
+        with self._command_lock:
+            snapshot = self._fresh_snapshot()
+            self._validate_servo_index(snapshot, servo_id)
+            if servo_id not in self._accumulated_states:
+                raw = snapshot.positions[servo_id]
+                self._set_accumulated_state(servo_id, raw, raw)
+            start_position = self._update_accumulated_position(
+                servo_id,
+                snapshot.positions[servo_id],
+            )
+            wheel_commands = 0
+            deadline = started_at + self.accumulated_config.wheel_arrival_timeout_s
+            self.begin_accumulated_control((servo_id,))
+            try:
+                while True:
+                    self._check_cancel(cancel_check)
+                    if time.monotonic() >= deadline:
+                        raise PositionArrivalTimeoutError(
+                            f"Servo {servo_id} did not approach accumulated target "
+                            f"{target} within the configured timeout"
+                        )
+                    command = self.command_accumulated_positions(
+                        (servo_id,),
+                        (target,),
+                    )
+                    wheel_commands += 1
+                    actual = command.actual_positions[0]
+                    self._report_accumulated_progress(
+                        progress_callback,
+                        "wheel_approach",
+                        servo_id,
+                        target,
+                        actual,
+                        command.speed_commands[0],
+                        0,
+                    )
+                    if command.speed_commands[0] == 0:
+                        break
+
+                final_positions = self.end_accumulated_control(
+                    (servo_id,),
+                    (target,),
+                )
+                final_snapshot = self._fresh_snapshot()
+                return AccumulatedMoveResult(
+                    servo_id=servo_id,
+                    start_position=start_position,
+                    target_position=target,
+                    final_position=final_positions[0],
+                    final_raw_position=final_snapshot.positions[servo_id],
+                    final_speed=self._speed(final_snapshot, servo_id),
+                    wheel_commands=wheel_commands,
+                    elapsed_s=time.monotonic() - started_at,
+                )
+            except Exception:
+                self._accumulated_active_ids = ()
+                self._fail_safe_stop((servo_id,))
+                raise
+
     def prepare(
+        self,
+        servo_ids: Sequence[int],
+        *,
+        force_init_servo_ids: Sequence[int] | None = None,
+    ) -> None:
+        self._prepare_position(
+            servo_ids,
+            force_init_servo_ids=force_init_servo_ids,
+        )
+
+    def _prepare_position(
         self,
         servo_ids: Sequence[int],
         *,
@@ -217,6 +555,25 @@ class ReliablePositionController:
                 raise
 
     def move_and_wait(
+        self,
+        servo_id: int,
+        target_position: int,
+        *,
+        time_ms: int = 0,
+        retry_policy: RetryPolicy = RetryPolicy.NEVER,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCheck | None = None,
+    ) -> MoveResult:
+        return self._move_raw_and_wait(
+            servo_id,
+            target_position,
+            time_ms=time_ms,
+            retry_policy=retry_policy,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def _move_raw_and_wait(
         self,
         servo_id: int,
         target_position: int,
@@ -321,12 +678,212 @@ class ReliablePositionController:
                 self._fail_safe_stop((servo_id,))
                 raise
 
+    def _set_accumulated_state(
+        self,
+        servo_id: int,
+        raw_position: int,
+        accumulated_position: int,
+    ) -> None:
+        if not 0 <= raw_position < self.accumulated_config.encoder_period:
+            raise ValueError(
+                f"raw_position must be 0-"
+                f"{self.accumulated_config.encoder_period - 1}"
+            )
+        self._accumulated_states[servo_id] = _AccumulatedPositionState(
+            last_raw_position=int(raw_position),
+            accumulated_position=int(accumulated_position),
+        )
+
+    def _update_accumulated_position(
+        self,
+        servo_id: int,
+        raw_position: int,
+    ) -> int:
+        state = self._accumulated_states.get(servo_id)
+        if state is None:
+            raise AccumulatedPositionNotInitializedError(
+                f"Accumulated position for servo {servo_id} is not initialized"
+            )
+
+        period = self.accumulated_config.encoder_period
+        half_period = period // 2
+        delta = int(raw_position) - state.last_raw_position
+        if abs(delta) == half_period:
+            raise AccumulatedPositionAmbiguousError(
+                f"Servo {servo_id} moved exactly half an encoder period between "
+                "telemetry samples"
+            )
+        if delta > half_period:
+            delta -= period
+        elif delta < -half_period:
+            delta += period
+
+        state.accumulated_position += delta
+        state.last_raw_position = int(raw_position)
+        return state.accumulated_position
+
+    def _wait_for_wheel_snapshot(self) -> TelemetrySnapshot:
+        try:
+            snapshot = self._telemetry.wait_for_newer(
+                self._accumulated_sequence,
+                self.accumulated_config.wheel_telemetry_timeout_s,
+            )
+        except TimeoutError as exc:
+            raise TelemetryUnavailableError(
+                "Fresh telemetry was not received while wheel control was active"
+            ) from exc
+        except RuntimeError as exc:
+            raise TelemetryUnavailableError("Telemetry monitor failed") from exc
+        self._require_speeds(snapshot)
+        self._accumulated_sequence = snapshot.sequence
+        return snapshot
+
+    def _check_accumulated_load(
+        self,
+        snapshot: TelemetrySnapshot,
+        servo_id: int,
+    ) -> None:
+        limit = self.accumulated_config.max_abs_load
+        if limit is not None and abs(snapshot.loads[servo_id]) > limit:
+            raise PositionControlError(
+                f"Servo {servo_id} load {snapshot.loads[servo_id]} exceeds "
+                f"max_abs_load={limit}"
+            )
+
+    def _calculate_wheel_speed(
+        self,
+        target_position: int,
+        actual_position: int,
+        raw_position: int,
+        measured_speed: int,
+    ) -> int:
+        config = self.accumulated_config
+        error = target_position - actual_position
+        raw_target = target_position % config.encoder_period
+        if (
+            abs(error) <= config.switch_to_position_threshold
+            and abs(raw_target - raw_position) <= config.switch_to_position_threshold
+        ):
+            return 0
+
+        command = round(config.wheel_kp * error - config.wheel_kd * measured_speed)
+        command = max(-config.wheel_max_speed, min(config.wheel_max_speed, command))
+        if 0 < command < config.wheel_min_speed:
+            command = config.wheel_min_speed
+        elif -config.wheel_min_speed < command < 0:
+            command = -config.wheel_min_speed
+        return int(command)
+
+    def _stop_wheel_control(
+        self,
+        servo_ids: Sequence[int],
+    ) -> TelemetrySnapshot:
+        for servo_id in servo_ids:
+            self._api.timed_run(
+                servo_id,
+                0,
+                self.accumulated_config.wheel_command_lifetime_ms,
+            )
+
+        deadline = time.monotonic() + self.accumulated_config.wheel_stop_timeout_s
+        stable_frames = 0
+        snapshot: TelemetrySnapshot | None = None
+        while time.monotonic() < deadline:
+            snapshot = self._wait_for_wheel_snapshot()
+            for servo_id in servo_ids:
+                self._update_accumulated_position(
+                    servo_id,
+                    snapshot.positions[servo_id],
+                )
+            if all(
+                abs(self._speed(snapshot, servo_id)) <= self.config.speed_tolerance
+                for servo_id in servo_ids
+            ):
+                stable_frames += 1
+                if stable_frames >= self.accumulated_config.wheel_stop_stable_frames:
+                    return snapshot
+            else:
+                stable_frames = 0
+
+        raise PositionArrivalTimeoutError(
+            "Servos did not stop before the wheel-control stop timeout"
+        )
+
+    def _finish_raw_positions(
+        self,
+        servo_ids: Sequence[int],
+        accumulated_targets: Sequence[int],
+    ) -> TelemetrySnapshot:
+        raw_targets = tuple(
+            target % self.accumulated_config.encoder_period
+            for target in accumulated_targets
+        )
+        snapshot = self._fresh_snapshot()
+        sequence = snapshot.sequence
+        for servo_id, raw_target in zip(servo_ids, raw_targets):
+            self._api.set_position(servo_id, raw_target, time_ms=0)
+
+        deadline = time.monotonic() + self.config.arrival_timeout_s
+        stable_frames = 0
+        while time.monotonic() < deadline:
+            snapshot = self._wait_for_newer_until(sequence, deadline)
+            sequence = snapshot.sequence
+            self._require_speeds(snapshot)
+            for servo_id in servo_ids:
+                self._update_accumulated_position(
+                    servo_id,
+                    snapshot.positions[servo_id],
+                )
+            if all(
+                self._is_settled(
+                    snapshot.positions[servo_id],
+                    self._speed(snapshot, servo_id),
+                    raw_target,
+                )
+                for servo_id, raw_target in zip(servo_ids, raw_targets)
+            ):
+                stable_frames += 1
+                if stable_frames >= self.config.stable_frame_count:
+                    return snapshot
+            else:
+                stable_frames = 0
+
+        raise PositionArrivalTimeoutError(
+            "Servos did not settle at their final raw positions"
+        )
+
+    @staticmethod
+    def _report_accumulated_progress(
+        callback: ProgressCallback | None,
+        phase: str,
+        servo_id: int,
+        target_position: int,
+        actual_position: int,
+        speed: int,
+        load: int,
+    ) -> None:
+        if callback is None:
+            return
+        callback(
+            PositionProgress(
+                phase=phase,
+                servo_id=servo_id,
+                target_position=target_position,
+                actual_position=actual_position,
+                speed=speed,
+                load=load,
+                stable_frames=0,
+                attempt=1,
+            )
+        )
+
     def stop_all(self) -> None:
         with self._command_lock:
             try:
                 self._api.stop_all()
             finally:
                 self.invalidate()
+                self._accumulated_active_ids = ()
 
     def _observe_start(
         self,

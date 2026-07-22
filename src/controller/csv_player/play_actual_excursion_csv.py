@@ -34,12 +34,14 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
 from controller.csv_player.excursion_player import (
+    CommandFrame,
     ExcursionPlayer,
     PlaybackStatus,
     load_position_calibration,
 )
 from controller.servo_mapping import SERVO_IDS_BY_TENDON, TENDONS
 from servo.control import (
+    AccumulatedPositionControlConfig,
     PositionControlConfig,
     ReliablePositionController,
     TelemetryMonitor as PositionTelemetryMonitor,
@@ -87,6 +89,16 @@ START_MIN_DELTA = 3
 SPEED_TOLERANCE = 5
 STABLE_FRAME_COUNT = 3
 MAX_START_RETRIES = 1
+WHEEL_SWITCH_TO_POSITION_THRESHOLD = 150
+WHEEL_KP = 0.5
+WHEEL_KD = 0.1
+WHEEL_MIN_SPEED = 30
+WHEEL_MAX_SPEED = 400
+WHEEL_COMMAND_LIFETIME_MS = 200
+WHEEL_TELEMETRY_TIMEOUT_S = 0.15
+WHEEL_ARRIVAL_TIMEOUT_S = 20.0
+WHEEL_STOP_TIMEOUT_S = 1.0
+
 
 RETURN_TO_START = True
 RETURN_TO_START_TIME_MS = 2000
@@ -96,8 +108,8 @@ RETURN_TO_START_TIMEOUT_S = 5.0
 OUTPUT_ROOT = PROJECT_ROOT / "logs" / "actual_excursion_playback"
 
 # Optional preflight limits.  Leave as None until experiment-specific safe
-# limits are known.  Servo position range validation is always enforced by
-# ExcursionPlayer.build_command_frames().
+# limits are known.  Accumulated control intentionally allows command frames
+# outside the firmware's single-turn position range.
 MAX_ABS_EXCURSION_FROM_START_MM: float | None = None
 MAX_EXCURSION_STEP_MM: float | None = None
 MAX_EXCURSION_RATE_MM_S: float | None = None
@@ -376,15 +388,12 @@ def plot_servo_tracking(
     plt.close(figure)
 
 
-def prepare_position_control(api) -> tuple[int, ...]:
-    """Put all servos into reliable position mode and measure their starts."""
 
-    telemetry = PositionTelemetryMonitor(
-        api,
-        num_servos=len(TENDONS),
-        read_timeout_s=SERIAL_TIMEOUT_S,
-    )
-    controller = ReliablePositionController(
+def create_position_controller(
+    api,
+    telemetry: PositionTelemetryMonitor,
+) -> ReliablePositionController:
+    return ReliablePositionController(
         api,
         telemetry,
         PositionControlConfig(
@@ -405,22 +414,39 @@ def prepare_position_control(api) -> tuple[int, ...]:
             position_min=SERVO_POSITION_MIN,
             position_max=SERVO_POSITION_MAX,
         ),
+        AccumulatedPositionControlConfig(
+            switch_to_position_threshold=WHEEL_SWITCH_TO_POSITION_THRESHOLD,
+            wheel_kp=WHEEL_KP,
+            wheel_kd=WHEEL_KD,
+            wheel_min_speed=WHEEL_MIN_SPEED,
+            wheel_max_speed=WHEEL_MAX_SPEED,
+            wheel_command_lifetime_ms=WHEEL_COMMAND_LIFETIME_MS,
+            wheel_telemetry_timeout_s=WHEEL_TELEMETRY_TIMEOUT_S,
+            wheel_arrival_timeout_s=WHEEL_ARRIVAL_TIMEOUT_S,
+            wheel_stop_timeout_s=WHEEL_STOP_TIMEOUT_S,
+        ),
     )
+
+
+def prepare_position_control(
+    controller: ReliablePositionController,
+) -> tuple[int, ...]:
     print(
         "Preparing position control: "
         f"reset_ids=True, speed_init_servos=0-{len(TENDONS) - 1}, "
         f"position_servos={SERVO_IDS}, "
         f"prime_commands={POSITION_MODE_PRIME_COMMAND_COUNT}"
     )
-    telemetry.start()
-    try:
-        controller.prepare(
-            SERVO_IDS,
-            force_init_servo_ids=tuple(range(len(TENDONS))),
-        )
-        return tuple(controller.current_position(servo_id) for servo_id in SERVO_IDS)
-    finally:
-        telemetry.stop()
+    controller.prepare(
+        SERVO_IDS,
+        force_init_servo_ids=tuple(range(len(TENDONS))),
+    )
+    start_positions = tuple(
+        controller.current_position(servo_id) for servo_id in SERVO_IDS
+    )
+    for servo_id, start in zip(SERVO_IDS, start_positions):
+        controller.set_accumulated_reference(servo_id, start)
+    return start_positions
 
 
 def build_player(position_units_per_mm: Sequence[float]) -> ExcursionPlayer:
@@ -431,7 +457,142 @@ def build_player(position_units_per_mm: Sequence[float]) -> ExcursionPlayer:
         max_lag_s=MAX_LAG_S,
         live_display_interval_s=LIVE_DISPLAY_INTERVAL_S,
         telemetry_stale_s=TELEMETRY_STALE_S,
+        allow_out_of_range_positions=True,
     )
+
+
+def play_accumulated_frames(
+    player: ExcursionPlayer,
+    controller: ReliablePositionController,
+    frames: Sequence[CommandFrame],
+    *,
+    started_at: float,
+    recorder: ExperimentalTraceRecorder,
+) -> None:
+    if not frames:
+        raise ValueError("frames must not be empty")
+
+    controller.begin_accumulated_control(SERVO_IDS)
+    next_display_at = started_at
+    try:
+        for row_index, frame in enumerate(frames):
+            scheduled_at = started_at + frame.elapsed_s
+            remaining_s = scheduled_at - time.monotonic()
+            if remaining_s > 0.0:
+                time.sleep(remaining_s)
+
+            now = time.monotonic()
+            lag_s = now - scheduled_at
+            if lag_s > MAX_LAG_S:
+                raise RuntimeError(
+                    f"Control timing lag at row {row_index} is {lag_s:.3f} s, "
+                    f"exceeding MAX_LAG_S={MAX_LAG_S:.3f}"
+                )
+
+            command = controller.command_accumulated_positions(
+                SERVO_IDS,
+                frame.positions,
+            )
+            now = time.monotonic()
+            status = PlaybackStatus(
+                phase="playback",
+                elapsed_s=now - started_at,
+                scheduled_s=frame.elapsed_s,
+                row_index=row_index,
+                move_time_ms=frame.move_time_ms,
+                target_positions=frame.positions,
+                actual_positions=command.actual_positions,
+                telemetry_age_s=None,
+            )
+            recorder.write(status)
+            if now >= next_display_at or row_index == len(frames) - 1:
+                player.print_status(status)
+                next_display_at = now + LIVE_DISPLAY_INTERVAL_S
+
+        settle_deadline = (
+            time.monotonic()
+            + controller.accumulated_config.wheel_arrival_timeout_s
+        )
+        while any(speed != 0 for speed in command.speed_commands):
+            if time.monotonic() >= settle_deadline:
+                raise TimeoutError(
+                    "Servos did not enter the final position-mode switching region"
+                )
+            command = controller.command_accumulated_positions(
+                SERVO_IDS,
+                frames[-1].positions,
+            )
+            now = time.monotonic()
+            status = PlaybackStatus(
+                phase="settling",
+                elapsed_s=now - started_at,
+                scheduled_s=None,
+                row_index=None,
+                move_time_ms=0,
+                target_positions=frames[-1].positions,
+                actual_positions=command.actual_positions,
+                telemetry_age_s=None,
+            )
+            recorder.write(status)
+            if now >= next_display_at:
+                player.print_status(status)
+                next_display_at = now + LIVE_DISPLAY_INTERVAL_S
+
+        controller.end_accumulated_control(
+            SERVO_IDS,
+            frames[-1].positions,
+        )
+    except Exception:
+        controller.stop_all()
+        raise
+
+
+def move_all_accumulated_and_wait(
+    player: ExcursionPlayer,
+    controller: ReliablePositionController,
+    targets: Sequence[int],
+    *,
+    experiment_started_at: float,
+    timeout_s: float,
+    recorder: ExperimentalTraceRecorder,
+) -> None:
+    target_tuple = tuple(int(value) for value in targets)
+    deadline = time.monotonic() + timeout_s
+    next_display_at = time.monotonic()
+    controller.begin_accumulated_control(SERVO_IDS)
+    try:
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Servos did not approach accumulated targets within {timeout_s:.1f} s"
+                )
+            command = controller.command_accumulated_positions(
+                SERVO_IDS,
+                target_tuple,
+            )
+            now = time.monotonic()
+            reached_switch_region = all(speed == 0 for speed in command.speed_commands)
+            status = PlaybackStatus(
+                phase="return",
+                elapsed_s=now - experiment_started_at,
+                scheduled_s=None,
+                row_index=None,
+                move_time_ms=0,
+                target_positions=target_tuple,
+                actual_positions=command.actual_positions,
+                telemetry_age_s=None,
+            )
+            recorder.write(status)
+            if now >= next_display_at or reached_switch_region:
+                player.print_status(status)
+                next_display_at = now + LIVE_DISPLAY_INTERVAL_S
+            if reached_switch_region:
+                break
+
+        controller.end_accumulated_control(SERVO_IDS, target_tuple)
+    except Exception:
+        controller.stop_all()
+        raise
 
 
 def write_manifest(
@@ -451,6 +612,18 @@ def write_manifest(
     payload = {
         "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "experiment": "actual_excursion_smoothed_playback",
+        "control_mode": "host_hybrid_accumulated_position",
+        "accumulated_position_control": {
+            "switch_to_position_threshold": WHEEL_SWITCH_TO_POSITION_THRESHOLD,
+            "kp": WHEEL_KP,
+            "kd": WHEEL_KD,
+            "min_speed": WHEEL_MIN_SPEED,
+            "max_speed": WHEEL_MAX_SPEED,
+            "command_lifetime_ms": WHEEL_COMMAND_LIFETIME_MS,
+            "telemetry_timeout_s": WHEEL_TELEMETRY_TIMEOUT_S,
+            "arrival_timeout_s": WHEEL_ARRIVAL_TIMEOUT_S,
+            "stop_timeout_s": WHEEL_STOP_TIMEOUT_S,
+        },
         "session_dir": str(session_dir),
         "input_csv_path": str(csv_path),
         "actual_excursion_columns": list(ACTUAL_EXCURSION_COLUMNS),
@@ -488,6 +661,10 @@ def main() -> None:
     print("Excursion source: measured, smoothed actual excursion")
     print("Columns: " + ", ".join(ACTUAL_EXCURSION_COLUMNS))
 
+    print("Control: host-side hybrid accumulated position")
+    print(
+        "CAUTION: wheel-mode gains and switching thresholds require hardware tuning."
+    )
     if not EXECUTE:
         if START_POSITIONS is None:
             raise ValueError("Dry-run requires START_POSITIONS because no telemetry is opened")
@@ -519,44 +696,50 @@ def main() -> None:
             baud_rate=BAUD_RATE,
             timeout=SERIAL_TIMEOUT_S,
         ) as api:
-            start_positions = prepare_position_control(api)
-            frames = player.build_command_frames(
-                elapsed_times,
-                excursions,
-                start_positions,
+            telemetry = PositionTelemetryMonitor(
+                api,
+                num_servos=len(TENDONS),
+                read_timeout_s=SERIAL_TIMEOUT_S,
             )
-            player.print_summary(csv_path, frames, start_positions)
-            telemetry_monitor = player.create_telemetry_monitor(api, SERIAL_TIMEOUT_S)
-            telemetry_monitor.start()
-            experiment_started_at = time.monotonic()
+            controller = create_position_controller(api, telemetry)
+            telemetry.start()
             try:
-                print("Executing actual-excursion trajectory. Press Ctrl-C to stop all servos.")
-                player.play(
-                    api,
+                start_positions = prepare_position_control(controller)
+                frames = player.build_command_frames(
+                    elapsed_times,
+                    excursions,
+                    start_positions,
+                )
+                player.print_summary(csv_path, frames, start_positions)
+                experiment_started_at = time.monotonic()
+                print(
+                    "Executing accumulated actual-excursion trajectory. "
+                    "Press Ctrl-C to stop all servos."
+                )
+                play_accumulated_frames(
+                    player,
+                    controller,
                     frames,
-                    telemetry_monitor,
                     started_at=experiment_started_at,
-                    status_callback=recorder.write,
+                    recorder=recorder,
                 )
                 playback_completed = True
 
                 if RETURN_TO_START:
-                    player.return_to_start(
-                        api,
+                    move_all_accumulated_and_wait(
+                        player,
+                        controller,
                         start_positions,
-                        telemetry_monitor,
                         experiment_started_at=experiment_started_at,
-                        move_time_ms=RETURN_TO_START_TIME_MS,
-                        tolerance=RETURN_TO_START_TOLERANCE,
                         timeout_s=RETURN_TO_START_TIMEOUT_S,
-                        status_callback=recorder.write,
+                        recorder=recorder,
                     )
                     returned_to_start = True
             finally:
                 try:
-                    api.stop_all()
+                    controller.stop_all()
                 finally:
-                    telemetry_monitor.stop()
+                    telemetry.stop()
     except BaseException as exc:
         error_text = f"{type(exc).__name__}: {exc}"
         raise

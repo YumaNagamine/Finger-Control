@@ -6,7 +6,9 @@ import unittest
 from dataclasses import dataclass
 
 from servo.control import (
+    AccumulatedPositionControlConfig,
     PositionControlConfig,
+    PositionControlError,
     PositionControlState,
     PositionStartTimeoutError,
     ReliablePositionController,
@@ -31,6 +33,7 @@ class FakeServoAPI:
         self.loads = [0] * num_servos
         self.speeds = [0] * num_servos
         self.position_commands: list[tuple[int, int, int]] = []
+        self.timed_run_commands: list[tuple[int, int, int]] = []
         self.ignore_next_position_commands = 0
         self.reverse_next_position_commands = 0
         self.stop_count = 0
@@ -54,6 +57,18 @@ class FakeServoAPI:
         del force_init
         with self._lock:
             self.speeds[servo_id] = speed
+
+    def timed_run(self, servo_id: int, speed: int, time_ms: int) -> None:
+        with self._lock:
+            self.timed_run_commands.append((servo_id, speed, time_ms))
+            self.speeds[servo_id] = speed
+            if speed == 0:
+                return
+            direction = 1 if speed > 0 else -1
+            step = min(40, max(1, abs(speed) // 4))
+            self.positions[servo_id] = (
+                self.positions[servo_id] + direction * step
+            ) % 4096
 
     def set_position(self, servo_id: int, position: int, time_ms: int = 0) -> None:
         with self._lock:
@@ -106,6 +121,18 @@ class ReliablePositionControllerTest(unittest.TestCase):
             self.api,
             self.telemetry,
             test_config(),
+            AccumulatedPositionControlConfig(
+                switch_to_position_threshold=20,
+                wheel_kp=1.0,
+                wheel_kd=0.01,
+                wheel_min_speed=40,
+                wheel_max_speed=400,
+                wheel_command_lifetime_ms=100,
+                wheel_telemetry_timeout_s=0.1,
+                wheel_arrival_timeout_s=2.0,
+                wheel_stop_timeout_s=0.2,
+                wheel_stop_stable_frames=2,
+            ),
         )
         self.telemetry.start()
 
@@ -188,6 +215,82 @@ class ReliablePositionControllerTest(unittest.TestCase):
             len(self.api.position_commands) - prime_command_count,
             1,
         )
+
+
+    def test_accumulated_position_unwraps_forward_boundary(self) -> None:
+        self.api.positions[5] = 4090
+        time.sleep(0.01)
+        self.controller.set_accumulated_reference(5, 4090)
+
+        self.api.positions[5] = 5
+        time.sleep(0.01)
+
+        self.assertEqual(self.controller.current_accumulated_position(5), 4101)
+
+    def test_accumulated_position_unwraps_reverse_boundary(self) -> None:
+        self.api.positions[5] = 5
+        time.sleep(0.01)
+        self.controller.set_accumulated_reference(5, 5)
+
+        self.api.positions[5] = 4090
+        time.sleep(0.01)
+
+        self.assertEqual(self.controller.current_accumulated_position(5), -6)
+
+    def test_move_accumulated_crosses_boundary_and_finishes_in_position_mode(
+        self,
+    ) -> None:
+        self.prepare_servo()
+        self.controller.set_accumulated_reference(5, 100)
+
+        result = self.controller.move_accumulated_and_wait(5, 4300)
+
+        self.assertEqual(result.target_position, 4300)
+        self.assertLessEqual(abs(result.final_position - 4300), 1)
+        self.assertEqual(result.final_raw_position, 4300 % 4096)
+        self.assertTrue(
+            any(speed > 0 for _, speed, _ in self.api.timed_run_commands)
+        )
+        self.assertEqual(self.controller.state(5), PositionControlState.READY)
+
+    def test_streaming_accumulated_control_returns_to_position_mode(self) -> None:
+        self.prepare_servo()
+        self.controller.set_accumulated_reference(5, 100)
+        self.controller.begin_accumulated_control((5,))
+
+        command = self.controller.command_accumulated_positions((5,), (4300,))
+        self.assertGreater(command.speed_commands[0], 0)
+
+        final = self.controller.end_accumulated_control((5,), (140,))
+        self.assertEqual(final, (140,))
+        self.assertEqual(self.controller.state(5), PositionControlState.READY)
+
+
+    def test_streaming_rejects_unsafe_position_mode_transition(self) -> None:
+        self.prepare_servo()
+        self.controller.set_accumulated_reference(5, 100)
+        self.controller.begin_accumulated_control((5,))
+        self.controller.command_accumulated_positions((5,), (4300,))
+
+        with self.assertRaises(PositionControlError):
+            self.controller.end_accumulated_control((5,), (4300,))
+
+        self.assertGreaterEqual(self.api.stop_count, 1)
+        self.assertEqual(self.controller.state(5), PositionControlState.FAILED)
+
+
+    def test_move_accumulated_crosses_reverse_boundary(self) -> None:
+        self.prepare_servo()
+        self.controller.set_accumulated_reference(5, 100)
+
+        result = self.controller.move_accumulated_and_wait(5, -100)
+
+        self.assertLessEqual(abs(result.final_position - (-100)), 1)
+        self.assertEqual(result.final_raw_position, (-100) % 4096)
+        self.assertTrue(
+            any(speed < 0 for _, speed, _ in self.api.timed_run_commands)
+        )
+        self.assertEqual(self.controller.state(5), PositionControlState.READY)
 
 
 if __name__ == "__main__":

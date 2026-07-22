@@ -1,6 +1,11 @@
 """Higher-level, telemetry-aware servo control helpers."""
 
 from .position_controller import (
+    AccumulatedCommandResult,
+    AccumulatedMoveResult,
+    AccumulatedPositionAmbiguousError,
+    AccumulatedPositionControlConfig,
+    AccumulatedPositionNotInitializedError,
     MoveResult,
     PositionControlCancelledError,
     PositionControlConfig,
@@ -17,6 +22,11 @@ from .position_controller import (
 from .telemetry_monitor import TelemetryMonitor, TelemetrySnapshot
 
 __all__ = [
+    "AccumulatedCommandResult",
+    "AccumulatedMoveResult",
+    "AccumulatedPositionAmbiguousError",
+    "AccumulatedPositionControlConfig",
+    "AccumulatedPositionNotInitializedError",
     "MoveResult",
     "PositionArrivalTimeoutError",
     "PositionControlCancelledError",
