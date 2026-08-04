@@ -129,6 +129,15 @@ class MoveResult:
     elapsed_s: float
 
 
+@dataclass(frozen=True)
+class StreamCommandResult:
+    commanded_at: float
+    telemetry_sequence: int
+    servo_ids: tuple[int, ...]
+    target_positions: tuple[int, ...]
+    time_ms: int
+
+
 ProgressCallback = Callable[[PositionProgress], None]
 CancelCheck = Callable[[], bool]
 
@@ -319,6 +328,69 @@ class ReliablePositionController:
                 raise TelemetryUnavailableError(str(exc)) from exc
             except Exception:
                 self._fail_safe_stop((servo_id,))
+                raise
+
+    def stream_positions(
+        self,
+        servo_ids: Sequence[int],
+        target_positions: Sequence[int],
+        *,
+        time_ms: int = 0,
+    ) -> StreamCommandResult:
+        """Send one non-blocking position setpoint to multiple prepared servos.
+
+        This path is intended for continuously updated trajectories. It checks
+        controller state, target bounds, and telemetry freshness, but it does
+        not wait for each setpoint to start or arrive.
+        """
+
+        requested_servo_ids = tuple(int(value) for value in servo_ids)
+        targets = tuple(int(value) for value in target_positions)
+        if not requested_servo_ids:
+            raise ValueError("servo_ids must not be empty")
+        if len(requested_servo_ids) != len(targets):
+            raise ValueError(
+                "servo_ids and target_positions must contain the same number "
+                "of values"
+            )
+        if len(set(requested_servo_ids)) != len(requested_servo_ids):
+            raise ValueError("servo_ids must not contain duplicates")
+        if not 0 <= time_ms <= 65535:
+            raise ValueError("time_ms must be in the range 0-65535")
+        for target in targets:
+            if not self.config.position_min <= target <= self.config.position_max:
+                raise ValueError(
+                    f"target_position must be {self.config.position_min}-"
+                    f"{self.config.position_max}, got {target}"
+                )
+
+        with self._command_lock:
+            for servo_id in requested_servo_ids:
+                if self.state(servo_id) is not PositionControlState.READY:
+                    raise PositionControlNotPreparedError(
+                        f"Servo {servo_id} is not ready for position control"
+                    )
+
+            try:
+                snapshot = self._fresh_snapshot()
+                self._validate_servo_ids(snapshot, requested_servo_ids)
+                self._require_speeds(snapshot)
+                commanded_at = time.monotonic()
+                for servo_id, target in zip(requested_servo_ids, targets):
+                    self._api.set_position(
+                        servo_id,
+                        target,
+                        time_ms=time_ms,
+                    )
+                return StreamCommandResult(
+                    commanded_at=commanded_at,
+                    telemetry_sequence=snapshot.sequence,
+                    servo_ids=requested_servo_ids,
+                    target_positions=targets,
+                    time_ms=time_ms,
+                )
+            except Exception:
+                self._fail_safe_stop(requested_servo_ids)
                 raise
 
     def stop_all(self) -> None:

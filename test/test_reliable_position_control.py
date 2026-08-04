@@ -190,5 +190,52 @@ class ReliablePositionControllerTest(unittest.TestCase):
         )
 
 
+    def test_stream_positions_requires_prepared_servos(self) -> None:
+        with self.assertRaisesRegex(Exception, "not ready"):
+            self.controller.stream_positions((5,), (140,))
+
+        self.assertEqual(self.api.position_commands, [])
+
+    def test_stream_positions_sends_all_targets_without_waiting(self) -> None:
+        self.controller.prepare(
+            (0, 1, 2, 3, 4, 5),
+            force_init_servo_ids=tuple(range(6)),
+        )
+        prime_command_count = len(self.api.position_commands)
+
+        result = self.controller.stream_positions(
+            (0, 1, 2, 3, 4, 5),
+            (110, 120, 130, 140, 150, 160),
+            time_ms=0,
+        )
+
+        self.assertEqual(
+            self.api.position_commands[prime_command_count:],
+            [
+                (0, 110, 0),
+                (1, 120, 0),
+                (2, 130, 0),
+                (3, 140, 0),
+                (4, 150, 0),
+                (5, 160, 0),
+            ],
+        )
+        self.assertEqual(result.target_positions, (110, 120, 130, 140, 150, 160))
+        self.assertTrue(
+            all(
+                self.controller.state(servo_id) is PositionControlState.READY
+                for servo_id in range(6)
+            )
+        )
+
+    def test_stream_positions_rejects_out_of_range_target(self) -> None:
+        self.prepare_servo()
+        prime_command_count = len(self.api.position_commands)
+
+        with self.assertRaises(ValueError):
+            self.controller.stream_positions((5,), (5000,))
+
+        self.assertEqual(len(self.api.position_commands), prime_command_count)
+
 if __name__ == "__main__":
     unittest.main()

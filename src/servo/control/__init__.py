@@ -12,6 +12,7 @@ from .position_controller import (
     PositionStartTimeoutError,
     ReliablePositionController,
     RetryPolicy,
+    StreamCommandResult,
     TelemetryUnavailableError,
 )
 from .telemetry_monitor import TelemetryMonitor, TelemetrySnapshot
@@ -28,6 +29,7 @@ __all__ = [
     "PositionStartTimeoutError",
     "ReliablePositionController",
     "RetryPolicy",
+    "StreamCommandResult",
     "TelemetryMonitor",
     "TelemetrySnapshot",
     "TelemetryUnavailableError",
