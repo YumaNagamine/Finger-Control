@@ -39,12 +39,12 @@
   },
   "safety": {
     "position_limits": {
-      "FDP": [0, 4095],
-      "FDS": [0, 4095],
-      "EI": [0, 4095],
-      "DI": [0, 4095],
-      "PI": [0, 4095],
-      "LUM": [0, 4095]
+      "FDP": [-28672, 28672],
+      "FDS": [-28672, 28672],
+      "EI": [-28672, 28672],
+      "DI": [-28672, 28672],
+      "PI": [-28672, 28672],
+      "LUM": [-28672, 28672]
     },
     "max_position_step": {
       "FDP": 200,
@@ -60,6 +60,7 @@
   },
   "hardware": {
     "serial_port": "COM3",
+    "multiturn": true,
     "baud_rate": 921600,
     "serial_timeout_s": 0.2,
     "telemetry_wait_s": 3.0,

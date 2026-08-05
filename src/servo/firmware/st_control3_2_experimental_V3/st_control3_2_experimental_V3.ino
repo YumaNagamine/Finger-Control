@@ -31,7 +31,9 @@ enum CmdType {
     CMD_JOG,
     CMD_SCAN_IDS, 
     CMD_CHANGE_ID,
-    CMD_SET_POSITION
+    CMD_SET_POSITION,
+    CMD_SET_MULTITURN_ABSOLUTE,
+    CMD_SET_MULTITURN_RELATIVE
 };
 
 struct RobotCommand {
@@ -41,9 +43,17 @@ struct RobotCommand {
     int val2; // Duration or Extra
 };
 
-enum MotorState { STATE_WHEEL, STATE_PID_HOLD, STATE_JOGGING, STATE_SERVO_MODE };
+enum MotorState {
+    STATE_STOPPED,
+    STATE_WHEEL,
+    STATE_PID_HOLD,
+    STATE_JOGGING,
+    STATE_SERVO_MODE,
+    STATE_STEP_MODE
+};
 
 struct MotorControlState {
+    bool targetInitialized;
     MotorState state;
     long targetPos;
     unsigned long jogEndTime;
@@ -252,8 +262,8 @@ void loop() {
                             sendCmd(CMD_TIMED_RUN, id, spd, time);
                         }
                     }
-                    else if (cmdStr == "x") {
-                        // x,ID,Pos,[Time]
+                    else if (cmdStr == "x" || cmdStr == "ma" || cmdStr == "mr") {
+                        // x/ma/mr,ID,PositionOrDelta,[Time]
                         int comma2 = rem.indexOf(',');
                         int comma3 = rem.lastIndexOf(',');
                         if (comma2 > 0) {
@@ -266,7 +276,13 @@ void loop() {
                                  pos = rem.substring(comma2+1).toInt();
                                  time = 0;
                              }
-                             sendCmd(CMD_SET_POSITION, id, pos, time);
+                             CmdType commandType = CMD_SET_POSITION;
+                             if (cmdStr == "ma") {
+                                 commandType = CMD_SET_MULTITURN_ABSOLUTE;
+                             } else if (cmdStr == "mr") {
+                                 commandType = CMD_SET_MULTITURN_RELATIVE;
+                             }
+                             sendCmd(commandType, id, pos, time);
                         }
                     }
                     else {
@@ -312,7 +328,10 @@ void loop() {
 void sendCmd(CmdType type, int id, int v1, int v2) {
     RobotCommand cmd;
     cmd.type = type; cmd.id = id; cmd.val1 = v1; cmd.val2 = v2;
-    xQueueSend(commandQueue, &cmd, 0);
+    if (xQueueSend(commandQueue, &cmd, 0) != pdTRUE) {
+        Serial.println("ERROR: COMMAND_QUEUE_FULL");
+        return;
+    }
     Serial.print("Queueing Cmd: Type="); Serial.print(type); Serial.print(", ID="); Serial.print(id); 
     Serial.print(", V1="); Serial.print(v1); Serial.print(", V2="); Serial.println(v2);
 }
@@ -339,6 +358,7 @@ void TaskControl(void *pvParameters) {
         st.writeSpeed(physical_id, 0); // Ensure stop
         mState[i].state = STATE_WHEEL;
         mState[i].targetPos = 0;
+        mState[i].targetInitialized = false;
         mState[i].jogEndTime = 0;
     }
 
@@ -367,8 +387,12 @@ void TaskControl(void *pvParameters) {
             if (cmd.type == CMD_STOP_ALL) {
                 for(int i=0; i<NUM_SERVOS; i++) {
                     uint8_t physical_id = SERVO_IDS[i];
-                    st.writeSpeed(physical_id, 0);
-                    mState[i].state = STATE_WHEEL;
+                    st.disableTorque(physical_id);
+                    mState[i].state = STATE_STOPPED;
+                    if (wrappedServos[i] && wrappedServos[i]->isInitialized()) {
+                        mState[i].targetPos = currentPositions[i];
+                        mState[i].targetInitialized = true;
+                    }
                 }
             }
             else if (cmd.type == CMD_RESET_ALL) {
@@ -380,6 +404,9 @@ void TaskControl(void *pvParameters) {
                     st.writeAcceleration(physical_id, 0);
                     st.lock(physical_id);
                     if (wrappedServos[i]) wrappedServos[i]->reset();
+                    mState[i].state = STATE_WHEEL;
+                    mState[i].targetPos = 0;
+                    mState[i].targetInitialized = false;
                 }
             }
             else if (cmd.type == CMD_SCAN_IDS) {
@@ -429,7 +456,10 @@ void TaskControl(void *pvParameters) {
                 switch (cmd.type) {
                     case CMD_SET_SPEED:
                         // Check if state mismatch OR Forced Init (val2 == 1)
-                        if (mState[i].state != STATE_WHEEL && mState[i].state != STATE_JOGGING || cmd.val2 == 1) {
+                        if (
+                            (mState[i].state != STATE_WHEEL && mState[i].state != STATE_JOGGING)
+                            || cmd.val2 == 1
+                        ) {
                              st.setWheelMode(physical_id);
                              delay(2);
                              st.lock(physical_id); // Ensure torque ON
@@ -459,6 +489,53 @@ void TaskControl(void *pvParameters) {
                         st.writePosition(physical_id, (int)hw_target, cmd.val2, 1500); 
                         break;
                     }
+                    case CMD_SET_MULTITURN_ABSOLUTE:
+                    case CMD_SET_MULTITURN_RELATIVE: {
+                        if (!wrappedServos[i]->isInitialized() || !mState[i].targetInitialized) {
+                            Serial.print("ERROR: MULTITURN_NOT_INITIALIZED ID=");
+                            Serial.println(i);
+                            break;
+                        }
+                        if (cmd.val2 < 0 || cmd.val2 > 65535) {
+                            Serial.print("ERROR: INVALID_MOVE_TIME ");
+                            Serial.println(cmd.val2);
+                            break;
+                        }
+
+                        if (mState[i].state != STATE_STEP_MODE) {
+                            Serial.print("Switching Motor ");
+                            Serial.print(physical_id);
+                            Serial.println(" to STEP MODE...");
+                            st.setStepMode(physical_id);
+                            delay(2);
+                            mState[i].state = STATE_STEP_MODE;
+                        }
+
+                        long newTarget = cmd.type == CMD_SET_MULTITURN_RELATIVE
+                            ? mState[i].targetPos + (long)cmd.val1
+                            : (long)cmd.val1;
+                        long stepDelta = newTarget - mState[i].targetPos;
+                        if (stepDelta < -32767L || stepDelta > 32767L) {
+                            Serial.print("ERROR: MULTITURN_STEP_OUT_OF_RANGE ");
+                            Serial.println(stepDelta);
+                            break;
+                        }
+
+                        st.writeStepPosition(
+                            physical_id,
+                            (int16_t)stepDelta,
+                            (uint16_t)cmd.val2,
+                            1500
+                        );
+                        mState[i].targetPos = newTarget;
+                        Serial.print("MULTITURN_TARGET ID=");
+                        Serial.print(i);
+                        Serial.print(" TARGET=");
+                        Serial.print(newTarget);
+                        Serial.print(" STEP=");
+                        Serial.println(stepDelta);
+                        break;
+                    }
                     case CMD_TIMED_RUN:
                         if (mState[i].state != STATE_WHEEL) {
                              st.setWheelMode(physical_id);
@@ -471,8 +548,11 @@ void TaskControl(void *pvParameters) {
                         mState[i].jogEndTime = millis() + cmd.val2;
                         break;
                     case CMD_GOTO_ZERO:
-                        // Keep existing PID Hold logic (Software Position Control) or switch to Hardware?
-                        // Let's keep it as is for now to not break "Go to Zero" behavior if user expects soft PID.
+                        if (mState[i].state != STATE_WHEEL) {
+                            st.setWheelMode(physical_id);
+                            delay(2);
+                            st.lock(physical_id);
+                        }
                         mState[i].state = STATE_PID_HOLD;
                         mState[i].targetPos = 0;
                         wrappedServos[i]->prev_error = 0;
@@ -517,6 +597,13 @@ void TaskControl(void *pvParameters) {
                 currentPositions[i] = wrappedServos[i]->getAccumulatedPosition();
                 currentLoads[i] = wrappedServos[i]->last_load;
                 currentSpeeds[i] = wrappedServos[i]->last_speed; // Capture velocity (fixed name)
+                if (
+                    !mState[i].targetInitialized
+                    || mState[i].state != STATE_STEP_MODE
+                ) {
+                    mState[i].targetPos = currentPositions[i];
+                    mState[i].targetInitialized = true;
+                }
             } else {
                 // Read failed or Object NULL: Maintain last known position (or 0 if never read)
                 // Only clear Load/Speed as they are instantaneous

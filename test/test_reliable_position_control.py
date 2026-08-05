@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from servo.control import (
     PositionControlConfig,
@@ -32,6 +32,7 @@ class FakeServoAPI:
         self.speeds = [0] * num_servos
         self.position_commands: list[tuple[int, int, int]] = []
         self.ignore_next_position_commands = 0
+        self.multiturn_position_commands: list[tuple[int, int, int]] = []
         self.reverse_next_position_commands = 0
         self.stop_count = 0
         self.reset_count = 0
@@ -66,6 +67,19 @@ class FakeServoAPI:
                 direction = 1 if position >= self.positions[servo_id] else -1
                 self.positions[servo_id] -= direction * 10
                 return
+            self.positions[servo_id] = position
+            self.speeds[servo_id] = 0
+
+    def set_multiturn_position(
+        self,
+        servo_id: int,
+        position: int,
+        time_ms: int = 0,
+    ) -> None:
+        with self._lock:
+            self.multiturn_position_commands.append(
+                (servo_id, position, time_ms)
+            )
             self.positions[servo_id] = position
             self.speeds[servo_id] = 0
 
@@ -236,6 +250,39 @@ class ReliablePositionControllerTest(unittest.TestCase):
             self.controller.stream_positions((5,), (5000,))
 
         self.assertEqual(len(self.api.position_commands), prime_command_count)
+
+    def test_multiturn_stream_accepts_extended_position(self) -> None:
+        controller = ReliablePositionController(
+            self.api,
+            self.telemetry,
+            replace(
+                test_config(),
+                multiturn=True,
+                position_min=-28672,
+                position_max=28672,
+            ),
+        )
+        controller.prepare((5,), force_init_servo_ids=tuple(range(6)))
+        prime_command_count = len(self.api.multiturn_position_commands)
+
+        result = controller.stream_positions((5,), (5000,), time_ms=0)
+
+        self.assertEqual(
+            self.api.multiturn_position_commands[prime_command_count:],
+            [(5, 5000, 0)],
+        )
+        self.assertEqual(result.target_positions, (5000,))
+
+    def test_multiturn_stream_rejects_configured_out_of_range_target(self) -> None:
+        controller = ReliablePositionController(
+            self.api,
+            self.telemetry,
+            replace(test_config(), multiturn=True, position_max=6000),
+        )
+        controller.prepare((5,), force_init_servo_ids=tuple(range(6)))
+
+        with self.assertRaises(ValueError):
+            controller.stream_positions((5,), (6001,))
 
 if __name__ == "__main__":
     unittest.main()

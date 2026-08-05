@@ -19,6 +19,12 @@ private:
     long zero_offset;
     long physical_zero_offset; // Track raw hardware position at zero time
 
+    static long normalizeRawPosition(long position) {
+        long normalized = position % 4096;
+        if (normalized < 0) normalized += 4096;
+        return normalized;
+    }
+
 public:
     // Telemetry
     int16_t last_load;
@@ -39,8 +45,8 @@ public:
     void begin() {
         int16_t p, v, l;
         if (st.readState(servo_id, p, v, l)) {
-            last_pos = p;
-            accumulated_pos = p;
+            last_pos = normalizeRawPosition(p);
+            accumulated_pos = (long)p;
             last_speed = v;
             last_load = l;
             first_read = false;
@@ -61,25 +67,32 @@ public:
         last_volts = 0; 
 
         if (first_read) {
-            last_pos = p;
-            accumulated_pos = p;
+            last_pos = normalizeRawPosition(p);
+            accumulated_pos = (long)p;
             first_read = false;
             return true;
         }
 
-        long delta = (long)p - last_pos;
+        long raw_pos = normalizeRawPosition(p);
+        long delta = raw_pos - last_pos;
         if (delta > 2048) delta -= 4096; 
         else if (delta < -2048) delta += 4096;
 
         accumulated_pos += delta;
-        last_pos = p;
+        last_pos = raw_pos;
         return true;
     }
 
     long getAccumulatedPosition() const {
-        // Return Raw Hardware Position (0-4095) to match Hardware Servo Mode limits
-        // and avoid negative accumulated values confusing the GUI tools.
-        return last_pos; 
+        return accumulated_pos;
+    }
+
+    long getRawPosition() const {
+        return last_pos;
+    }
+
+    bool isInitialized() const {
+        return !first_read;
     }
 
     long getZeroOffset() const {
@@ -98,8 +111,8 @@ public:
     void reset() {
         int16_t p, v, l;
         if (st.readState(servo_id, p, v, l)) {
-            last_pos = p;
-            accumulated_pos = 0; // Reset software accumulation to 0
+            last_pos = normalizeRawPosition(p);
+            accumulated_pos = 0;
             zero_offset = 0;     // Reset the offset as well
             prev_error = 0;
             integral_term = 0;

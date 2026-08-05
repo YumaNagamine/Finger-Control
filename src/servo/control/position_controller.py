@@ -65,6 +65,7 @@ class PositionControlConfig:
     arrival_timeout_s: float = 3.0
     max_start_retries: int = 1
     reset_id_map_on_prepare: bool = True
+    multiturn: bool = False
     position_min: int = 0
     position_max: int = 4095
 
@@ -208,7 +209,7 @@ class ReliablePositionController:
                     for _ in range(self.config.prime_command_count):
                         current = snapshot.positions[servo_id]
                         sequence = snapshot.sequence
-                        self._api.set_position(servo_id, current, time_ms=0)
+                        self._send_position(servo_id, current, time_ms=0)
                         self._sleep(self.config.prime_interval_s)
                         snapshot = self._wait_for_newer(sequence)
 
@@ -265,7 +266,7 @@ class ReliablePositionController:
                     self._check_cancel(cancel_check)
                     sequence = snapshot.sequence
                     baseline_position = snapshot.positions[servo_id]
-                    self._api.set_position(
+                    self._send_position(
                         servo_id,
                         target_position,
                         time_ms=time_ms,
@@ -377,7 +378,7 @@ class ReliablePositionController:
                 self._require_speeds(snapshot)
                 commanded_at = time.monotonic()
                 for servo_id, target in zip(requested_servo_ids, targets):
-                    self._api.set_position(
+                    self._send_position(
                         servo_id,
                         target,
                         time_ms=time_ms,
@@ -392,6 +393,18 @@ class ReliablePositionController:
             except Exception:
                 self._fail_safe_stop(requested_servo_ids)
                 raise
+
+    def _send_position(
+        self,
+        servo_id: int,
+        target_position: int,
+        *,
+        time_ms: int,
+    ) -> None:
+        if self.config.multiturn:
+            self._api.set_multiturn_position(servo_id, target_position, time_ms)
+        else:
+            self._api.set_position(servo_id, target_position, time_ms)
 
     def stop_all(self) -> None:
         with self._command_lock:

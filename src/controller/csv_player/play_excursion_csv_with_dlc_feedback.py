@@ -249,6 +249,7 @@ def _make_position_controller(
             arrival_timeout_s=float(hardware["telemetry_wait_s"]),
             max_start_retries=1,
             reset_id_map_on_prepare=True,
+            multiturn=bool(hardware["multiturn"]),
             position_min=min(value[0] for value in position_limits),
             position_max=max(value[1] for value in position_limits),
         ),

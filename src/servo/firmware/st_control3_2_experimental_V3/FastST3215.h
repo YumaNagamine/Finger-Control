@@ -21,6 +21,17 @@ public:
         _serial->flush(); // Ensure transmission complete
         // No delay needed at 1Mbps
     }
+    void writeRegister16(uint8_t id, uint8_t reg, uint16_t val) {
+        uint8_t low = (uint8_t)(val & 0xFF);
+        uint8_t high = (uint8_t)(val >> 8);
+        uint8_t p[] = {0xFF, 0xFF, id, 0x05, 0x03, reg, low, high, 0x00};
+        uint16_t sum = id + 5 + 3 + reg + low + high;
+        p[8] = ~(sum & 0xFF);
+        while (_serial->available()) _serial->read();
+        _serial->write(p, 9);
+        _serial->flush();
+    }
+
 
     // Set Acceleration (Reg 41 / 0x29)
     // 0 = Max (Instant), 254 = Slowest
@@ -32,10 +43,8 @@ public:
     void enableTorque(uint8_t id) { writeRegister(id, 0x28, 1); }
     void disableTorque(uint8_t id) { writeRegister(id, 0x28, 0); }
 
-    // EEPROM Lock (Address 48 / 0x30) - 0=Unlock, 1=Lock
-    // Reverted to Reg 48 for standard operations (Mode, etc)
-    void unlockEeprom(uint8_t id) { writeRegister(id, 48, 0); }
-    void lockEeprom(uint8_t id) { writeRegister(id, 48, 1); }
+    void unlockEeprom(uint8_t id) { writeRegister(id, 55, 0); }
+    void lockEeprom(uint8_t id) { writeRegister(id, 55, 1); }
 
     // Legacy aliases for compatibility
     void unlock(uint8_t id) { disableTorque(id); } 
@@ -44,11 +53,11 @@ public:
     void setMode(uint8_t id, uint8_t mode) {
         disableTorque(id); 
         delay(5);
-        unlockEeprom(id); // Uses Reg 48
+        unlockEeprom(id);
         delay(5);
         writeRegister(id, 33, mode); // Address 33 (0x21) = Operating Mode
         delay(10); // Reduced delay
-        lockEeprom(id); // Uses Reg 48
+        lockEeprom(id);
         delay(5);
     }
     
@@ -59,6 +68,22 @@ public:
     void setWheelMode(uint8_t id) {
         setMode(id, 1);
     }
+    void setStepMode(uint8_t id) {
+        disableTorque(id);
+        delay(5);
+        unlockEeprom(id);
+        delay(5);
+        writeRegister16(id, 9, 0);
+        delay(5);
+        writeRegister16(id, 11, 0);
+        delay(5);
+        writeRegister(id, 33, 3);
+        delay(10);
+        lockEeprom(id);
+        delay(5);
+        enableTorque(id);
+    }
+
 
     // For Servo Mode (Mode 0)
     void writePosition(uint8_t id, uint16_t position, uint16_t time = 0, uint16_t speed = 1500) {
@@ -87,6 +112,39 @@ public:
         _serial->write(p, 13);
         _serial->flush();
     }
+    void writeStepPosition(
+        uint8_t id,
+        int16_t delta,
+        uint16_t time = 0,
+        uint16_t speed = 1500
+    ) {
+        uint16_t encoded_delta;
+        if (delta < 0) {
+            encoded_delta = (uint16_t)(-(int32_t)delta) | 0x8000;
+        } else {
+            encoded_delta = (uint16_t)delta;
+        }
+        uint8_t p[13];
+        p[0] = 0xFF; p[1] = 0xFF;
+        p[2] = id;
+        p[3] = 0x09;
+        p[4] = 0x03;
+        p[5] = 0x2A;
+        p[6] = (uint8_t)(encoded_delta & 0xFF);
+        p[7] = (uint8_t)(encoded_delta >> 8);
+        p[8] = (uint8_t)(time & 0xFF);
+        p[9] = (uint8_t)(time >> 8);
+        p[10] = (uint8_t)(speed & 0xFF);
+        p[11] = (uint8_t)(speed >> 8);
+
+        uint16_t sum = id + 9 + 3 + 0x2A
+            + p[6] + p[7] + p[8] + p[9] + p[10] + p[11];
+        p[12] = ~(sum & 0xFF);
+
+        _serial->write(p, 13);
+        _serial->flush();
+    }
+
 
     // For Wheel Mode (Mode 1)
     void writeSpeed(uint8_t id, int16_t speed) {
@@ -161,7 +219,12 @@ public:
 
         if (rx[0] != 0xFF || rx[1] != 0xFF || rx[2] != id) return false;
 
-        pos = (int16_t)(rx[5] | (rx[6] << 8));
+        uint16_t raw_pos = (uint16_t)(rx[5] | (rx[6] << 8));
+        if (raw_pos & 0x8000) {
+            pos = -(int16_t)(raw_pos & 0x7FFF);
+        } else {
+            pos = (int16_t)raw_pos;
+        }
         
         // Speed: Sign-Magnitude Format (Bit 15 is sign)
         uint16_t raw_vel = (uint16_t)(rx[7] | (rx[8] << 8));
