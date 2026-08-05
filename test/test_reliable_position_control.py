@@ -31,8 +31,10 @@ class FakeServoAPI:
         self.loads = [0] * num_servos
         self.speeds = [0] * num_servos
         self.position_commands: list[tuple[int, int, int]] = []
+        self.speed_commands: list[tuple[int, int, bool]] = []
         self.ignore_next_position_commands = 0
         self.multiturn_position_commands: list[tuple[int, int, int]] = []
+        self.offset_next_position_commands = 0
         self.reverse_next_position_commands = 0
         self.stop_count = 0
         self.reset_count = 0
@@ -52,9 +54,9 @@ class FakeServoAPI:
             self.reset_count += 1
 
     def set_speed(self, servo_id: int, speed: int, force_init: bool = False) -> None:
-        del force_init
         with self._lock:
             self.speeds[servo_id] = speed
+            self.speed_commands.append((servo_id, speed, force_init))
 
     def set_position(self, servo_id: int, position: int, time_ms: int = 0) -> None:
         with self._lock:
@@ -68,6 +70,10 @@ class FakeServoAPI:
                 self.positions[servo_id] -= direction * 10
                 return
             self.positions[servo_id] = position
+            if self.offset_next_position_commands:
+                self.positions[servo_id] = position + self.offset_next_position_commands
+                self.offset_next_position_commands = 0
+                return
             self.speeds[servo_id] = 0
 
     def set_multiturn_position(
@@ -139,6 +145,36 @@ class ReliablePositionControllerTest(unittest.TestCase):
             [5, 5],
         )
         self.assertEqual(self.controller.state(0), PositionControlState.UNPREPARED)
+
+    def test_prepare_keeps_one_fixed_prime_target(self) -> None:
+        self.api.offset_next_position_commands = 5
+
+        self.prepare_servo()
+
+        self.assertEqual(
+            self.api.position_commands,
+            [(5, 100, 0), (5, 100, 0)],
+        )
+
+    def test_multiturn_prepare_does_not_force_wheel_mode(self) -> None:
+        controller = ReliablePositionController(
+            self.api,
+            self.telemetry,
+            replace(
+                test_config(),
+                multiturn=True,
+                position_min=-28672,
+                position_max=28672,
+            ),
+        )
+
+        controller.prepare((5,), force_init_servo_ids=tuple(range(6)))
+
+        self.assertEqual(self.api.speed_commands, [])
+        self.assertEqual(
+            self.api.multiturn_position_commands,
+            [(5, 100, 0), (5, 100, 0)],
+        )
 
     def test_move_retries_once_when_first_real_command_is_ignored(self) -> None:
         self.prepare_servo()

@@ -200,22 +200,32 @@ class ReliablePositionController:
                     self._sleep(self.config.id_map_reset_wait_s)
                     initial = self._wait_for_newer(sequence)
 
-                for servo_id in init_servo_ids:
-                    self._api.set_speed(servo_id, 0, force_init=True)
+                # Multi-turn position control can enter Mode 0 directly. Do
+                # not force it through wheel mode first: that transition
+                # disables/re-enables torque and makes the position sampled
+                # for priming transient on physical servos.
+                if not self.config.multiturn:
+                    for servo_id in init_servo_ids:
+                        self._api.set_speed(servo_id, 0, force_init=True)
                 self._sleep(self.config.speed_init_wait_s)
                 snapshot = self._wait_for_newer(initial.sequence)
 
                 for servo_id in position_servo_ids:
+                    snapshot = self._wait_until_stationary(
+                        servo_id,
+                        snapshot,
+                        deadline=time.monotonic() + self.config.telemetry_wait_s,
+                    )
+                    prime_target = snapshot.positions[servo_id]
                     for _ in range(self.config.prime_command_count):
-                        current = snapshot.positions[servo_id]
                         sequence = snapshot.sequence
-                        self._send_position(servo_id, current, time_ms=0)
+                        self._send_position(servo_id, prime_target, time_ms=0)
                         self._sleep(self.config.prime_interval_s)
                         snapshot = self._wait_for_newer(sequence)
 
                     snapshot = self._wait_until_stable(
                         servo_id,
-                        snapshot.positions[servo_id],
+                        prime_target,
                         snapshot,
                         deadline=time.monotonic() + self.config.telemetry_wait_s,
                         attempt=0,
@@ -517,6 +527,40 @@ class ReliablePositionController:
         raise PositionArrivalTimeoutError(
             f"Servo {servo_id} did not arrive at target {target_position} within "
             f"the configured timeout"
+        )
+
+    def _wait_until_stationary(
+        self,
+        servo_id: int,
+        snapshot: TelemetrySnapshot,
+        *,
+        deadline: float,
+    ) -> TelemetrySnapshot:
+        """Wait for a stable measured position before selecting a prime target."""
+        self._require_speeds(snapshot)
+        previous_position = snapshot.positions[servo_id]
+        stable_frames = 0
+        sequence = snapshot.sequence
+
+        while time.monotonic() < deadline:
+            snapshot = self._wait_for_newer_until(sequence, deadline)
+            sequence = snapshot.sequence
+            self._require_speeds(snapshot)
+            actual = snapshot.positions[servo_id]
+            speed = self._speed(snapshot, servo_id)
+            if (
+                abs(actual - previous_position) <= self.config.position_tolerance
+                and abs(speed) <= self.config.speed_tolerance
+            ):
+                stable_frames += 1
+            else:
+                stable_frames = 0
+            previous_position = actual
+            if stable_frames >= self.config.stable_frame_count:
+                return snapshot
+
+        raise PositionArrivalTimeoutError(
+            f"Servo {servo_id} did not become stationary during preparation"
         )
 
     def _wait_for_any_snapshot(self) -> TelemetrySnapshot:
