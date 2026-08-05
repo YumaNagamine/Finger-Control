@@ -25,9 +25,7 @@ DEFAULT_LOG_DIRECTORY = SRC_ROOT.parent / "logs" / "servo_multiturn_test"
 class BoundaryTestPlan:
     initial_position: int
     setup_position: int
-    forward_delta: int
     forward_target: int
-    reverse_delta: int
     reverse_target: int
 
 
@@ -60,12 +58,14 @@ def build_boundary_test_plan(
         start_raw,
     )
     forward_target = setup_position + delta
+    if not -28672 <= setup_position <= 28672:
+        raise ValueError("setup position exceeds the multi-loop range")
+    if not -28672 <= forward_target <= 28672:
+        raise ValueError("forward target exceeds the multi-loop range")
     return BoundaryTestPlan(
         initial_position=initial_position,
         setup_position=setup_position,
-        forward_delta=delta,
         forward_target=forward_target,
-        reverse_delta=-delta,
         reverse_target=setup_position,
     )
 
@@ -190,6 +190,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", default="COM3")
     parser.add_argument("--baud-rate", type=int, default=921600)
     parser.add_argument("--serial-timeout-s", type=float, default=0.2)
+    parser.add_argument("--startup-wait-s", type=float, default=2.0)
     parser.add_argument("--servo-id", type=int, default=0)
     parser.add_argument("--start-raw", type=int, default=4000)
     parser.add_argument("--delta", type=int, default=1000)
@@ -221,6 +222,8 @@ def main() -> None:
         raise ValueError("--time-ms must be in the range 0-65535")
     if args.tolerance < 0 or args.speed_tolerance < 0:
         raise ValueError("tolerances must be non-negative")
+    if args.startup_wait_s < 0.0:
+        raise ValueError("--startup-wait-s must be non-negative")
     if args.stable_frames <= 0 or args.timeout_s <= 0.0:
         raise ValueError("stable frames and timeout must be greater than zero")
 
@@ -237,6 +240,7 @@ def main() -> None:
         )
         telemetry.start()
         try:
+            time.sleep(args.startup_wait_s)
             initial_snapshot = telemetry.wait_for_newer(0, args.timeout_s)
             api.stop_all()
             stopped_snapshot = telemetry.wait_for_newer(
@@ -271,7 +275,11 @@ def main() -> None:
                 logger=logger,
             )
 
-            api.move_relative(args.servo_id, plan.forward_delta, args.time_ms)
+            api.set_multiturn_position(
+                args.servo_id,
+                plan.forward_target,
+                args.time_ms,
+            )
             forward_snapshot = wait_for_target(
                 telemetry,
                 servo_id=args.servo_id,
@@ -304,7 +312,11 @@ def main() -> None:
             ) > args.tolerance:
                 raise AssertionError("Repeated absolute target caused position drift")
 
-            api.move_relative(args.servo_id, plan.reverse_delta, args.time_ms)
+            api.set_multiturn_position(
+                args.servo_id,
+                plan.reverse_target,
+                args.time_ms,
+            )
             reverse_snapshot = wait_for_target(
                 telemetry,
                 servo_id=args.servo_id,

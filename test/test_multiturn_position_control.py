@@ -36,6 +36,10 @@ class MultiturnPositionModelTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_boundary_test_plan(1000, start_raw=1000, delta=1000)
 
+    def test_plan_rejects_target_beyond_multiloop_range(self) -> None:
+        with self.assertRaises(ValueError):
+            build_boundary_test_plan(28000, start_raw=4000, delta=1000)
+
 
 class ServoAPIMultiturnCommandTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -47,15 +51,15 @@ class ServoAPIMultiturnCommandTest(unittest.TestCase):
 
         send_raw.assert_called_once_with("ma,2,5000,200")
 
-    def test_sends_negative_relative_multiturn_command(self) -> None:
+    def test_sends_negative_absolute_multiturn_command(self) -> None:
         with patch.object(self.api, "send_raw") as send_raw:
-            self.api.move_relative(2, -1000, 0)
+            self.api.set_multiturn_position(2, -1000, 0)
 
-        send_raw.assert_called_once_with("mr,2,-1000,0")
+        send_raw.assert_called_once_with("ma,2,-1000,0")
 
-    def test_rejects_unrepresentable_relative_step(self) -> None:
+    def test_rejects_out_of_range_absolute_position(self) -> None:
         with self.assertRaises(ValueError):
-            self.api.move_relative(2, -32768, 0)
+            self.api.set_multiturn_position(2, 28673, 0)
 
 
 if __name__ == "__main__":

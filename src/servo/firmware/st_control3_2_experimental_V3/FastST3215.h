@@ -32,6 +32,18 @@ public:
         _serial->flush();
     }
 
+    bool readRegister8(uint8_t id, uint8_t reg, uint8_t& value) {
+        while (_serial->available()) _serial->read();
+        uint8_t packet[] = {0xFF, 0xFF, id, 0x04, 0x02, reg, 0x01, 0x00};
+        packet[7] = ~(id + 4 + 2 + reg + 1) & 0xFF;
+        _serial->write(packet, 8);
+        _serial->flush();
+
+        uint8_t rx[7];
+        if (!readStatusPacket(id, 3, rx, sizeof(rx))) return false;
+        value = rx[5];
+        return true;
+    }
 
     // Set Acceleration (Reg 41 / 0x29)
     // 0 = Max (Instant), 254 = Slowest
@@ -61,90 +73,49 @@ public:
         delay(5);
     }
     
-    void setServoMode(uint8_t id) {
-        setMode(id, 0);
+    bool setServoMode(uint8_t id) {
+        return configurePositionMode(id, false);
     }
 
     void setWheelMode(uint8_t id) {
         setMode(id, 1);
     }
-    void setStepMode(uint8_t id) {
-        disableTorque(id);
-        delay(5);
-        unlockEeprom(id);
-        delay(5);
-        writeRegister16(id, 9, 0);
-        delay(5);
-        writeRegister16(id, 11, 0);
-        delay(5);
-        writeRegister(id, 33, 3);
-        delay(10);
-        lockEeprom(id);
-        delay(5);
-        enableTorque(id);
+
+    bool setMultiTurnMode(uint8_t id) {
+        return configurePositionMode(id, true);
     }
 
-
-    // For Servo Mode (Mode 0)
-    void writePosition(uint8_t id, uint16_t position, uint16_t time = 0, uint16_t speed = 1500) {
-        if (position > 4096) position = 4096;
-        
-        // Length = Instr(1) + Addr(1) + Data(6) + Checksum(1) = 9
-        uint8_t p[13];
-        p[0] = 0xFF; p[1] = 0xFF;
-        p[2] = id;
-        p[3] = 0x09; // Length
-        p[4] = 0x03; // WRITE
-        p[5] = 0x2A; // Address 42 (Target Position) - Based on st_benchmark and standard maps
-        
-        p[6] = (uint8_t)(position & 0xFF);
-        p[7] = (uint8_t)(position >> 8);
-        
-        p[8] = (uint8_t)(time & 0xFF);
-        p[9] = (uint8_t)(time >> 8);
-        
-        p[10] = (uint8_t)(speed & 0xFF);
-        p[11] = (uint8_t)(speed >> 8);
-        
-        uint16_t sum = id + 9 + 3 + 0x2A + p[6] + p[7] + p[8] + p[9] + p[10] + p[11];
-        p[12] = ~(sum & 0xFF);
-        
-        _serial->write(p, 13);
-        _serial->flush();
-    }
-    void writeStepPosition(
-        uint8_t id,
-        int16_t delta,
-        uint16_t time = 0,
-        uint16_t speed = 1500
-    ) {
-        uint16_t encoded_delta;
-        if (delta < 0) {
-            encoded_delta = (uint16_t)(-(int32_t)delta) | 0x8000;
+    // Position command for both single-turn and multi-loop Mode 0.
+    void writePosition(uint8_t id, int16_t position, uint16_t time = 0, uint16_t speed = 1500) {
+        uint16_t encoded_position;
+        if (position < 0) {
+            encoded_position = (uint16_t)(-(int32_t)position) | 0x8000;
         } else {
-            encoded_delta = (uint16_t)delta;
+            encoded_position = (uint16_t)position;
         }
-        uint8_t p[13];
+
+        // Official WritePosEx layout: ACC + Position + Time + Speed, from Reg 41.
+        uint8_t p[14];
         p[0] = 0xFF; p[1] = 0xFF;
         p[2] = id;
-        p[3] = 0x09;
+        p[3] = 0x0A;
         p[4] = 0x03;
-        p[5] = 0x2A;
-        p[6] = (uint8_t)(encoded_delta & 0xFF);
-        p[7] = (uint8_t)(encoded_delta >> 8);
-        p[8] = (uint8_t)(time & 0xFF);
-        p[9] = (uint8_t)(time >> 8);
-        p[10] = (uint8_t)(speed & 0xFF);
-        p[11] = (uint8_t)(speed >> 8);
+        p[5] = 0x29;
+        p[6] = 0;
+        p[7] = (uint8_t)(encoded_position & 0xFF);
+        p[8] = (uint8_t)(encoded_position >> 8);
+        p[9] = (uint8_t)(time & 0xFF);
+        p[10] = (uint8_t)(time >> 8);
+        p[11] = (uint8_t)(speed & 0xFF);
+        p[12] = (uint8_t)(speed >> 8);
 
-        uint16_t sum = id + 9 + 3 + 0x2A
-            + p[6] + p[7] + p[8] + p[9] + p[10] + p[11];
-        p[12] = ~(sum & 0xFF);
+        uint16_t sum = id + 10 + 3 + 0x29;
+        for (int i = 6; i <= 12; i++) sum += p[i];
+        p[13] = ~(sum & 0xFF);
 
-        _serial->write(p, 13);
+        _serial->write(p, 14);
         _serial->flush();
     }
-
 
     // For Wheel Mode (Mode 1)
     void writeSpeed(uint8_t id, int16_t speed) {
@@ -200,24 +171,15 @@ public:
     }
 
     bool readState(uint8_t id, int16_t& pos, int16_t& vel, int16_t& load) {
-        while (_serial->available()) _serial->read(); 
-        
-        // Read Present Pos/Speed/Load starting at 0x38 (per st_load_test)
-        // Length = Instr(1) + Addr(1) + DataLen(1) + Checksum(1) = 4
-        uint8_t packet[] = {0xFF, 0xFF, id, 0x04, 0x02, 0x38, 0x06, 0x00};
-        packet[7] = ~(id + 4 + 2 + 0x38 + 6) & 0xFF; 
+        while (_serial->available()) _serial->read();
 
+        uint8_t packet[] = {0xFF, 0xFF, id, 0x04, 0x02, 0x38, 0x06, 0x00};
+        packet[7] = ~(id + 4 + 2 + 0x38 + 6) & 0xFF;
         _serial->write(packet, 8);
-        
-        unsigned long start = micros();
-        while (_serial->available() < 12) {
-            if (micros() - start > 3000) return false;
-        }
+        _serial->flush();
 
         uint8_t rx[12];
-        _serial->readBytes(rx, 12);
-
-        if (rx[0] != 0xFF || rx[1] != 0xFF || rx[2] != id) return false;
+        if (!readStatusPacket(id, 8, rx, sizeof(rx))) return false;
 
         uint16_t raw_pos = (uint16_t)(rx[5] | (rx[6] << 8));
         if (raw_pos & 0x8000) {
@@ -225,8 +187,7 @@ public:
         } else {
             pos = (int16_t)raw_pos;
         }
-        
-        // Speed: Sign-Magnitude Format (Bit 15 is sign)
+
         uint16_t raw_vel = (uint16_t)(rx[7] | (rx[8] << 8));
         if (raw_vel & 0x8000) {
             vel = -(int16_t)(raw_vel & 0x7FFF);
@@ -235,7 +196,6 @@ public:
         }
 
         load = (int16_t)(rx[9] | (rx[10] << 8));
-        
         return true;
     }
 
@@ -249,6 +209,81 @@ public:
     }
 
 private:
+    bool readStatusPacket(
+        uint8_t id,
+        uint8_t expectedLength,
+        uint8_t* packet,
+        size_t packetSize
+    ) {
+        size_t index = 0;
+        unsigned long start = micros();
+        while (micros() - start <= 5000) {
+            if (!_serial->available()) continue;
+            uint8_t value = _serial->read();
+
+            if (index == 0) {
+                if (value == 0xFF) packet[index++] = value;
+                continue;
+            }
+            if (index == 1) {
+                if (value == 0xFF) {
+                    packet[index++] = value;
+                } else {
+                    index = 0;
+                }
+                continue;
+            }
+            if (index == 2) {
+                if (value == id) {
+                    packet[index++] = value;
+                } else {
+                    index = value == 0xFF ? 1 : 0;
+                }
+                continue;
+            }
+            if (index == 3 && value != expectedLength) {
+                index = value == 0xFF ? 1 : 0;
+                continue;
+            }
+
+            packet[index++] = value;
+            if (index != packetSize) continue;
+
+            uint16_t sum = 0;
+            for (size_t i = 2; i + 1 < packetSize; i++) sum += packet[i];
+            if ((uint8_t)(~sum) == packet[packetSize - 1]) return true;
+            index = 0;
+        }
+        return false;
+    }
+
+    bool configurePositionMode(uint8_t id, bool multiturn) {
+        uint8_t specialFunction;
+        if (!readRegister8(id, 0x12, specialFunction)) return false;
+
+        disableTorque(id);
+        delay(5);
+        unlockEeprom(id);
+        delay(5);
+        writeRegister16(id, 9, 0);
+        delay(5);
+        writeRegister16(id, 11, multiturn ? 0 : 4095);
+        delay(5);
+        if (multiturn) {
+            specialFunction |= 0x10;
+        } else {
+            specialFunction &= (uint8_t)~0x10;
+        }
+        writeRegister(id, 0x12, specialFunction);
+        delay(5);
+        writeRegister(id, 33, 0);
+        delay(10);
+        lockEeprom(id);
+        delay(5);
+        enableTorque(id);
+        return true;
+    }
+
     HardwareSerial* _serial;
 };
 

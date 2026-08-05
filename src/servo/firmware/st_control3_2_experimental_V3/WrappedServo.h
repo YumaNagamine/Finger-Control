@@ -12,8 +12,8 @@ private:
     FastST3215& st;              // Custom driver reference
     int servo_id;
 
-    long last_pos;            // Raw 0-4095
-    long accumulated_pos;     // Multiturn
+    long last_pos;
+    long accumulated_pos;
     bool first_read;
 
     long zero_offset;
@@ -45,7 +45,7 @@ public:
     void begin() {
         int16_t p, v, l;
         if (st.readState(servo_id, p, v, l)) {
-            last_pos = normalizeRawPosition(p);
+            last_pos = (long)p;
             accumulated_pos = (long)p;
             last_speed = v;
             last_load = l;
@@ -67,19 +67,14 @@ public:
         last_volts = 0; 
 
         if (first_read) {
-            last_pos = normalizeRawPosition(p);
+            last_pos = (long)p;
             accumulated_pos = (long)p;
             first_read = false;
             return true;
         }
 
-        long raw_pos = normalizeRawPosition(p);
-        long delta = raw_pos - last_pos;
-        if (delta > 2048) delta -= 4096; 
-        else if (delta < -2048) delta += 4096;
-
-        accumulated_pos += delta;
-        last_pos = raw_pos;
+        last_pos = (long)p;
+        accumulated_pos = (long)p;
         return true;
     }
 
@@ -88,7 +83,7 @@ public:
     }
 
     long getRawPosition() const {
-        return last_pos;
+        return normalizeRawPosition(last_pos);
     }
 
     bool isInitialized() const {
@@ -105,14 +100,14 @@ public:
 
     void setZeroPoint() {
         zero_offset = accumulated_pos;
-        physical_zero_offset = last_pos; // Capture absolute hardware pos
+        physical_zero_offset = normalizeRawPosition(last_pos);
     }
 
     void reset() {
         int16_t p, v, l;
         if (st.readState(servo_id, p, v, l)) {
-            last_pos = normalizeRawPosition(p);
-            accumulated_pos = 0;
+            last_pos = (long)p;
+            accumulated_pos = (long)p;
             zero_offset = 0;     // Reset the offset as well
             prev_error = 0;
             integral_term = 0;

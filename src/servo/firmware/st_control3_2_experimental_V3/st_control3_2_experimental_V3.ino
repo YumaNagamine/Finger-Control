@@ -32,8 +32,7 @@ enum CmdType {
     CMD_SCAN_IDS, 
     CMD_CHANGE_ID,
     CMD_SET_POSITION,
-    CMD_SET_MULTITURN_ABSOLUTE,
-    CMD_SET_MULTITURN_RELATIVE
+    CMD_SET_MULTITURN_ABSOLUTE
 };
 
 struct RobotCommand {
@@ -49,7 +48,7 @@ enum MotorState {
     STATE_PID_HOLD,
     STATE_JOGGING,
     STATE_SERVO_MODE,
-    STATE_STEP_MODE
+    STATE_MULTITURN_MODE
 };
 
 struct MotorControlState {
@@ -262,8 +261,8 @@ void loop() {
                             sendCmd(CMD_TIMED_RUN, id, spd, time);
                         }
                     }
-                    else if (cmdStr == "x" || cmdStr == "ma" || cmdStr == "mr") {
-                        // x/ma/mr,ID,PositionOrDelta,[Time]
+                    else if (cmdStr == "x" || cmdStr == "ma") {
+                        // x/ma,ID,Position,[Time]
                         int comma2 = rem.indexOf(',');
                         int comma3 = rem.lastIndexOf(',');
                         if (comma2 > 0) {
@@ -276,12 +275,9 @@ void loop() {
                                  pos = rem.substring(comma2+1).toInt();
                                  time = 0;
                              }
-                             CmdType commandType = CMD_SET_POSITION;
-                             if (cmdStr == "ma") {
-                                 commandType = CMD_SET_MULTITURN_ABSOLUTE;
-                             } else if (cmdStr == "mr") {
-                                 commandType = CMD_SET_MULTITURN_RELATIVE;
-                             }
+                             CmdType commandType = cmdStr == "ma"
+                                 ? CMD_SET_MULTITURN_ABSOLUTE
+                                 : CMD_SET_POSITION;
                              sendCmd(commandType, id, pos, time);
                         }
                     }
@@ -471,7 +467,11 @@ void TaskControl(void *pvParameters) {
                     case CMD_SET_POSITION: {
                         if (mState[i].state != STATE_SERVO_MODE) {
                              Serial.print("Switching Motor "); Serial.print(physical_id); Serial.println(" to SERVO MODE...");
-                             st.setServoMode(physical_id);
+                             if (!st.setServoMode(physical_id)) {
+                                 Serial.print("ERROR: SERVO_MODE_CONFIG_FAILED ID=");
+                                 Serial.println(i);
+                                 break;
+                             }
                              delay(2);
                              st.lock(physical_id);
                              mState[i].state = STATE_SERVO_MODE;
@@ -489,8 +489,7 @@ void TaskControl(void *pvParameters) {
                         st.writePosition(physical_id, (int)hw_target, cmd.val2, 1500); 
                         break;
                     }
-                    case CMD_SET_MULTITURN_ABSOLUTE:
-                    case CMD_SET_MULTITURN_RELATIVE: {
+                    case CMD_SET_MULTITURN_ABSOLUTE: {
                         if (!wrappedServos[i]->isInitialized() || !mState[i].targetInitialized) {
                             Serial.print("ERROR: MULTITURN_NOT_INITIALIZED ID=");
                             Serial.println(i);
@@ -502,28 +501,29 @@ void TaskControl(void *pvParameters) {
                             break;
                         }
 
-                        if (mState[i].state != STATE_STEP_MODE) {
-                            Serial.print("Switching Motor ");
-                            Serial.print(physical_id);
-                            Serial.println(" to STEP MODE...");
-                            st.setStepMode(physical_id);
-                            delay(2);
-                            mState[i].state = STATE_STEP_MODE;
-                        }
-
-                        long newTarget = cmd.type == CMD_SET_MULTITURN_RELATIVE
-                            ? mState[i].targetPos + (long)cmd.val1
-                            : (long)cmd.val1;
-                        long stepDelta = newTarget - mState[i].targetPos;
-                        if (stepDelta < -32767L || stepDelta > 32767L) {
-                            Serial.print("ERROR: MULTITURN_STEP_OUT_OF_RANGE ");
-                            Serial.println(stepDelta);
+                        long newTarget = (long)cmd.val1;
+                        if (newTarget < -28672L || newTarget > 28672L) {
+                            Serial.print("ERROR: MULTITURN_TARGET_OUT_OF_RANGE ");
+                            Serial.println(newTarget);
                             break;
                         }
 
-                        st.writeStepPosition(
+                        if (mState[i].state != STATE_MULTITURN_MODE) {
+                            Serial.print("Switching Motor ");
+                            Serial.print(physical_id);
+                            Serial.println(" to MULTI-LOOP POSITION MODE...");
+                            if (!st.setMultiTurnMode(physical_id)) {
+                                Serial.print("ERROR: MULTITURN_MODE_CONFIG_FAILED ID=");
+                                Serial.println(i);
+                                break;
+                            }
+                            delay(50);
+                            mState[i].state = STATE_MULTITURN_MODE;
+                        }
+
+                        st.writePosition(
                             physical_id,
-                            (int16_t)stepDelta,
+                            (int16_t)newTarget,
                             (uint16_t)cmd.val2,
                             1500
                         );
@@ -531,9 +531,7 @@ void TaskControl(void *pvParameters) {
                         Serial.print("MULTITURN_TARGET ID=");
                         Serial.print(i);
                         Serial.print(" TARGET=");
-                        Serial.print(newTarget);
-                        Serial.print(" STEP=");
-                        Serial.println(stepDelta);
+                        Serial.println(newTarget);
                         break;
                     }
                     case CMD_TIMED_RUN:
@@ -599,7 +597,7 @@ void TaskControl(void *pvParameters) {
                 currentSpeeds[i] = wrappedServos[i]->last_speed; // Capture velocity (fixed name)
                 if (
                     !mState[i].targetInitialized
-                    || mState[i].state != STATE_STEP_MODE
+                    || mState[i].state != STATE_MULTITURN_MODE
                 ) {
                     mState[i].targetPos = currentPositions[i];
                     mState[i].targetInitialized = true;

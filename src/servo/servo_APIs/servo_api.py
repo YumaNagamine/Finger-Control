@@ -159,25 +159,11 @@ class ServoAPI:
         time_ms: int = 0,
     ) -> None:
         self._validate_servo_id(servo_id)
-        if not -(2**31) <= position <= (2**31 - 1):
-            raise ValueError("position must fit in a signed 32-bit integer")
+        if not -28672 <= position <= 28672:
+            raise ValueError("position must be in the range -28672-28672")
         if not 0 <= time_ms <= 65535:
             raise ValueError("time_ms must be in the range 0-65535")
         self.send_raw(f"ma,{servo_id},{position},{time_ms}")
-
-    def move_relative(
-        self,
-        servo_id: int,
-        delta: int,
-        time_ms: int = 0,
-    ) -> None:
-        self._validate_servo_id(servo_id)
-        if not -32767 <= delta <= 32767:
-            raise ValueError("delta must be in the range -32767-32767")
-        if not 0 <= time_ms <= 65535:
-            raise ValueError("time_ms must be in the range 0-65535")
-        self.send_raw(f"mr,{servo_id},{delta},{time_ms}")
-
 
     def stop_all(self) -> None:
         self.send_raw("s")
