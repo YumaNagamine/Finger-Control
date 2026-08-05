@@ -542,6 +542,12 @@ def main() -> None:
                     position_limits=position_limits,
                     max_position_step=max_position_step,
                 )
+                post_prepare_warmup_frames = int(config["vision"]["warmup_frames"])
+                print(
+                    "Re-warming camera and DLC after servo preparation "
+                    f"({post_prepare_warmup_frames} frame(s))."
+                )
+                angle_source.warm_up(post_prepare_warmup_frames)
                 logger = CycleLogger(log_directory)
                 print("Executing synchronized DLC feedback control. Press Ctrl-C to stop.")
                 _run_loop(
