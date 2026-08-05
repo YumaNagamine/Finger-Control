@@ -462,6 +462,16 @@ def main() -> None:
     print("Opening camera and initializing DLC before servo control.")
     angle_source.open()
     try:
+        meta1_calibration = angle_source.calibrate_meta1()
+        if meta1_calibration is not None:
+            print(
+                "Static meta1 accepted: "
+                f"position=({meta1_calibration.position[0]:.1f}, "
+                f"{meta1_calibration.position[1]:.1f}), "
+                f"cluster={meta1_calibration.dominant_samples}/"
+                f"{meta1_calibration.valid_samples}, "
+                f"dispersion={meta1_calibration.dispersion_px:.1f}px"
+            )
         angle_source.warm_up(int(config["vision"]["warmup_frames"]))
 
         if not args.execute:

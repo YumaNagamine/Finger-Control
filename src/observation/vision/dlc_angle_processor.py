@@ -163,6 +163,7 @@ class DLCAngleProcessor:
         self._last_valid: dict[str, np.ndarray] = {}
         self._ema_state: dict[str, np.ndarray] = {}
         self._missing_count: dict[str, int] = {name: 0 for name in self.keypoint_names}
+        self._latched_keypoints: dict[str, tuple[np.ndarray, float]] = {}
 
         self._predictor = _DLCLivePredictor(config["dlc"], self.keypoint_names, config_base_dir) if enable_live else None
 
@@ -211,8 +212,27 @@ class DLCAngleProcessor:
         self._last_valid.clear()
         self._ema_state.clear()
         self._missing_count = {name: 0 for name in self.keypoint_names}
+        self._latched_keypoints.clear()
         if self._predictor is not None:
             self._predictor.reset()
+
+    def set_latched_keypoint(
+        self,
+        name: str,
+        position: tuple[float, float],
+        likelihood: float,
+    ) -> None:
+        if name not in self.keypoint_names:
+            raise ValueError(f"Unknown keypoint: {name}")
+        point = np.asarray(position, dtype=np.float32)
+        if point.shape != (2,) or not np.isfinite(point).all():
+            raise ValueError("position must contain two finite coordinates")
+        if not np.isfinite(likelihood) or not 0.0 <= likelihood <= 1.0:
+            raise ValueError("likelihood must be finite and in the range 0-1")
+        self._latched_keypoints[name] = (point, float(likelihood))
+
+    def clear_latched_keypoints(self) -> None:
+        self._latched_keypoints.clear()
 
     @staticmethod
     def _calculate_angle(segment_a: list[tuple[float, float]], segment_b: list[tuple[float, float]]) -> float:
@@ -260,6 +280,17 @@ class DLCAngleProcessor:
     ) -> dict[str, dict[str, float | str | None]]:
         tracked: dict[str, dict[str, float | str | None]] = {}
         for name in self.keypoint_names:
+            latched = self._latched_keypoints.get(name)
+            if latched is not None:
+                point, likelihood = latched
+                tracked[name] = {
+                    "x": float(point[0]),
+                    "y": float(point[1]),
+                    "likelihood": likelihood,
+                    "status": "latched",
+                }
+                continue
+
             x_val, y_val, conf = raw_keypoints[name]
             valid = np.isfinite(x_val) and np.isfinite(y_val) and conf >= self._confidence_threshold
 
@@ -473,6 +504,8 @@ class DLCAngleProcessor:
             status = str(point["status"])
             if status == "detected":
                 color = (0, 255, 0)
+            elif status == "latched":
+                color = (255, 255, 0)
             elif status == "held_last":
                 color = (0, 180, 255)
             else:

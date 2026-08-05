@@ -8,7 +8,7 @@
     "prediction_csv": "logs/dual_camera/excursion_predictions/dual_processed_controlTestSimpleExtension_20260727_184321_prediction_20260727.csv",
     "moment_arm_directory": "logs/dual_camera/moment_arm_average",
     "servo_calibration": "src/controller/excursion_servo_calibration.json",
-    "dlc_config": "src/observation/vision/config_deeplabcut_angle.json",
+    "dlc_config": "src/observation/vision/config_deeplabcut_angle_control.json",
     "camera_config": "src/observation/camera/paramsHighResolution/camera_config_dlc.json",
     "log_directory": "logs/feedback_control"
   },

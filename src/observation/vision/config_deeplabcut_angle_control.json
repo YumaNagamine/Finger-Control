@@ -1,0 +1,100 @@
+{
+  "profile": {
+    "name": "realtime_control",
+    "description": "Control-specific DLC geometry. Tune processing.adjustments for the control camera distance without changing the measurement profile."
+  },
+  "input": {
+    "mode": "camera",
+    "video_path": ""
+  },
+  "dlc": {
+    "third_party_path": "third_party/deeplabcut",
+    "model_path": "deeplabcut_export",
+    "model_type": "pytorch",
+    "pcutoff": 0.0,
+    "default_likelihood": 0.0,
+    "convert_bgr_to_rgb": true
+  },
+  "keypoints": {
+    "names": [
+      "fingertip",
+      "distal1",
+      "middle1",
+      "middle2",
+      "proximal1",
+      "proximal2",
+      "meta1"
+    ],
+    "segments": {
+      "distal": [
+        "fingertip",
+        "distal1"
+      ],
+      "medial": [
+        "middle1",
+        "middle2"
+      ],
+      "proximal": [
+        "proximal1",
+        "proximal2"
+      ],
+      "palm": [
+        "meta1",
+        "meta1"
+      ]
+    }
+  },
+  "angles": [
+    {
+      "name": "DIP",
+      "segment_a": "distal",
+      "segment_b": "medial"
+    },
+    {
+      "name": "PIP",
+      "segment_a": "medial",
+      "segment_b": "proximal"
+    },
+    {
+      "name": "MCP",
+      "segment_a": "proximal",
+      "segment_b": "palm"
+    }
+  ],
+  "static_keypoints": {
+    "meta1": {
+      "enabled": true,
+      "required_valid_samples": 10,
+      "max_frames": 30,
+      "min_likelihood": 0.3,
+      "cluster_radius_px": 10.0,
+      "min_cluster_samples": 6,
+      "min_cluster_ratio": 0.6
+    }
+  },
+  "processing": {
+    "confidence_threshold": 0.3,
+    "ema_alpha": 0.0,
+    "hold_last_frames": 0,
+    "adjustments": {
+      "theta_rad": 0.45,
+      "distance_shift": -20.0,
+      "joint_shifters": [15.0, 95.0],
+      "mcp_offset": [-100.0, 0.0],
+      "palm_horizontal_offset_px": 100.0
+    }
+  },
+  "draw": {
+    "show_keypoint_labels": true,
+    "keypoint_radius": 4,
+    "line_thickness": 2
+  },
+  "output": {
+    "csv_dir": "logs/deeplabcut_test/csv",
+    "overlay_video_dir": "logs/deeplabcut_test/video",
+    "filename_prefix": "dlc_angle_control",
+    "save_overlay_video": true,
+    "show_window": true,
+    "fallback_fps": 30.0
+  }
+}
