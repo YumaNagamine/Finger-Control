@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 
 from servo.control import (
     PositionControlConfig,
+    PositionControlNotPreparedError,
     PositionControlState,
     PositionStartTimeoutError,
     ReliablePositionController,
@@ -196,7 +197,7 @@ class ReliablePositionControllerTest(unittest.TestCase):
         self.assertEqual(self.controller.state(5), PositionControlState.READY)
 
     def test_move_stops_and_fails_after_retry_limit(self) -> None:
-        self.prepare_servo()
+        self.controller.prepare((4, 5), force_init_servo_ids=tuple(range(6)))
         self.api.ignore_next_position_commands = 10
 
         with self.assertRaises(PositionStartTimeoutError):
@@ -208,6 +209,12 @@ class ReliablePositionControllerTest(unittest.TestCase):
 
         self.assertGreaterEqual(self.api.stop_count, 1)
         self.assertEqual(self.controller.state(5), PositionControlState.FAILED)
+        self.assertEqual(
+            self.controller.state(4),
+            PositionControlState.UNPREPARED,
+        )
+        with self.assertRaisesRegex(PositionControlNotPreparedError, "not ready"):
+            self.controller.stream_positions((4,), (140,))
 
     def test_move_retries_when_first_command_only_moves_in_reverse(self) -> None:
         self.prepare_servo()

@@ -696,6 +696,11 @@ class ReliablePositionController:
             self._validate_servo_index(snapshot, servo_id)
 
     def _fail_safe_stop(self, servo_ids: Sequence[int]) -> None:
-        for servo_id in servo_ids:
-            self._states[servo_id] = PositionControlState.FAILED
+        failed_servo_ids = set(servo_ids)
+        for servo_id in tuple(self._states):
+            self._states[servo_id] = (
+                PositionControlState.FAILED
+                if servo_id in failed_servo_ids
+                else PositionControlState.UNPREPARED
+            )
         self._api.stop_all()
