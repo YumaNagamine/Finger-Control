@@ -511,16 +511,23 @@ class DLCAngleProcessor:
             else:
                 color = (0, 0, 255)
             center = (int(float(x_val)), int(float(y_val)))
-            cv2.circle(out, center, self._keypoint_radius, color, -1)
+            if status == "latched":
+                cv2.circle(out, center, 14, color, 3, cv2.LINE_AA)
+                cv2.circle(out, center, 5, color, -1, cv2.LINE_AA)
+                cv2.drawMarker(out, center, color, cv2.MARKER_CROSS, 34, 3, cv2.LINE_AA)
+            else:
+                cv2.circle(out, center, self._keypoint_radius, color, -1)
             if self._show_keypoint_labels:
                 cv2.putText(
                     out,
-                    name,
-                    (center[0] + 5, center[1] - 5),
+                    f"{name} (FIXED)" if status == "latched" else name,
+                    (center[0] + 18, center[1] - 18)
+                    if status == "latched"
+                    else (center[0] + 5, center[1] - 5),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 255, 255),
-                    1,
+                    0.7 if status == "latched" else 0.45,
+                    color if status == "latched" else (255, 255, 255),
+                    2 if status == "latched" else 1,
                     cv2.LINE_AA,
                 )
 

@@ -268,13 +268,14 @@ class RealtimeJointAngleSource:
                         flush=True,
                     )
                     selected = (int(round(cluster.position[0])), int(round(cluster.position[1])))
+                    cv2.circle(confirmation, selected, 18, (255, 255, 0), 4, cv2.LINE_AA)
                     cv2.drawMarker(
                         confirmation,
                         selected,
                         (255, 255, 0),
                         cv2.MARKER_CROSS,
-                        24,
-                        2,
+                        44,
+                        4,
                         cv2.LINE_AA,
                     )
                     lines = (
