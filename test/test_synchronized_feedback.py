@@ -152,8 +152,26 @@ class SynchronizedFeedbackTest(unittest.TestCase):
         first = builder.build((0.0,) * len(TENDONS), (0.1,) * len(TENDONS))
         second = builder.build((0.0,) * len(TENDONS), (0.1,) * len(TENDONS))
 
+        self.assertEqual(first.nominal_target_positions, (100,) * len(TENDONS))
         self.assertEqual(first.target_positions, (101,) * len(TENDONS))
         self.assertEqual(second.target_positions, (101,) * len(TENDONS))
+
+    def test_builder_reports_separate_nominal_and_feedback_targets(self) -> None:
+        builder = FeedbackCommandBuilder(
+            start_positions=(100,) * len(TENDONS),
+            initial_excursions_mm=(0.0,) * len(TENDONS),
+            position_units_per_mm=(10.0,) * len(TENDONS),
+            position_limits=((0, 4095),) * len(TENDONS),
+            max_position_step=(100,) * len(TENDONS),
+        )
+
+        command = builder.build(
+            (0.2,) * len(TENDONS),
+            (0.3,) * len(TENDONS),
+        )
+
+        self.assertEqual(command.nominal_target_positions, (102,) * len(TENDONS))
+        self.assertEqual(command.target_positions, (105,) * len(TENDONS))
 
     def test_loop_sends_command_at_next_period_boundary(self) -> None:
         class FakeClock:
@@ -202,6 +220,7 @@ class SynchronizedFeedbackTest(unittest.TestCase):
             nominal_excursions_mm=(0.0,) * len(TENDONS),
             feedback_excursions_mm=(0.0,) * len(TENDONS),
             total_excursions_mm=(0.0,) * len(TENDONS),
+            nominal_target_positions=(100,) * len(TENDONS),
             target_positions=(100,) * len(TENDONS),
         )
         command_builder = SimpleNamespace(build=lambda *_args: command)
@@ -314,6 +333,7 @@ class SynchronizedFeedbackTest(unittest.TestCase):
                 nominal_excursions_mm=(0.0,) * len(TENDONS),
                 feedback_excursions_mm=tuple(feedback_excursions),
                 total_excursions_mm=tuple(feedback_excursions),
+                nominal_target_positions=(100,) * len(TENDONS),
                 target_positions=(100,) * len(TENDONS),
             )
 
@@ -358,6 +378,36 @@ class SynchronizedFeedbackTest(unittest.TestCase):
         self.assertEqual(len(commands), 2)
         self.assertEqual(commands[0], commands[1])
         self.assertEqual(logger.rows[1]["measurement_held_last"], 1)
+
+    def test_feedback_excursion_plot_is_saved_from_logged_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            metadata = feedback_main._feedback_log_metadata(
+                (100,) * len(TENDONS),
+                (0.0,) * len(TENDONS),
+                (10.0,) * len(TENDONS),
+            )
+            logger = feedback_main.CycleLogger(
+                directory,
+                session_id="plot_test",
+                fixed_fields=metadata,
+            )
+            row: dict[str, object] = {
+                "commanded_s": 0.2,
+                "telemetry_received_s": 0.19,
+            }
+            for tendon in TENDONS:
+                row[f"{tendon}_nominal_excursion_mm"] = 0.2
+                row[f"{tendon}_nominal_target_position"] = 102
+                row[f"{tendon}_target_position"] = 105
+                row[f"{tendon}_actual_position"] = 104
+            logger.write(row)
+            logger.close()
+
+            output_path = feedback_main.plot_feedback_excursion_log(logger.path)
+
+            self.assertTrue(output_path.is_file())
+            self.assertGreater(output_path.stat().st_size, 0)
 
 if __name__ == "__main__":
     unittest.main()

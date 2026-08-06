@@ -87,22 +87,195 @@ class TrackingSupervisor:
 
 
 class CycleLogger:
-    def __init__(self, output_directory: Path, *, session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        output_directory: Path,
+        *,
+        session_id: str | None = None,
+        fixed_fields: dict[str, object] | None = None,
+    ) -> None:
         output_directory.mkdir(parents=True, exist_ok=True)
         timestamp = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = output_directory / f"dlc_feedback_{timestamp}.csv"
         self._handle = self.path.open("w", newline="", encoding="utf-8")
         self._writer: csv.DictWriter | None = None
+        self._fixed_fields = dict(fixed_fields or {})
 
     def write(self, row: dict[str, object]) -> None:
+        merged_row = dict(row)
+        duplicate_fields = set(merged_row).intersection(self._fixed_fields)
+        if duplicate_fields:
+            raise ValueError(
+                f"Cycle log fields overlap fixed metadata: {sorted(duplicate_fields)}"
+            )
+        merged_row.update(self._fixed_fields)
         if self._writer is None:
-            self._writer = csv.DictWriter(self._handle, fieldnames=list(row))
+            self._writer = csv.DictWriter(self._handle, fieldnames=list(merged_row))
             self._writer.writeheader()
-        self._writer.writerow(row)
+        self._writer.writerow(merged_row)
         self._handle.flush()
 
     def close(self) -> None:
         self._handle.close()
+
+
+def _feedback_log_metadata(
+    start_positions: Sequence[int],
+    initial_excursions_mm: Sequence[float],
+    position_units_per_mm: Sequence[float],
+) -> dict[str, object]:
+    if not (
+        len(start_positions)
+        == len(initial_excursions_mm)
+        == len(position_units_per_mm)
+        == len(TENDONS)
+    ):
+        raise ValueError("Feedback log conversion metadata must contain six values")
+
+    metadata: dict[str, object] = {}
+    for tendon, servo_id, start, initial, scale in zip(
+        TENDONS,
+        SERVO_IDS,
+        start_positions,
+        initial_excursions_mm,
+        position_units_per_mm,
+    ):
+        if not math.isfinite(float(scale)) or float(scale) == 0.0:
+            raise ValueError(f"{tendon} position_units_per_mm must be finite and non-zero")
+        metadata[f"{tendon}_servo_id"] = int(servo_id)
+        metadata[f"{tendon}_start_position"] = int(start)
+        metadata[f"{tendon}_initial_excursion_mm"] = float(initial)
+        metadata[f"{tendon}_position_units_per_mm"] = float(scale)
+    return metadata
+
+
+def _optional_log_float(row: dict[str, str], field_name: str) -> float:
+    raw_value = row.get(field_name, "")
+    if raw_value is None or not raw_value.strip():
+        return math.nan
+    return float(raw_value)
+
+
+def plot_feedback_excursion_log(
+    log_path: Path,
+    output_path: Path | None = None,
+) -> Path:
+    """Plot nominal, commanded, and telemetry-equivalent tendon excursions."""
+
+    with log_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"No feedback-control cycles are available in {log_path}")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    command_times = [_optional_log_float(row, "commanded_s") for row in rows]
+    telemetry_times = [
+        _optional_log_float(row, "telemetry_received_s") for row in rows
+    ]
+    first_row = rows[0]
+    figure, axes = plt.subplots(
+        nrows=3,
+        ncols=2,
+        figsize=(15, 11),
+        sharex=True,
+    )
+
+    for axis, tendon in zip(axes.flatten(), TENDONS):
+        servo_id = int(float(first_row[f"{tendon}_servo_id"]))
+        start_position = float(first_row[f"{tendon}_start_position"])
+        initial_excursion = float(first_row[f"{tendon}_initial_excursion_mm"])
+        scale = float(first_row[f"{tendon}_position_units_per_mm"])
+        if not math.isfinite(scale) or scale == 0.0:
+            raise ValueError(f"{tendon} position_units_per_mm must be finite and non-zero")
+
+        def position_to_excursion(position: float) -> float:
+            if not math.isfinite(position):
+                return math.nan
+            return initial_excursion + (position - start_position) / scale
+
+        predicted_excursions = [
+            _optional_log_float(row, f"{tendon}_nominal_excursion_mm")
+            for row in rows
+        ]
+        main_command_excursions = [
+            position_to_excursion(
+                _optional_log_float(row, f"{tendon}_nominal_target_position")
+            )
+            for row in rows
+        ]
+        total_command_excursions = [
+            position_to_excursion(
+                _optional_log_float(row, f"{tendon}_target_position")
+            )
+            for row in rows
+        ]
+        measured_excursions = [
+            position_to_excursion(
+                _optional_log_float(row, f"{tendon}_actual_position")
+            )
+            for row in rows
+        ]
+
+        axis.plot(
+            command_times,
+            predicted_excursions,
+            label="Predicted (CSV)",
+            linewidth=1.6,
+            linestyle="--",
+        )
+        axis.plot(
+            command_times,
+            main_command_excursions,
+            label="Main command (no FB)",
+            linewidth=1.7,
+        )
+        axis.plot(
+            command_times,
+            total_command_excursions,
+            label="Total command (with FB)",
+            linewidth=1.9,
+        )
+        axis.plot(
+            telemetry_times,
+            measured_excursions,
+            label="Servo telemetry",
+            linewidth=1.5,
+            alpha=0.85,
+        )
+        axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.6)
+        axis.set_title(
+            f"{tendon} (servo {servo_id})\n"
+            f"scale={scale:.4f} count/mm, start={start_position:.0f} count, "
+            f"initial={initial_excursion:.4f} mm"
+        )
+        axis.set_ylabel("Excursion [mm]")
+        axis.grid(True, alpha=0.3)
+        axis.legend(loc="best", fontsize=8)
+
+    for axis in axes[-1, :]:
+        axis.set_xlabel("Time [s]")
+
+    figure.suptitle("DLC feedback excursion tracking", fontsize=14)
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    resolved_output = output_path or log_path.with_suffix(".png")
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(resolved_output, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    return resolved_output
+
+
+def _save_feedback_plot_safely(log_path: Path) -> Path | None:
+    try:
+        plot_path = plot_feedback_excursion_log(log_path)
+    except Exception as exc:
+        print(f"WARNING: failed to create feedback excursion plot: {exc}")
+        return None
+    print(f"Feedback excursion plot: {plot_path}")
+    return plot_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -329,6 +502,9 @@ def _build_log_row(
         "min_likelihood": measurement.min_likelihood,
         "measurement_held_last": int(getattr(measurement, "held_last", False)),
         "measurement_reason": measurement.reason or "",
+        "telemetry_received_s": (
+            "" if snapshot is None else snapshot.received_at - started_at
+        ),
     }
     for index, joint in enumerate(JOINTS):
         row[f"{joint}_reference_rad"] = reference.joint_angles_rad[index]
@@ -338,6 +514,9 @@ def _build_log_row(
         row[f"{tendon}_nominal_excursion_mm"] = command.nominal_excursions_mm[index]
         row[f"{tendon}_feedback_excursion_mm"] = command.feedback_excursions_mm[index]
         row[f"{tendon}_total_excursion_mm"] = command.total_excursions_mm[index]
+        row[f"{tendon}_nominal_target_position"] = (
+            command.nominal_target_positions[index]
+        )
         row[f"{tendon}_target_position"] = command.target_positions[index]
         if snapshot is not None:
             servo_id = SERVO_IDS[index]
@@ -547,7 +726,15 @@ def main() -> None:
                 max_position_step=max_position_step,
             )
             session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-            logger = CycleLogger(log_directory, session_id=session_id)
+            logger = CycleLogger(
+                log_directory,
+                session_id=session_id,
+                fixed_fields=_feedback_log_metadata(
+                    start_positions,
+                    initial_sample.nominal_excursions_mm,
+                    position_units_per_mm,
+                ),
+            )
             video_path: Path | None = None
             video_summary = None
             try:
@@ -570,6 +757,7 @@ def main() -> None:
                     video_summary = angle_source.stop_overlay_recording()
                 finally:
                     logger.close()
+                    _save_feedback_plot_safely(logger.path)
             print(f"Dry-run log: {logger.path}")
             if video_path is not None:
                 print(f"Dry-run overlay video: {video_path}")
@@ -628,7 +816,15 @@ def main() -> None:
                 )
                 angle_source.warm_up(post_prepare_warmup_frames)
                 session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-                logger = CycleLogger(log_directory, session_id=session_id)
+                logger = CycleLogger(
+                    log_directory,
+                    session_id=session_id,
+                    fixed_fields=_feedback_log_metadata(
+                        start_positions,
+                        initial_sample.nominal_excursions_mm,
+                        position_units_per_mm,
+                    ),
+                )
                 video_path = _start_overlay_recording(
                     angle_source,
                     config,
@@ -663,6 +859,7 @@ def main() -> None:
                         telemetry.stop()
                         if logger is not None:
                             logger.close()
+                            _save_feedback_plot_safely(logger.path)
             if completed and logger is not None:
                 print(f"Feedback-control log: {logger.path}")
                 if video_path is not None:

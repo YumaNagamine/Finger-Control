@@ -15,6 +15,7 @@ class ServoCommand:
     nominal_excursions_mm: tuple[float, float, float, float, float, float]
     feedback_excursions_mm: tuple[float, float, float, float, float, float]
     total_excursions_mm: tuple[float, float, float, float, float, float]
+    nominal_target_positions: tuple[int, int, int, int, int, int]
     target_positions: tuple[int, int, int, int, int, int]
 
 
@@ -53,6 +54,7 @@ class FeedbackCommandBuilder:
         )
         if np.any(self._max_position_step < 0):
             raise ValueError("max_position_step must be non-negative")
+        self._last_nominal_positions = self._start_positions.copy()
         self._last_positions = self._start_positions.copy()
 
     def build(
@@ -69,6 +71,10 @@ class FeedbackCommandBuilder:
             "feedback_excursions_mm",
         )
         total = nominal + feedback
+        raw_nominal_positions = np.rint(
+            self._start_positions
+            + (nominal - self._initial_excursions) * self._position_units_per_mm
+        ).astype(np.int64)
         raw_positions = np.rint(
             self._start_positions
             + (total - self._initial_excursions) * self._position_units_per_mm
@@ -84,6 +90,15 @@ class FeedbackCommandBuilder:
                 f"{tuple(int(value) for value in self._position_limits[tendon_index])}"
             )
 
+        nominal_lower_step = self._last_nominal_positions - self._max_position_step
+        nominal_upper_step = self._last_nominal_positions + self._max_position_step
+        nominal_limited_positions = np.clip(
+            raw_nominal_positions,
+            nominal_lower_step,
+            nominal_upper_step,
+        )
+        self._last_nominal_positions = nominal_limited_positions
+
         lower_step = self._last_positions - self._max_position_step
         upper_step = self._last_positions + self._max_position_step
         limited_positions = np.clip(raw_positions, lower_step, upper_step)
@@ -92,6 +107,9 @@ class FeedbackCommandBuilder:
             nominal_excursions_mm=tuple(float(value) for value in nominal),
             feedback_excursions_mm=tuple(float(value) for value in feedback),
             total_excursions_mm=tuple(float(value) for value in total),
+            nominal_target_positions=tuple(
+                int(value) for value in nominal_limited_positions
+            ),
             target_positions=tuple(int(value) for value in limited_positions),
         )
 
