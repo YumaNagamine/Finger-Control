@@ -17,6 +17,10 @@ from observation.camera.camera_utils import (
     undistort_frame,
 )
 from observation.vision.dlc_angle_processor import DLCAngleProcessor
+from observation.vision.overlay_video_recorder import (
+    OverlayVideoRecorder,
+    OverlayVideoSummary,
+)
 from utils.config_loader import load_config
 from utils.path_utils import resolve_path
 
@@ -127,6 +131,7 @@ class RealtimeJointAngleSource:
         self._processor: DLCAngleProcessor | None = None
         self._calibration = None
         self._runtime_config: dict | None = None
+        self._overlay_recorder: OverlayVideoRecorder | None = None
 
     def open(self) -> None:
         if self._capture is not None:
@@ -367,6 +372,35 @@ class RealtimeJointAngleSource:
         for frame_index in range(frame_count):
             self.read(-(frame_count - frame_index))
 
+    def start_overlay_recording(
+        self,
+        path: Path,
+        *,
+        fps: float,
+        codec: str = "mp4v",
+        queue_size: int = 10,
+    ) -> Path:
+        if self._capture is None or self._processor is None:
+            raise RuntimeError("Joint-angle source is not open")
+        if self._overlay_recorder is not None:
+            raise RuntimeError("Overlay video recording is already active")
+        recorder = OverlayVideoRecorder(
+            path,
+            fps=fps,
+            codec=codec,
+            queue_size=queue_size,
+        )
+        recorder.start()
+        self._overlay_recorder = recorder
+        return recorder.path
+
+    def stop_overlay_recording(self) -> OverlayVideoSummary | None:
+        recorder = self._overlay_recorder
+        self._overlay_recorder = None
+        if recorder is None:
+            return None
+        return recorder.stop()
+
     def read(self, frame_index: int) -> JointAngleMeasurement:
         if self._capture is None or self._processor is None:
             raise RuntimeError("Joint-angle source is not open")
@@ -377,10 +411,12 @@ class RealtimeJointAngleSource:
             raise RuntimeError("Failed to read a frame from the camera")
 
         frame = undistort_frame(frame, self._calibration)
-        result, _overlay = self._processor.process_frame(
+        result, overlay = self._processor.process_frame(
             frame_bgr=frame,
             frame_idx=frame_index,
         )
+        if self._overlay_recorder is not None:
+            self._overlay_recorder.write(overlay)
         inference_finished_at = time.monotonic()
 
         raw_angles = result["angles"]
@@ -419,13 +455,16 @@ class RealtimeJointAngleSource:
         )
 
     def close(self) -> None:
-        capture = self._capture
-        self._capture = None
-        self._processor = None
-        self._runtime_config = None
-        self._calibration = None
-        if capture is not None:
-            capture.release()
+        try:
+            self.stop_overlay_recording()
+        finally:
+            capture = self._capture
+            self._capture = None
+            self._processor = None
+            self._runtime_config = None
+            self._calibration = None
+            if capture is not None:
+                capture.release()
 
     def _resolve_dlc_runtime_config(self) -> dict:
         config = load_config(

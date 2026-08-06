@@ -37,6 +37,12 @@
     "warmup_frames": 3,
     "min_likelihood": 0.3
   },
+  "logging": {
+    "save_overlay_video": true,
+    "video_directory": "logs/feedback_control",
+    "video_codec": "mp4v",
+    "video_queue_size": 10
+  },
   "safety": {
     "position_limits": {
       "FDP": [-28672, 28672],

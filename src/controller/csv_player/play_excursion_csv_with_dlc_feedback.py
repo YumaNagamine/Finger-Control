@@ -87,9 +87,9 @@ class TrackingSupervisor:
 
 
 class CycleLogger:
-    def __init__(self, output_directory: Path) -> None:
+    def __init__(self, output_directory: Path, *, session_id: str | None = None) -> None:
         output_directory.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = output_directory / f"dlc_feedback_{timestamp}.csv"
         self._handle = self.path.open("w", newline="", encoding="utf-8")
         self._writer: csv.DictWriter | None = None
@@ -220,6 +220,38 @@ def _make_angle_source(config: dict) -> RealtimeJointAngleSource:
         dlc_config_path=_project_path(paths["dlc_config"], "paths.dlc_config"),
         camera_config_path=_project_path(paths["camera_config"], "paths.camera_config"),
         min_likelihood=float(vision["min_likelihood"]),
+    )
+
+
+def _start_overlay_recording(
+    angle_source: RealtimeJointAngleSource,
+    config: dict,
+    *,
+    session_id: str,
+) -> Path | None:
+    logging_config = config.get("logging", {})
+    if not isinstance(logging_config, dict):
+        raise ValueError("logging must be an object when provided")
+    if not bool(logging_config.get("save_overlay_video", False)):
+        return None
+
+    video_directory = _project_path(
+        str(
+            logging_config.get(
+                "video_directory",
+                config["paths"]["log_directory"],
+            )
+        ),
+        "logging.video_directory",
+    )
+    codec = str(logging_config.get("video_codec", "mp4v"))
+    queue_size = int(logging_config.get("video_queue_size", 10))
+    video_path = video_directory / f"dlc_feedback_{session_id}.mp4"
+    return angle_source.start_overlay_recording(
+        video_path,
+        fps=float(config["control"]["frequency_hz"]),
+        codec=codec,
+        queue_size=queue_size,
     )
 
 
@@ -487,8 +519,16 @@ def main() -> None:
                 position_limits=position_limits,
                 max_position_step=max_position_step,
             )
-            logger = CycleLogger(log_directory)
+            session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            logger = CycleLogger(log_directory, session_id=session_id)
+            video_path: Path | None = None
+            video_summary = None
             try:
+                video_path = _start_overlay_recording(
+                    angle_source,
+                    config,
+                    session_id=session_id,
+                )
                 print("DRY RUN: camera and DLC are active; no servo commands will be sent.")
                 _run_loop(
                     config=config,
@@ -499,8 +539,18 @@ def main() -> None:
                     logger=logger,
                 )
             finally:
-                logger.close()
+                try:
+                    video_summary = angle_source.stop_overlay_recording()
+                finally:
+                    logger.close()
             print(f"Dry-run log: {logger.path}")
+            if video_path is not None:
+                print(f"Dry-run overlay video: {video_path}")
+                if video_summary is not None and video_summary.dropped_frames:
+                    print(
+                        "Dry-run overlay video dropped "
+                        f"{video_summary.dropped_frames} frame(s)."
+                    )
             return
 
         from servo.servo_APIs import ServoAPI
@@ -524,6 +574,8 @@ def main() -> None:
             )
             telemetry.start()
             logger: CycleLogger | None = None
+            video_path: Path | None = None
+            video_summary = None
             completed = False
             try:
                 controller.prepare(
@@ -548,7 +600,13 @@ def main() -> None:
                     f"({post_prepare_warmup_frames} frame(s))."
                 )
                 angle_source.warm_up(post_prepare_warmup_frames)
-                logger = CycleLogger(log_directory)
+                session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                logger = CycleLogger(log_directory, session_id=session_id)
+                video_path = _start_overlay_recording(
+                    angle_source,
+                    config,
+                    session_id=session_id,
+                )
                 print("Executing synchronized DLC feedback control. Press Ctrl-C to stop.")
                 _run_loop(
                     config=config,
@@ -570,13 +628,23 @@ def main() -> None:
                     )
             finally:
                 try:
-                    controller.stop_all()
+                    video_summary = angle_source.stop_overlay_recording()
                 finally:
-                    telemetry.stop()
-                    if logger is not None:
-                        logger.close()
+                    try:
+                        controller.stop_all()
+                    finally:
+                        telemetry.stop()
+                        if logger is not None:
+                            logger.close()
             if completed and logger is not None:
                 print(f"Feedback-control log: {logger.path}")
+                if video_path is not None:
+                    print(f"Feedback-control overlay video: {video_path}")
+                    if video_summary is not None and video_summary.dropped_frames:
+                        print(
+                            "Feedback-control overlay video dropped "
+                            f"{video_summary.dropped_frames} frame(s)."
+                        )
     finally:
         angle_source.close()
 
