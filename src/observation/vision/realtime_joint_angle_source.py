@@ -38,6 +38,73 @@ class JointAngleMeasurement:
     inference_ms: float
     valid: bool
     reason: str | None
+    held_last: bool = False
+
+
+@dataclass(frozen=True)
+class TemporalAngleDecision:
+    angles_rad: tuple[float, float, float]
+    valid: bool
+    held_last: bool
+    reason: str | None
+
+
+class TemporalAngleGate:
+    """Reject implausible DLC angle jumps and briefly hold the last valid value."""
+
+    def __init__(
+        self,
+        *,
+        jump_threshold_deg: float = 10.0,
+        max_hold_frames: int = 1,
+    ) -> None:
+        if not math.isfinite(jump_threshold_deg) or jump_threshold_deg <= 0.0:
+            raise ValueError("jump_threshold_deg must be finite and positive")
+        if max_hold_frames < 0:
+            raise ValueError("max_hold_frames must be non-negative")
+        self._threshold_rad = math.radians(float(jump_threshold_deg))
+        self._max_hold_frames = int(max_hold_frames)
+        self._last_valid: tuple[float, float, float] | None = None
+        self._held_frames = 0
+
+    def reset(self) -> None:
+        self._last_valid = None
+        self._held_frames = 0
+
+    def apply(
+        self,
+        angles_rad: tuple[float, float, float],
+    ) -> TemporalAngleDecision:
+        values = np.asarray(angles_rad, dtype=np.float64)
+        if values.shape != (len(JOINTS),) or not np.isfinite(values).all():
+            raise ValueError("angles_rad must contain three finite values")
+        current = tuple(float(value) for value in values)
+
+        if self._last_valid is None:
+            self._last_valid = current
+            return TemporalAngleDecision(current, True, False, None)
+
+        deltas_rad = np.abs(values - np.asarray(self._last_valid, dtype=np.float64))
+        if np.any(deltas_rad > self._threshold_rad):
+            delta_text = ", ".join(
+                f"{joint}={math.degrees(delta):.1f}deg"
+                for joint, delta in zip(JOINTS, deltas_rad)
+                if delta > self._threshold_rad
+            )
+            reason = f"temporal DLC outlier ({delta_text})"
+            if self._held_frames < self._max_hold_frames:
+                self._held_frames += 1
+                return TemporalAngleDecision(
+                    self._last_valid,
+                    True,
+                    True,
+                    reason,
+                )
+            return TemporalAngleDecision(current, False, False, reason)
+
+        self._last_valid = current
+        self._held_frames = 0
+        return TemporalAngleDecision(current, True, False, None)
 
 
 @dataclass(frozen=True)
@@ -121,12 +188,23 @@ class RealtimeJointAngleSource:
         dlc_config_path: Path,
         camera_config_path: Path,
         min_likelihood: float,
+        temporal_outlier_enabled: bool = False,
+        temporal_jump_threshold_deg: float = 10.0,
+        temporal_max_hold_frames: int = 1,
     ) -> None:
         if not math.isfinite(min_likelihood) or not 0.0 <= min_likelihood <= 1.0:
             raise ValueError("min_likelihood must be in the range 0-1")
         self._dlc_config_path = dlc_config_path.expanduser().resolve()
         self._camera_config_path = camera_config_path.expanduser().resolve()
         self._min_likelihood = float(min_likelihood)
+        self._temporal_gate = (
+            TemporalAngleGate(
+                jump_threshold_deg=temporal_jump_threshold_deg,
+                max_hold_frames=temporal_max_hold_frames,
+            )
+            if temporal_outlier_enabled
+            else None
+        )
         self._capture: cv2.VideoCapture | None = None
         self._processor: DLCAngleProcessor | None = None
         self._calibration = None
@@ -164,6 +242,7 @@ class RealtimeJointAngleSource:
             camera_config,
             log_prefix="[feedback-camera]",
         )
+        self.reset_temporal_history()
 
     def calibrate_meta1(self) -> Meta1CalibrationResult | None:
         """Optionally determine and latch meta1 before feedback control starts."""
@@ -371,6 +450,11 @@ class RealtimeJointAngleSource:
             raise ValueError("frame_count must be non-negative")
         for frame_index in range(frame_count):
             self.read(-(frame_count - frame_index))
+        self.reset_temporal_history()
+
+    def reset_temporal_history(self) -> None:
+        if self._temporal_gate is not None:
+            self._temporal_gate.reset()
 
     def start_overlay_recording(
         self,
@@ -443,6 +527,15 @@ class RealtimeJointAngleSource:
                 f"{self._min_likelihood:.3f}"
             )
 
+        held_last = False
+        valid = reason is None
+        if reason is None and self._temporal_gate is not None:
+            decision = self._temporal_gate.apply(flexion_angles)
+            flexion_angles = decision.angles_rad
+            held_last = decision.held_last
+            valid = decision.valid
+            reason = decision.reason
+
         return JointAngleMeasurement(
             frame_index=int(frame_index),
             captured_at=captured_at,
@@ -450,8 +543,9 @@ class RealtimeJointAngleSource:
             flexion_angles_rad=flexion_angles,
             min_likelihood=min_likelihood,
             inference_ms=float(result.get("inference_ms") or 0.0),
-            valid=reason is None,
+            valid=valid,
             reason=reason,
+            held_last=held_last,
         )
 
     def close(self) -> None:
@@ -463,6 +557,7 @@ class RealtimeJointAngleSource:
             self._processor = None
             self._runtime_config = None
             self._calibration = None
+            self.reset_temporal_history()
             if capture is not None:
                 capture.release()
 

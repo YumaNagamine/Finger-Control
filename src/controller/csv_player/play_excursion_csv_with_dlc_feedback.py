@@ -175,17 +175,22 @@ def _make_feedback_components(config: dict):
             "paths.moment_arm_directory",
         )
     )
-    feedback_controller = JointFeedbackController(
-        moment_arm,
-        kp=_ordered_floats(feedback_config["kp"], JOINTS, "feedback.kp"),
-        max_joint_correction_rad=tuple(
+    raw_max_joint_correction_deg = feedback_config.get("max_joint_correction_deg")
+    if raw_max_joint_correction_deg is None:
+        max_joint_correction_rad = None
+    else:
+        max_joint_correction_rad = tuple(
             math.radians(value)
             for value in _ordered_floats(
-                feedback_config["max_joint_correction_deg"],
+                raw_max_joint_correction_deg,
                 JOINTS,
                 "feedback.max_joint_correction_deg",
             )
-        ),
+        )
+    feedback_controller = JointFeedbackController(
+        moment_arm,
+        kp=_ordered_floats(feedback_config["kp"], JOINTS, "feedback.kp"),
+        max_joint_correction_rad=max_joint_correction_rad,
         max_excursion_correction_mm=_ordered_floats(
             feedback_config["max_excursion_correction_mm"],
             TENDONS,
@@ -216,10 +221,20 @@ def _make_feedback_components(config: dict):
 def _make_angle_source(config: dict) -> RealtimeJointAngleSource:
     paths = config["paths"]
     vision = config["vision"]
+    temporal_outlier = vision.get("temporal_outlier", {})
+    if not isinstance(temporal_outlier, dict):
+        raise ValueError("vision.temporal_outlier must be an object")
     return RealtimeJointAngleSource(
         dlc_config_path=_project_path(paths["dlc_config"], "paths.dlc_config"),
         camera_config_path=_project_path(paths["camera_config"], "paths.camera_config"),
         min_likelihood=float(vision["min_likelihood"]),
+        temporal_outlier_enabled=bool(temporal_outlier.get("enabled", False)),
+        temporal_jump_threshold_deg=float(
+            temporal_outlier.get("base_jump_deg", 10.0)
+        ),
+        temporal_max_hold_frames=int(
+            temporal_outlier.get("max_hold_frames", 1)
+        ),
     )
 
 
@@ -312,6 +327,8 @@ def _build_log_row(
         "cycle_duration_ms": (cycle_finished_at - scheduled_at) * 1000.0,
         "inference_ms": measurement.inference_ms,
         "min_likelihood": measurement.min_likelihood,
+        "measurement_held_last": int(getattr(measurement, "held_last", False)),
+        "measurement_reason": measurement.reason or "",
     }
     for index, joint in enumerate(JOINTS):
         row[f"{joint}_reference_rad"] = reference.joint_angles_rad[index]
@@ -359,6 +376,7 @@ def _run_loop(
 
     started_at = time.monotonic()
     cycle_index = 0
+    previous_feedback = None
     while True:
         scheduled_at = started_at + cycle_index * period_s
         remaining_s = scheduled_at - time.monotonic()
@@ -375,11 +393,20 @@ def _run_loop(
             raise RuntimeError(
                 f"Invalid DLC measurement at cycle {cycle_index}: {measurement.reason}"
             )
-        feedback = feedback_controller.compute(
-            reference.joint_angles_rad,
-            measurement.flexion_angles_rad,
-            reference.motion_directions,
-        )
+        if getattr(measurement, "held_last", False):
+            if previous_feedback is None:
+                raise RuntimeError(
+                    f"DLC measurement was held at cycle {cycle_index} "
+                    "before any valid feedback result was available"
+                )
+            feedback = previous_feedback
+        else:
+            feedback = feedback_controller.compute(
+                reference.joint_angles_rad,
+                measurement.flexion_angles_rad,
+                reference.motion_directions,
+            )
+            previous_feedback = feedback
         command = command_builder.build(
             reference.nominal_excursions_mm,
             feedback.excursion_correction_mm,

@@ -117,6 +117,29 @@ class SynchronizedFeedbackTest(unittest.TestCase):
 
         np.testing.assert_allclose(result.excursion_correction_mm, np.zeros(6))
 
+    def test_none_joint_correction_limit_leaves_proportional_correction_unclipped(self) -> None:
+        coefficients = {
+            (joint, motion): {
+                tendon: np.asarray([1.0]) for tendon in TENDONS
+            }
+            for joint in JOINTS
+            for motion in MOTIONS
+        }
+        controller = JointFeedbackController(
+            MomentArmRuntime(coefficients),
+            kp=(1.0, 1.0, 1.0),
+            max_joint_correction_rad=None,
+            max_excursion_correction_mm=(100.0,) * len(TENDONS),
+        )
+
+        result = controller.compute(
+            (1.0, 1.0, 1.0),
+            (0.0, 0.0, 0.0),
+            ("flexion",) * len(JOINTS),
+        )
+
+        np.testing.assert_allclose(result.joint_correction_rad, (1.0, 1.0, 1.0))
+
     def test_feedback_excursion_is_not_accumulated_between_cycles(self) -> None:
         builder = FeedbackCommandBuilder(
             start_positions=(100,) * len(TENDONS),
@@ -221,6 +244,120 @@ class SynchronizedFeedbackTest(unittest.TestCase):
         self.assertEqual(len(logger.rows), 1)
         self.assertAlmostEqual(logger.rows[0]["command_deadline_s"], 0.2)
         self.assertAlmostEqual(logger.rows[0]["commanded_s"], 0.2)
+
+    def test_loop_reuses_previous_feedback_for_held_measurement(self) -> None:
+        class FakeClock:
+            def __init__(self) -> None:
+                self.current = 0.0
+
+            def monotonic(self) -> float:
+                return self.current
+
+            def sleep(self, duration_s: float) -> None:
+                self.current += max(0.0, duration_s)
+
+        clock = FakeClock()
+        sample = SimpleNamespace(
+            joint_angles_rad=(0.0, 0.0, 0.0),
+            nominal_excursions_mm=(0.0,) * len(TENDONS),
+            motion_directions=("flexion",) * len(JOINTS),
+        )
+        trajectory = SimpleNamespace(
+            duration_s=0.2,
+            sample=lambda _elapsed_s: sample,
+        )
+        measurements = [
+            SimpleNamespace(
+                frame_index=0,
+                captured_at=0.0,
+                inference_finished_at=0.05,
+                flexion_angles_rad=(0.0, 0.0, 0.0),
+                min_likelihood=1.0,
+                inference_ms=50.0,
+                valid=True,
+                reason=None,
+                held_last=False,
+            ),
+            SimpleNamespace(
+                frame_index=1,
+                captured_at=0.2,
+                inference_finished_at=0.25,
+                flexion_angles_rad=(0.0, 0.0, 0.0),
+                min_likelihood=1.0,
+                inference_ms=50.0,
+                valid=True,
+                reason="temporal DLC outlier",
+                held_last=True,
+            ),
+        ]
+
+        def read_measurement(frame_index: int):
+            return measurements[frame_index]
+
+        angle_source = SimpleNamespace(read=read_measurement)
+        feedback_value = SimpleNamespace(
+            error_rad=(0.1, 0.0, 0.0),
+            excursion_correction_mm=(0.25,) * len(TENDONS),
+        )
+        compute_calls: list[object] = []
+
+        def compute_feedback(*_args):
+            compute_calls.append(True)
+            return feedback_value
+
+        feedback_controller = SimpleNamespace(compute=compute_feedback)
+        commands: list[tuple[float, ...]] = []
+
+        def build_command(_nominal, feedback_excursions):
+            commands.append(tuple(feedback_excursions))
+            return SimpleNamespace(
+                nominal_excursions_mm=(0.0,) * len(TENDONS),
+                feedback_excursions_mm=tuple(feedback_excursions),
+                total_excursions_mm=tuple(feedback_excursions),
+                target_positions=(100,) * len(TENDONS),
+            )
+
+        command_builder = SimpleNamespace(build=build_command)
+
+        class MemoryLogger:
+            def __init__(self) -> None:
+                self.rows: list[dict[str, object]] = []
+
+            def write(self, row: dict[str, object]) -> None:
+                self.rows.append(row)
+
+        logger = MemoryLogger()
+        config = {
+            "control": {
+                "frequency_hz": 5.0,
+                "max_cycle_overrun_s": 0.05,
+                "stream_time_ms": 0,
+            },
+            "safety": {
+                "tracking_error_limit": 500,
+                "tracking_error_cycles": 3,
+                "telemetry_stale_s": 0.5,
+            },
+        }
+
+        with (
+            patch.object(feedback_main.time, "monotonic", clock.monotonic),
+            patch.object(feedback_main.time, "sleep", clock.sleep),
+            redirect_stdout(io.StringIO()),
+        ):
+            feedback_main._run_loop(
+                config=config,
+                trajectory=trajectory,
+                feedback_controller=feedback_controller,
+                angle_source=angle_source,
+                command_builder=command_builder,
+                logger=logger,
+            )
+
+        self.assertEqual(len(compute_calls), 1)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0], commands[1])
+        self.assertEqual(logger.rows[1]["measurement_held_last"], 1)
 
 if __name__ == "__main__":
     unittest.main()

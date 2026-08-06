@@ -18,11 +18,7 @@
       "PIP": 0.0,
       "MCP": 0.0
     },
-    "max_joint_correction_deg": {
-      "DIP": 2.0,
-      "PIP": 2.0,
-      "MCP": 2.0
-    },
+    "max_joint_correction_deg": null,
     "max_excursion_correction_mm": {
       "FDP": 1.0,
       "FDS": 1.0,
@@ -35,7 +31,12 @@
   },
   "vision": {
     "warmup_frames": 3,
-    "min_likelihood": 0.3
+    "min_likelihood": 0.3,
+    "temporal_outlier": {
+      "enabled": true,
+      "base_jump_deg": 10.0,
+      "max_hold_frames": 1
+    }
   },
   "logging": {
     "save_overlay_video": true,

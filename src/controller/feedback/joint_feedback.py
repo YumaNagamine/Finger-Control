@@ -24,22 +24,28 @@ class JointFeedbackController:
         moment_arm: MomentArmRuntime,
         *,
         kp: Sequence[float],
-        max_joint_correction_rad: Sequence[float],
+        max_joint_correction_rad: Sequence[float] | None,
         max_excursion_correction_mm: Sequence[float],
     ) -> None:
         self._moment_arm = moment_arm
         self._kp = self._validated_vector(kp, len(JOINTS), "kp")
-        self._max_joint = self._validated_vector(
-            max_joint_correction_rad,
-            len(JOINTS),
-            "max_joint_correction_rad",
+        self._max_joint = (
+            None
+            if max_joint_correction_rad is None
+            else self._validated_vector(
+                max_joint_correction_rad,
+                len(JOINTS),
+                "max_joint_correction_rad",
+            )
         )
         self._max_excursion = self._validated_vector(
             max_excursion_correction_mm,
             len(TENDONS),
             "max_excursion_correction_mm",
         )
-        if np.any(self._max_joint < 0.0) or np.any(self._max_excursion < 0.0):
+        if self._max_joint is not None and np.any(self._max_joint < 0.0):
+            raise ValueError("feedback correction limits must be non-negative")
+        if np.any(self._max_excursion < 0.0):
             raise ValueError("feedback correction limits must be non-negative")
 
     def compute(
@@ -59,11 +65,13 @@ class JointFeedbackController:
             "measured_angles_rad",
         )
         error = reference - measured
-        joint_correction = np.clip(
-            self._kp * error,
-            -self._max_joint,
-            self._max_joint,
-        )
+        joint_correction = self._kp * error
+        if self._max_joint is not None:
+            joint_correction = np.clip(
+                joint_correction,
+                -self._max_joint,
+                self._max_joint,
+            )
         excursion_correction = self._moment_arm.correction_excursion(
             reference,
             joint_correction,
