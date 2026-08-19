@@ -123,6 +123,7 @@ def _feedback_log_metadata(
     start_positions: Sequence[int],
     initial_excursions_mm: Sequence[float],
     position_units_per_mm: Sequence[float],
+    kp: Sequence[float] | None = None,
 ) -> dict[str, object]:
     if not (
         len(start_positions)
@@ -131,8 +132,14 @@ def _feedback_log_metadata(
         == len(TENDONS)
     ):
         raise ValueError("Feedback log conversion metadata must contain six values")
-
     metadata: dict[str, object] = {}
+    if kp is not None:
+        if len(kp) != len(JOINTS):
+            raise ValueError("Feedback log gain metadata must contain three values")
+        for joint, gain in zip(JOINTS, kp):
+            if not math.isfinite(float(gain)):
+                raise ValueError(f"{joint} kp must be finite")
+            metadata[f"{joint}_kp"] = float(gain)
     for tendon, servo_id, start, initial, scale in zip(
         TENDONS,
         SERVO_IDS,
@@ -154,6 +161,22 @@ def _optional_log_float(row: dict[str, str], field_name: str) -> float:
     if raw_value is None or not raw_value.strip():
         return math.nan
     return float(raw_value)
+
+
+def _logged_gain_text(row: dict[str, str]) -> str:
+    gains = [row.get(f"{joint}_kp", "") for joint in JOINTS]
+    if any(gain is None or not gain.strip() for gain in gains):
+        return "Kp: unavailable"
+    try:
+        values = [float(gain) for gain in gains]
+        if not all(math.isfinite(value) for value in values):
+            return "Kp: unavailable"
+        formatted = ", ".join(
+            f"{joint}={value:g}" for joint, value in zip(JOINTS, values)
+        )
+    except (TypeError, ValueError):
+        return "Kp: unavailable"
+    return f"Kp: {formatted}"
 
 
 def plot_feedback_excursion_log(
@@ -260,7 +283,15 @@ def plot_feedback_excursion_log(
         axis.set_xlabel("Time [s]")
 
     figure.suptitle("DLC feedback excursion tracking", fontsize=14)
-    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    figure.text(
+        0.01,
+        0.995,
+        _logged_gain_text(first_row),
+        ha="left",
+        va="top",
+        fontsize=10,
+    )
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
     resolved_output = output_path or log_path.with_suffix(".png")
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(resolved_output, dpi=200, bbox_inches="tight")
@@ -268,14 +299,116 @@ def plot_feedback_excursion_log(
     return resolved_output
 
 
-def _save_feedback_plot_safely(log_path: Path) -> Path | None:
-    try:
-        plot_path = plot_feedback_excursion_log(log_path)
-    except Exception as exc:
-        print(f"WARNING: failed to create feedback excursion plot: {exc}")
-        return None
-    print(f"Feedback excursion plot: {plot_path}")
-    return plot_path
+def plot_feedback_joint_angle_log(
+    log_path: Path,
+    output_path: Path | None = None,
+) -> Path:
+    """Plot reference and DLC-measured joint angles in degrees."""
+
+    with log_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"No feedback-control cycles are available in {log_path}")
+    first_row = rows[0]
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    reference_times = [_optional_log_float(row, "scheduled_s") for row in rows]
+    measured_times = [_optional_log_float(row, "captured_s") for row in rows]
+    held_last = [
+        row.get("measurement_held_last", "").strip() == "1" for row in rows
+    ]
+    figure, axes = plt.subplots(
+        nrows=len(JOINTS),
+        ncols=1,
+        figsize=(13, 10),
+        sharex=True,
+    )
+
+    for axis, joint in zip(axes, JOINTS):
+        reference_angles_deg = [
+            math.degrees(_optional_log_float(row, f"{joint}_reference_rad"))
+            for row in rows
+        ]
+        measured_angles_deg = [
+            math.degrees(_optional_log_float(row, f"{joint}_measured_rad"))
+            for row in rows
+        ]
+        axis.plot(
+            reference_times,
+            reference_angles_deg,
+            label="Target",
+            linewidth=1.9,
+        )
+        axis.plot(
+            measured_times,
+            measured_angles_deg,
+            label="DLC measured",
+            linewidth=1.7,
+        )
+        held_times = [
+            measured_time
+            for measured_time, was_held in zip(measured_times, held_last)
+            if was_held
+        ]
+        held_angles = [
+            angle
+            for angle, was_held in zip(measured_angles_deg, held_last)
+            if was_held
+        ]
+        if held_times:
+            axis.scatter(
+                held_times,
+                held_angles,
+                label="Held previous DLC value",
+                marker="x",
+                s=42,
+                linewidths=1.5,
+                zorder=3,
+            )
+        axis.set_title(joint)
+        axis.set_ylabel("Joint angle [deg]")
+        axis.grid(True, alpha=0.3)
+        axis.legend(loc="best")
+
+    axes[-1].set_xlabel("Time [s]")
+    figure.suptitle("Target vs DLC-measured joint angles", fontsize=14)
+    figure.text(
+        0.01,
+        0.995,
+        _logged_gain_text(first_row),
+        ha="left",
+        va="top",
+        fontsize=10,
+    )
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+    resolved_output = output_path or log_path.with_name(
+        f"{log_path.stem}_joint_angles.png"
+    )
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(resolved_output, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    return resolved_output
+
+
+def _save_feedback_plots_safely(log_path: Path) -> tuple[Path, ...]:
+    saved_paths: list[Path] = []
+    plotters = (
+        ("feedback excursion", plot_feedback_excursion_log),
+        ("feedback joint angle", plot_feedback_joint_angle_log),
+    )
+    for label, plotter in plotters:
+        try:
+            plot_path = plotter(log_path)
+        except Exception as exc:
+            print(f"WARNING: failed to create {label} plot: {exc}")
+            continue
+        print(f"{label.title()} plot: {plot_path}")
+        saved_paths.append(plot_path)
+    return tuple(saved_paths)
 
 
 def parse_args() -> argparse.Namespace:
@@ -684,6 +817,14 @@ def main() -> None:
         config_path,
         required_keys=("control", "paths", "feedback", "vision", "safety", "hardware"),
     )
+    feedback_kp = _ordered_floats(config["feedback"]["kp"], JOINTS, "feedback.kp")
+    print(
+        "FB gains: "
+        + ", ".join(
+            f"{joint}={gain:g}" for joint, gain in zip(JOINTS, feedback_kp)
+        ),
+        flush=True,
+    )
     (
         trajectory,
         feedback_controller,
@@ -733,6 +874,7 @@ def main() -> None:
                     start_positions,
                     initial_sample.nominal_excursions_mm,
                     position_units_per_mm,
+                    feedback_kp,
                 ),
             )
             video_path: Path | None = None
@@ -757,7 +899,7 @@ def main() -> None:
                     video_summary = angle_source.stop_overlay_recording()
                 finally:
                     logger.close()
-                    _save_feedback_plot_safely(logger.path)
+                    _save_feedback_plots_safely(logger.path)
             print(f"Dry-run log: {logger.path}")
             if video_path is not None:
                 print(f"Dry-run overlay video: {video_path}")
@@ -792,6 +934,7 @@ def main() -> None:
             video_path: Path | None = None
             video_summary = None
             completed = False
+            start_positions: tuple[int, ...] | None = None
             try:
                 controller.prepare(
                     SERVO_IDS,
@@ -823,6 +966,7 @@ def main() -> None:
                         start_positions,
                         initial_sample.nominal_excursions_mm,
                         position_units_per_mm,
+                        feedback_kp,
                     ),
                 )
                 video_path = _start_overlay_recording(
@@ -842,24 +986,38 @@ def main() -> None:
                     telemetry=telemetry,
                 )
                 completed = True
-                if bool(hardware["return_to_start"]):
-                    _return_to_start(
-                        controller=controller,
-                        telemetry=telemetry,
-                        start_positions=start_positions,
-                        config=config,
-                    )
             finally:
                 try:
-                    video_summary = angle_source.stop_overlay_recording()
+                    if (
+                        start_positions is not None
+                        and bool(hardware["return_to_start"])
+                    ):
+                        try:
+                            _return_to_start(
+                                controller=controller,
+                                telemetry=telemetry,
+                                start_positions=start_positions,
+                                config=config,
+                            )
+                        except Exception as exc:
+                            if completed:
+                                raise
+                            print(
+                                "WARNING: failed to return to the initial positions "
+                                f"during error cleanup: {exc}",
+                                file=sys.stderr,
+                            )
                 finally:
                     try:
-                        controller.stop_all()
+                        video_summary = angle_source.stop_overlay_recording()
                     finally:
-                        telemetry.stop()
-                        if logger is not None:
-                            logger.close()
-                            _save_feedback_plot_safely(logger.path)
+                        try:
+                            controller.stop_all()
+                        finally:
+                            telemetry.stop()
+                            if logger is not None:
+                                logger.close()
+                                _save_feedback_plots_safely(logger.path)
             if completed and logger is not None:
                 print(f"Feedback-control log: {logger.path}")
                 if video_path is not None:

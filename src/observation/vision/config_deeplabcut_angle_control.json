@@ -80,7 +80,7 @@
       "theta_rad": 0.45,
       "distance_shift": -20.0,
       "joint_shifters": [15.0, 95.0],
-      "mcp_offset": [-100.0, 0.0],
+      "mcp_offset": [-90.0, 0.0],
       "palm_horizontal_offset_px": 100.0
     }
   },
