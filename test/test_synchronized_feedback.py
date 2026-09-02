@@ -393,9 +393,15 @@ class SynchronizedFeedbackTest(unittest.TestCase):
                 fixed_fields=metadata,
             )
             row: dict[str, object] = {
+                "scheduled_s": 0.0,
+                "captured_s": 0.05,
                 "commanded_s": 0.2,
                 "telemetry_received_s": 0.19,
+                "measurement_held_last": 1,
             }
+            for joint in JOINTS:
+                row[f"{joint}_reference_rad"] = 0.2
+                row[f"{joint}_measured_rad"] = 0.1
             for tendon in TENDONS:
                 row[f"{tendon}_nominal_excursion_mm"] = 0.2
                 row[f"{tendon}_nominal_target_position"] = 102
@@ -405,9 +411,14 @@ class SynchronizedFeedbackTest(unittest.TestCase):
             logger.close()
 
             output_path = feedback_main.plot_feedback_excursion_log(logger.path)
+            joint_output_path = feedback_main.plot_feedback_joint_angle_log(
+                logger.path
+            )
 
             self.assertTrue(output_path.is_file())
             self.assertGreater(output_path.stat().st_size, 0)
+            self.assertTrue(joint_output_path.is_file())
+            self.assertGreater(joint_output_path.stat().st_size, 0)
 
 if __name__ == "__main__":
     unittest.main()

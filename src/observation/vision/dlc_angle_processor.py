@@ -4,7 +4,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import cv2
 import numpy as np
@@ -144,17 +144,12 @@ class DLCAngleProcessor:
         self._confidence_threshold = float(processing_cfg.get("confidence_threshold", 0.6))
         self._ema_alpha = float(processing_cfg.get("ema_alpha", 0.4))
         self._hold_last_frames = max(0, int(processing_cfg.get("hold_last_frames", 4)))
-        self._theta_rad = float(adjustments_cfg.get("theta_rad", 0.45))
-        self._distance_shift = float(adjustments_cfg.get("distance_shift", -20.0))
-        self._palm_horizontal_offset_px = float(adjustments_cfg.get("palm_horizontal_offset_px", 100.0))
-        joint_shifters = adjustments_cfg.get("joint_shifters", [15.0, 95.0])
-        if not isinstance(joint_shifters, (list, tuple)) or len(joint_shifters) != 2:
-            raise ValueError("processing.adjustments.joint_shifters must be a list with 2 numbers.")
-        self._joint_shifters = (float(joint_shifters[0]), float(joint_shifters[1]))
-        mcp_offset = adjustments_cfg.get("mcp_offset", [-110.0, 0.0])
-        if not isinstance(mcp_offset, (list, tuple)) or len(mcp_offset) != 2:
-            raise ValueError("processing.adjustments.mcp_offset must be a list with 2 numbers.")
-        self._mcp_offset = (float(mcp_offset[0]), float(mcp_offset[1]))
+        self._theta_rad = 0.45
+        self._distance_shift = -20.0
+        self._palm_horizontal_offset_px = 100.0
+        self._joint_shifters = (15.0, 95.0)
+        self._mcp_offset = (-110.0, 0.0)
+        self.update_adjustments(adjustments_cfg)
 
         self._show_keypoint_labels = bool(draw_cfg.get("show_keypoint_labels", True))
         self._keypoint_radius = max(1, int(draw_cfg.get("keypoint_radius", 4)))
@@ -166,6 +161,50 @@ class DLCAngleProcessor:
         self._latched_keypoints: dict[str, tuple[np.ndarray, float]] = {}
 
         self._predictor = _DLCLivePredictor(config["dlc"], self.keypoint_names, config_base_dir) if enable_live else None
+
+    def update_adjustments(self, adjustments: Mapping[str, Any]) -> None:
+        """Update geometry corrections without reloading the DLC predictor."""
+        theta_rad = float(adjustments.get("theta_rad", self._theta_rad))
+        distance_shift = float(adjustments.get("distance_shift", self._distance_shift))
+        palm_horizontal_offset_px = float(
+            adjustments.get("palm_horizontal_offset_px", self._palm_horizontal_offset_px)
+        )
+        joint_shifters = adjustments.get("joint_shifters", self._joint_shifters)
+        if not isinstance(joint_shifters, (list, tuple)) or len(joint_shifters) != 2:
+            raise ValueError("processing.adjustments.joint_shifters must be a list with 2 numbers.")
+        parsed_joint_shifters = (float(joint_shifters[0]), float(joint_shifters[1]))
+        mcp_offset = adjustments.get("mcp_offset", self._mcp_offset)
+        if not isinstance(mcp_offset, (list, tuple)) or len(mcp_offset) != 2:
+            raise ValueError("processing.adjustments.mcp_offset must be a list with 2 numbers.")
+        parsed_mcp_offset = (float(mcp_offset[0]), float(mcp_offset[1]))
+
+        scalar_values = (
+            theta_rad,
+            distance_shift,
+            palm_horizontal_offset_px,
+            *parsed_joint_shifters,
+            *parsed_mcp_offset,
+        )
+        if not all(np.isfinite(value) for value in scalar_values):
+            raise ValueError("processing.adjustments values must be finite numbers.")
+        if palm_horizontal_offset_px == 0.0:
+            raise ValueError("processing.adjustments.palm_horizontal_offset_px must not be zero.")
+
+        self._theta_rad = theta_rad
+        self._distance_shift = distance_shift
+        self._palm_horizontal_offset_px = palm_horizontal_offset_px
+        self._joint_shifters = parsed_joint_shifters
+        self._mcp_offset = parsed_mcp_offset
+
+    def get_adjustments(self) -> dict[str, float | list[float]]:
+        """Return a JSON-serializable snapshot of the active geometry corrections."""
+        return {
+            "theta_rad": self._theta_rad,
+            "distance_shift": self._distance_shift,
+            "joint_shifters": list(self._joint_shifters),
+            "mcp_offset": list(self._mcp_offset),
+            "palm_horizontal_offset_px": self._palm_horizontal_offset_px,
+        }
 
     @staticmethod
     def _parse_segments(raw_segments: dict[str, Any]) -> dict[str, tuple[str, str]]:
