@@ -1,0 +1,17 @@
+{
+  "processing": {
+    "adjustments": {
+      "theta_rad": 1.0,
+      "distance_shift": -20.0,
+      "joint_shifters": [
+        15.0,
+        80.0
+      ],
+      "mcp_offset": [
+        -90.0,
+        0.0
+      ],
+      "palm_horizontal_offset_px": 100.0
+    }
+  }
+}
