@@ -26,7 +26,7 @@ from utils.config_loader import load_config
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config.json")
+DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config_weight.json")
 DEFAULT_ARUCO_CONFIG = SCRIPT_DIR / "aruco_config.json"
 DEFAULT_OUTPUT_CONFIG = SCRIPT_DIR / "scale_params.json"
 

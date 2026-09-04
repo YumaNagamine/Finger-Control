@@ -30,7 +30,7 @@ from utils.path_utils import resolve_path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DLC_CONFIG = SCRIPT_DIR / "config_deeplabcut_angle.json"
-DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config.json")
+DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config_dlc.json")
 WINDOW_TITLE = "Joint Geometry Tuner"
 PREVIEW_MAX_WIDTH = 1050
 PREVIEW_MAX_HEIGHT = 760

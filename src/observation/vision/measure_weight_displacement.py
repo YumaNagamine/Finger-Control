@@ -30,7 +30,7 @@ from utils.path_utils import resolve_path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config_weight_displacement.json"
-DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config.json")
+DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config_weight.json")
 DEFAULT_VIDEO_PATH = SCRIPT_DIR.parent / "camera" / "test_video" / "test_20260507_183626.mp4"
 
 def parse_args() -> argparse.Namespace:

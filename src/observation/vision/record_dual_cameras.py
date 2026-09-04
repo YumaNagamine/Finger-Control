@@ -30,14 +30,22 @@ from utils.path_utils import resolve_path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config_dual_camera_record.json"
-DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config.json")
+DEFAULT_DLC_CAMERA_CONFIG = resolve_param_path("camera_config_dlc.json")
+DEFAULT_WEIGHT_CAMERA_CONFIG = resolve_param_path("camera_config_weight.json")
 PROJECT_ROOT = ROOT.parent
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record two cameras to video files for offline processing.")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
-    parser.add_argument("--camera-config", type=str, default=str(DEFAULT_CAMERA_CONFIG))
+    parser.add_argument(
+        "--camera-config",
+        type=str,
+        default=None,
+        help="Override both cameras with one shared config.",
+    )
+    parser.add_argument("--dlc-camera-config", type=str, default=str(DEFAULT_DLC_CAMERA_CONFIG))
+    parser.add_argument("--weight-camera-config", type=str, default=str(DEFAULT_WEIGHT_CAMERA_CONFIG))
     parser.add_argument("--duration-s", type=float, default=None, help="Override capture.duration_s in config.")
     parser.add_argument("--frame-limit", type=int, default=None, help="Override capture.frame_limit in config.")
     parser.add_argument("--target-fps", type=float, default=None, help="Override capture.target_fps in config.")
@@ -73,7 +81,15 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config).resolve()
     config = load_config(config_path, required_keys=("camera", "capture", "output"))
-    base_camera_cfg = load_config(Path(args.camera_config).resolve())
+    if args.camera_config:
+        dlc_camera_config_path = Path(args.camera_config).resolve()
+        weight_camera_config_path = dlc_camera_config_path
+    else:
+        dlc_camera_config_path = Path(args.dlc_camera_config).resolve()
+        weight_camera_config_path = Path(args.weight_camera_config).resolve()
+
+    camera_cfg_0 = load_config(dlc_camera_config_path)
+    camera_cfg_1 = load_config(weight_camera_config_path)
     dual_camera_cfg = dict(config["camera"])
     camera_indices = dual_camera_cfg.get("indices", [0, 1])
     if not isinstance(camera_indices, list) or len(camera_indices) != 2:
@@ -84,7 +100,6 @@ def main() -> None:
     calibration_paths = dual_camera_cfg.get("calibration_paths", None)
     calibration_enabled = dual_camera_cfg.get("use_chessboard_calibration", None)
 
-    camera_cfg_0 = dict(base_camera_cfg)
     camera_cfg_0["index"] = int(camera_indices[0])
     camera_cfg_0["name"] = str(camera_names[0])
     cam0_calib_path = _optional_list_value(calibration_paths, 0)
@@ -94,7 +109,6 @@ def main() -> None:
     if cam0_calib_enable is not None:
         camera_cfg_0["use_chessboard_calibration"] = bool(cam0_calib_enable)
 
-    camera_cfg_1 = dict(base_camera_cfg)
     camera_cfg_1["index"] = int(camera_indices[1])
     camera_cfg_1["name"] = str(camera_names[1])
     cam1_calib_path = _optional_list_value(calibration_paths, 1)
@@ -294,7 +308,10 @@ def main() -> None:
                 "show_window": show_window,
             },
             "camera_names": {"cam0": cam0_name, "cam1": cam1_name},
-            "camera_config_path": str(Path(args.camera_config).resolve()),
+            "camera_config_paths": {
+                "cam0": str(dlc_camera_config_path),
+                "cam1": str(weight_camera_config_path),
+            },
             "camera_configs": {"cam0": camera_cfg_0, "cam1": camera_cfg_1},
             "calibration": {
                 "cam0_enabled": bool(camera_cfg_0.get("use_chessboard_calibration", False)),
