@@ -85,6 +85,26 @@ def _row_bool(value: str | int | None) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
+def _read_frame_at_index(
+    capture: cv2.VideoCapture,
+    target_index: int,
+    next_index: int,
+    cached_index: int | None,
+    cached_frame: np.ndarray | None,
+) -> tuple[bool, np.ndarray | None, int, int | None, np.ndarray | None]:
+    if target_index < 0:
+        raise ValueError(f"Video frame index must be non-negative: {target_index}")
+    if cached_index == target_index and cached_frame is not None:
+        return True, cached_frame.copy(), next_index, cached_index, cached_frame
+
+    if target_index != next_index:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, target_index)
+    ok, frame = capture.read()
+    if not ok or frame is None:
+        return False, None, next_index, cached_index, cached_frame
+    return True, frame.copy(), target_index + 1, target_index, frame
+
+
 def process_dual_recording_config(
     cfg: dict,
     *,
@@ -166,6 +186,12 @@ def process_dual_recording_config(
     out_fps1 = cap1_fps if cap1_fps > 0.0 else fallback_fps
     writer_dlc_overlay: cv2.VideoWriter | None = None
     writer_weight_overlay: cv2.VideoWriter | None = None
+    cap0_next_index = 0
+    cap1_next_index = 0
+    cap0_cached_index: int | None = None
+    cap1_cached_index: int | None = None
+    cap0_cached_frame: np.ndarray | None = None
+    cap1_cached_frame: np.ndarray | None = None
 
     row_count = 0
     try:
@@ -191,11 +217,23 @@ def process_dual_recording_config(
                 frame1 = None
 
                 if cam0_ok:
-                    ok0, frame0 = cap0.read()
-                    if not ok0 or frame0 is None:
-                        print("Stopping: cam0 video ended before pair CSV.")
-                        break
                     frame0_idx = int(cam0_frame_idx_txt) if cam0_frame_idx_txt != "" else row_count
+                    (
+                        ok0,
+                        frame0,
+                        cap0_next_index,
+                        cap0_cached_index,
+                        cap0_cached_frame,
+                    ) = _read_frame_at_index(
+                        cap0,
+                        frame0_idx,
+                        cap0_next_index,
+                        cap0_cached_index,
+                        cap0_cached_frame,
+                    )
+                    if not ok0 or frame0 is None:
+                        print(f"Stopping: cam0 frame {frame0_idx} could not be read.")
+                        break
                     if frame0_idx >= predictions.frame_count:
                         raw_keypoints = {
                             name: (float("nan"), float("nan"), 0.0)
@@ -216,11 +254,23 @@ def process_dual_recording_config(
                     dlc_overlay = None
 
                 if cam1_ok:
-                    ok1, frame1 = cap1.read()
-                    if not ok1 or frame1 is None:
-                        print("Stopping: cam1 video ended before pair CSV.")
-                        break
                     frame1_idx = int(cam1_frame_idx_txt) if cam1_frame_idx_txt != "" else row_count
+                    (
+                        ok1,
+                        frame1,
+                        cap1_next_index,
+                        cap1_cached_index,
+                        cap1_cached_frame,
+                    ) = _read_frame_at_index(
+                        cap1,
+                        frame1_idx,
+                        cap1_next_index,
+                        cap1_cached_index,
+                        cap1_cached_frame,
+                    )
+                    if not ok1 or frame1 is None:
+                        print(f"Stopping: cam1 frame {frame1_idx} could not be read.")
+                        break
                     weight_results, weight_overlay = weight_processor.process_frame(frame1, frame1_idx)
                 else:
                     weight_overlay = None

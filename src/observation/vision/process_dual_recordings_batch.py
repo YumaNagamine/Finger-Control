@@ -17,7 +17,7 @@ from utils.path_utils import resolve_path
 
 PROJECT_ROOT = ROOT.parent
 DEFAULT_RECORDINGS_ROOT = PROJECT_ROOT / "logs" / "dual_camera" / "recordings"
-REQUIRED_RECORDING_FILES = ("cam0.mp4", "cam1.mp4", "pair_timestamps.csv")
+VIDEO_EXTENSIONS = (".mp4", ".avi")
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,7 +45,24 @@ def _resolve_existing_dir(raw_path: str, config_base_dir: Path) -> Path:
 
 
 def is_recording_dir(path: Path) -> bool:
-    return path.is_dir() and all((path / name).is_file() for name in REQUIRED_RECORDING_FILES)
+    return (
+        path.is_dir()
+        and (path / "pair_timestamps.csv").is_file()
+        and any(
+            (path / f"cam0{extension}").is_file()
+            and (path / f"cam1{extension}").is_file()
+            for extension in VIDEO_EXTENSIONS
+        )
+    )
+
+
+def _recording_video_paths(session_dir: Path) -> tuple[Path, Path]:
+    for extension in VIDEO_EXTENSIONS:
+        cam0_path = session_dir / f"cam0{extension}"
+        cam1_path = session_dir / f"cam1{extension}"
+        if cam0_path.is_file() and cam1_path.is_file():
+            return cam0_path, cam1_path
+    raise FileNotFoundError(f"No matching cam0/cam1 MP4 or AVI pair found: {session_dir}")
 
 
 def find_recording_dirs(recordings_root: Path) -> list[Path]:
@@ -58,8 +75,9 @@ def find_recording_dirs(recordings_root: Path) -> list[Path]:
 def build_session_config(base_cfg: dict, session_dir: Path) -> dict:
     cfg = copy.deepcopy(base_cfg)
     input_cfg = dict(cfg["input"])
-    input_cfg["cam0_video_path"] = str(session_dir / "cam0.mp4")
-    input_cfg["cam1_video_path"] = str(session_dir / "cam1.mp4")
+    cam0_path, cam1_path = _recording_video_paths(session_dir)
+    input_cfg["cam0_video_path"] = str(cam0_path)
+    input_cfg["cam1_video_path"] = str(cam1_path)
     input_cfg["pair_timestamps_csv"] = str(session_dir / "pair_timestamps.csv")
     cfg["input"] = input_cfg
     return cfg

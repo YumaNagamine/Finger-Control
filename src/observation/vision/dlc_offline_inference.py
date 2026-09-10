@@ -251,9 +251,11 @@ def prepare_dlc_prediction_file(
     if dlc_project_config_path is None or not dlc_project_config_path.is_file():
         raise FileNotFoundError(f"deeplabcut config not found: {dlc_project_config_path}")
 
-    inference = settings["inference"]
-    if not isinstance(inference, dict):
+    inference_raw = settings["inference"]
+    if not isinstance(inference_raw, dict):
         raise ValueError("`inference` must be a JSON object")
+    inference = dict(inference_raw)
+    inference["videotype"] = video_path.suffix.lstrip(".").lower()
 
     resolved_output_dir = output_dir or (video_path.parent / "dlc_inference")
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
