@@ -1,20 +1,23 @@
 {
   "camera": {
-    "indices": [0, 1],
+    "indices": [1, 0],
     "names": ["cam_dlc", "cam_weight"],
     "use_chessboard_calibration": [true, true],
     "calibration_paths": ["camera_calibration_dlc.json", "camera_calibration_weight.json"]
   },
   "capture": {
-    "target_fps": 30,
+    "target_fps": 90,
     "duration_s": 0.0,
     "frame_limit": 0,
-    "warmup_frames": 5
+    "warmup_frames": 5,
+    "ring_buffer_frames": 16,
+    "preview_fps": 10.0
   },
   "output": {
     "record_dir": "logs/dual_camera/recordings",
     "filename_prefix": "dual_record",
-    "writer_fourcc": "mp4v",
+    "writer_fourcc": "MJPG",
+    "video_extension": ".avi",
     "show_window": true
   }
 }

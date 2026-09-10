@@ -94,7 +94,8 @@ def _fmt(v: float | int | None, digits: int = 6) -> str:
 
 def _report_camera(session_dir: Path, cam_name: str) -> None:
     ts_csv = session_dir / f"{cam_name}_timestamps.csv"
-    video_path = session_dir / f"{cam_name}.mp4"
+    video_candidates = [session_dir / f"{cam_name}.mp4", session_dir / f"{cam_name}.avi"]
+    video_path = next((path for path in video_candidates if path.is_file()), video_candidates[0])
 
     elapsed = _load_elapsed_seconds(ts_csv)
     actual = _compute_actual_fps(elapsed)
