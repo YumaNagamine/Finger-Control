@@ -91,15 +91,6 @@ def main() -> None:
 
     camera_cfg_0 = load_config(dlc_camera_config_path)
     camera_cfg_1 = load_config(weight_camera_config_path)
-    for camera_cfg, camera_config_path in (
-        (camera_cfg_0, dlc_camera_config_path),
-        (camera_cfg_1, weight_camera_config_path),
-    ):
-        calibration_path = camera_cfg.get("calibration_path")
-        if calibration_path and not Path(str(calibration_path)).is_absolute():
-            camera_cfg["calibration_path"] = str(
-                (camera_config_path.parent / str(calibration_path)).resolve()
-            )
     dual_camera_cfg = dict(config["camera"])
     camera_indices = dual_camera_cfg.get("indices", [0, 1])
     if not isinstance(camera_indices, list) or len(camera_indices) != 2:
@@ -127,6 +118,16 @@ def main() -> None:
         camera_cfg_1["calibration_path"] = str(cam1_calib_path)
     if cam1_calib_enable is not None:
         camera_cfg_1["use_chessboard_calibration"] = bool(cam1_calib_enable)
+
+    for camera_cfg, camera_config_path in (
+        (camera_cfg_0, dlc_camera_config_path),
+        (camera_cfg_1, weight_camera_config_path),
+    ):
+        calibration_path = camera_cfg.get("calibration_path")
+        if calibration_path and not Path(str(calibration_path)).is_absolute():
+            camera_cfg["calibration_path"] = str(
+                (camera_config_path.parent / str(calibration_path)).resolve()
+            )
 
     capture_cfg = dict(config["capture"])
     output_cfg = dict(config["output"])
