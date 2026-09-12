@@ -194,7 +194,11 @@ def main() -> None:
     xy_history: dict[int, dict[str, list[float]]] = defaultdict(lambda: {"frame": [], "x": [], "y": []})
 
     if show_window:
-        cv2.namedWindow("Weight Displacement", cv2.WINDOW_NORMAL)
+        cv2.namedWindow(
+            "Weight Displacement",
+            cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO,
+        )
+        cv2.resizeWindow("Weight Displacement", 800, 600)
 
     with csv_path.open("w", newline="", encoding="utf-8") as f_csv:
         writer_csv = csv.writer(f_csv)
