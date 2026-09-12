@@ -32,8 +32,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config_dual_camera_record_legacy.json"
 LEGACY_PARAM_DIR = ROOT / "observation" / "camera" / "paramsHighResolution"
 DEFAULT_DLC_CAMERA_CONFIG = LEGACY_PARAM_DIR / "camera_config_dlc_legacy.json"
-DEFAULT_WEIGHT_CAMERA_CONFIG = LEGACY_PARAM_DIR / "camera_config_weight_legacy.json"
+DEFAULT_WEIGHT_CAMERA_CONFIG = ROOT / "observation" / "camera" / "params" / "camera_config_weight.json"
 PROJECT_ROOT = ROOT.parent
+PREVIEW_FRAME_SIZE = (800, 600)
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,11 +72,9 @@ def _optional_list_value(values: object, idx: int) -> object | None:
 
 
 def _join_preview(frame0: np.ndarray, frame1: np.ndarray) -> np.ndarray:
-    h0, w0 = frame0.shape[:2]
-    h1, w1 = frame1.shape[:2]
-    if h0 != h1:
-        frame1 = cv2.resize(frame1, (w1, h0), interpolation=cv2.INTER_AREA)
-    return cv2.hconcat([frame0, frame1])
+    preview0 = cv2.resize(frame0, PREVIEW_FRAME_SIZE, interpolation=cv2.INTER_AREA)
+    preview1 = cv2.resize(frame1, PREVIEW_FRAME_SIZE, interpolation=cv2.INTER_AREA)
+    return cv2.hconcat([preview0, preview1])
 
 
 def main() -> None:

@@ -6,14 +6,14 @@
   ],
   "camera_matrix": [
     [
-      685.8110337849544,
+      504.5338226448062,
       0.0,
-      396.49500808836586
+      414.0287569283584
     ],
     [
       0.0,
-      686.1730044871574,
-      274.6761059841718
+      505.3940300434978,
+      313.9178020728578
     ],
     [
       0.0,
@@ -22,61 +22,52 @@
     ]
   ],
   "distortion_coefficients": [
-    -0.47595918115239844,
-    0.325693261195609,
-    -0.0010899756584839663,
-    0.0020792358580221998,
-    -0.12937422741671864
+    -0.0758482734945376,
+    0.17214743362157903,
+    -0.0003569405497148493,
+    -0.0004112736893159766,
+    -0.14229820514194497
   ],
-  "rms_reprojection_error": 0.46634747501594503,
-  "mean_reprojection_error": 0.46634750975645506,
+  "rms_reprojection_error": 0.2516387344583807,
+  "mean_reprojection_error": 0.25163845706051285,
   "chessboard": {
     "inner_corners": [
       9,
       6
     ],
-    "square_size_mm": 15.0
+    "square_size_mm": 11.0
   },
-  "num_images_found": 37,
-  "num_images_used": 37,
+  "num_images_found": 28,
+  "num_images_used": 28,
   "used_image_files": [
-    "chessboard_20260521_171225_593898.png",
-    "chessboard_20260521_171227_840600.png",
-    "chessboard_20260521_171231_121132.png",
-    "chessboard_20260521_171232_907797.png",
-    "chessboard_20260521_171234_698744.png",
-    "chessboard_20260521_171244_782853.png",
-    "chessboard_20260521_171247_971022.png",
-    "chessboard_20260521_171252_911305.png",
-    "chessboard_20260521_171256_801842.png",
-    "chessboard_20260521_171259_730021.png",
-    "chessboard_20260521_171301_922301.png",
-    "chessboard_20260521_171304_409962.png",
-    "chessboard_20260521_171313_293474.png",
-    "chessboard_20260521_171315_679060.png",
-    "chessboard_20260521_171318_027693.png",
-    "chessboard_20260521_171319_241699.png",
-    "chessboard_20260521_171320_958934.png",
-    "chessboard_20260521_171322_360053.png",
-    "chessboard_20260521_171323_777865.png",
-    "chessboard_20260521_171327_203059.png",
-    "chessboard_20260521_171335_353957.png",
-    "chessboard_20260521_171347_298852.png",
-    "chessboard_20260521_171350_625904.png",
-    "chessboard_20260521_171352_082109.png",
-    "chessboard_20260521_171354_133982.png",
-    "chessboard_20260521_171357_161690.png",
-    "chessboard_20260521_171403_171072.png",
-    "chessboard_20260521_171404_562458.png",
-    "chessboard_20260521_171407_328066.png",
-    "chessboard_20260521_171408_890140.png",
-    "chessboard_20260521_171410_679902.png",
-    "chessboard_20260521_171414_108296.png",
-    "chessboard_20260521_171423_180874.png",
-    "chessboard_20260521_171424_786751.png",
-    "chessboard_20260521_171427_083583.png",
-    "chessboard_20260521_171431_257769.png",
-    "chessboard_20260521_171434_138931.png"
+    "chessboard_20260912_224008_507669.png",
+    "chessboard_20260912_224010_970334.png",
+    "chessboard_20260912_224012_697805.png",
+    "chessboard_20260912_224018_202925.png",
+    "chessboard_20260912_224020_418078.png",
+    "chessboard_20260912_224022_882863.png",
+    "chessboard_20260912_224055_834874.png",
+    "chessboard_20260912_224058_556748.png",
+    "chessboard_20260912_224101_082466.png",
+    "chessboard_20260912_224102_946742.png",
+    "chessboard_20260912_224105_539886.png",
+    "chessboard_20260912_224107_245592.png",
+    "chessboard_20260912_224109_085640.png",
+    "chessboard_20260912_224127_262413.png",
+    "chessboard_20260912_224128_995566.png",
+    "chessboard_20260912_224132_910053.png",
+    "chessboard_20260912_224135_247206.png",
+    "chessboard_20260912_224137_955287.png",
+    "chessboard_20260912_224139_387798.png",
+    "chessboard_20260912_224145_019128.png",
+    "chessboard_20260912_224146_339852.png",
+    "chessboard_20260912_224147_278607.png",
+    "chessboard_20260912_224148_011361.png",
+    "chessboard_20260912_224150_844700.png",
+    "chessboard_20260912_224155_013514.png",
+    "chessboard_20260912_224156_339803.png",
+    "chessboard_20260912_224157_428485.png",
+    "chessboard_20260912_224158_548921.png"
   ],
-  "generated_at": "2026-05-21T17:14:56"
+  "generated_at": "2026-09-12T22:42:50"
 }
