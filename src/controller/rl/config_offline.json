@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "action_names": ["FDP", "FDS", "EI", "DI", "PI", "LUM"],
+    "observation_schema": "defined_by_future_training_dataset",
+    "network": {
+      "hidden_units": [256, 256],
+      "activation": "relu",
+      "use_batch_norm": false,
+      "use_layer_norm": false,
+      "dropout_rate": null
+    }
+  },
+  "algorithms": {
+    "bc": {
+      "batch_size": 128,
+      "learning_rate": 0.0003
+    },
+    "awac": {
+      "batch_size": 128,
+      "actor_learning_rate": 0.0003,
+      "critic_learning_rate": 0.0003,
+      "gamma": 0.99,
+      "tau": 0.005,
+      "lam": 1.0,
+      "n_action_samples": 1,
+      "n_critics": 2
+    }
+  }
+}
