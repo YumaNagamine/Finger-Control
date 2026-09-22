@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import threading
 import time
+from queue import Full, Queue
 from dataclasses import dataclass
+from typing import TypeAlias
 
 
 @dataclass(frozen=True)
@@ -15,6 +17,9 @@ class TelemetrySnapshot:
     loads: tuple[int, ...]
     speeds: tuple[int, ...] | None
     sequence: int
+
+
+TelemetrySubscription: TypeAlias = Queue[TelemetrySnapshot]
 
 
 class TelemetryMonitor:
@@ -40,6 +45,28 @@ class TelemetryMonitor:
         self._latest: TelemetrySnapshot | None = None
         self._error: Exception | None = None
         self._sequence = 0
+        self._subscriptions: set[TelemetrySubscription] = set()
+
+    def subscribe(self, *, maxsize: int = 0) -> TelemetrySubscription:
+        """Return a queue receiving every complete snapshot from this monitor.
+
+        The monitor remains the only serial reader.  Subscribers receive the
+        immutable snapshots after the monitor has accepted and published them.
+        An unbounded queue (the default) is appropriate for short recording
+        trials and prevents a slow DLC thread from dropping telemetry samples.
+        """
+        if maxsize < 0:
+            raise ValueError("maxsize must be non-negative")
+        subscription: TelemetrySubscription = Queue(maxsize=maxsize)
+        with self._condition:
+            if self._stop_event.is_set():
+                raise RuntimeError("Telemetry monitor is stopped")
+            self._subscriptions.add(subscription)
+        return subscription
+
+    def unsubscribe(self, subscription: TelemetrySubscription) -> None:
+        with self._condition:
+            self._subscriptions.discard(subscription)
 
     def start(self) -> None:
         if self._thread is not None:
@@ -119,7 +146,7 @@ class TelemetryMonitor:
 
                 with self._condition:
                     self._sequence += 1
-                    self._latest = TelemetrySnapshot(
+                    snapshot = TelemetrySnapshot(
                         received_at=time.monotonic(),
                         timestamp_ms=int(frame.timestamp_ms),
                         positions=tuple(int(value) for value in frame.positions),
@@ -131,7 +158,19 @@ class TelemetryMonitor:
                         ),
                         sequence=self._sequence,
                     )
+                    self._latest = snapshot
+                    subscriptions = tuple(self._subscriptions)
                     self._condition.notify_all()
+                for subscription in subscriptions:
+                    try:
+                        subscription.put_nowait(snapshot)
+                    except Full as exc:
+                        with self._condition:
+                            self._error = RuntimeError(
+                                "Telemetry subscription queue is full"
+                            )
+                            self._condition.notify_all()
+                        raise exc
         except Exception as exc:
             if not self._stop_event.is_set():
                 with self._condition:

@@ -44,6 +44,24 @@
     "video_codec": "mp4v",
     "video_queue_size": 10
   },
+  "step_response": {
+    "observation_timeout_s": 5.0,
+    "baseline_sample_count": 20,
+    "detection": {
+      "servo_onset_threshold_count": 3.0,
+      "joint_onset_threshold_deg": 1.0,
+      "consecutive_count": 3,
+      "noise_scale": 3.0
+    },
+    "settling": {
+      "servo_position_band_count": 10.0,
+      "servo_speed_threshold": 5.0,
+      "joint_position_band_deg": 2.0,
+      "joint_slope_threshold_deg": 0.5,
+      "consecutive_count": 5,
+      "terminal_window": 10
+    }
+  },
   "safety": {
     "position_limits": {
       "FDP": [-28672, 28672],
