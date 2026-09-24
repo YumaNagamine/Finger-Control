@@ -46,6 +46,8 @@ def _positive_int(value: object, name: str) -> int:
 
 
 def _finite_positive_float(value: object, name: str) -> float:
+    if isinstance(value, bool):
+        raise ActorConfigurationError(f"{name} must be positive and finite")
     try:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
@@ -89,7 +91,16 @@ def load_actor_settings(path: str | Path) -> dict[str, Any]:
             raise ActorConfigurationError(f"policy.network.{option} must be boolean")
     dropout_rate = network.get("dropout_rate")
     if dropout_rate is not None:
-        dropout_rate = float(dropout_rate)
+        if isinstance(dropout_rate, bool):
+            raise ActorConfigurationError(
+                "policy.network.dropout_rate must be null or in [0, 1)"
+            )
+        try:
+            dropout_rate = float(dropout_rate)
+        except (TypeError, ValueError) as exc:
+            raise ActorConfigurationError(
+                "policy.network.dropout_rate must be null or in [0, 1)"
+            ) from exc
         if not math.isfinite(dropout_rate) or not 0.0 <= dropout_rate < 1.0:
             raise ActorConfigurationError(
                 "policy.network.dropout_rate must be null or in [0, 1)"

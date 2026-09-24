@@ -57,7 +57,24 @@ class ActorBaseTest(TestCase):
             with self.assertRaisesRegex(ActorConfigurationError, "canonical order"):
                 load_actor_settings(path)
 
+    def test_boolean_numeric_setting_is_rejected(self):
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config["algorithms"]["awac"]["gamma"] = True
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ActorConfigurationError, "positive and finite"):
+                load_actor_settings(path)
+
+    def test_invalid_dropout_uses_configuration_error(self):
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config["policy"]["network"]["dropout_rate"] = "not-a-number"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ActorConfigurationError, "dropout_rate"):
+                load_actor_settings(path)
+
     def test_non_finite_observation_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "NaN or infinity"):
             predict_actions(_ZeroPolicy(), [[0.0, float("nan")]])
-

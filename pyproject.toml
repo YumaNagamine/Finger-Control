@@ -21,6 +21,9 @@ dlc = [
   "deeplabcut-live==1.1.0",
   "tables>=3.8",
 ]
+rl = [
+  "d3rlpy>=2.8,<3",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
