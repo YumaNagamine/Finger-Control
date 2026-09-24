@@ -13,9 +13,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.append(str(SRC))
 
-from controller.rl.actor import (
-    ActorConfigurationError,
-    load_actor_settings,
+from controller.rl.algorithm_factory import (
+    AlgorithmConfigurationError,
+    load_algorithm_settings,
     predict_actions,
 )
 from controller.servo_mapping import TENDONS
@@ -34,9 +34,9 @@ class _OutOfRangePolicy:
         return np.full((len(observations), len(TENDONS)), 1.25, dtype=np.float32)
 
 
-class ActorBaseTest(TestCase):
+class AlgorithmFactoryTest(TestCase):
     def test_config_uses_canonical_tendon_order(self):
-        settings = load_actor_settings(CONFIG_PATH)
+        settings = load_algorithm_settings(CONFIG_PATH)
         self.assertEqual(tuple(settings["policy"]["action_names"]), TENDONS)
 
     def test_observation_width_is_not_hard_coded(self):
@@ -54,8 +54,8 @@ class ActorBaseTest(TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "config.json"
             path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaisesRegex(ActorConfigurationError, "canonical order"):
-                load_actor_settings(path)
+            with self.assertRaisesRegex(AlgorithmConfigurationError, "canonical order"):
+                load_algorithm_settings(path)
 
     def test_boolean_numeric_setting_is_rejected(self):
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -63,8 +63,8 @@ class ActorBaseTest(TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "config.json"
             path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaisesRegex(ActorConfigurationError, "positive and finite"):
-                load_actor_settings(path)
+            with self.assertRaisesRegex(AlgorithmConfigurationError, "positive and finite"):
+                load_algorithm_settings(path)
 
     def test_invalid_dropout_uses_configuration_error(self):
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -72,8 +72,8 @@ class ActorBaseTest(TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "config.json"
             path.write_text(json.dumps(config), encoding="utf-8")
-            with self.assertRaisesRegex(ActorConfigurationError, "dropout_rate"):
-                load_actor_settings(path)
+            with self.assertRaisesRegex(AlgorithmConfigurationError, "dropout_rate"):
+                load_algorithm_settings(path)
 
     def test_non_finite_observation_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "NaN or infinity"):

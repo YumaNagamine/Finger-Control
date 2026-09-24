@@ -3,7 +3,7 @@
 The observation width is deliberately not part of this module. d3rlpy builds
 the policy network from the observation shape of the dataset passed to fit.
 This keeps future additions, such as calibrated servo torque features, out of
-the Actor implementation itself.
+the policy implementation itself.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ import numpy as np
 from controller.servo_mapping import TENDONS
 
 
-class ActorConfigurationError(ValueError):
-    """Raised when an Actor configuration cannot define a compatible policy."""
+class AlgorithmConfigurationError(ValueError):
+    """Raised when an algorithm configuration is not compatible with the policy."""
 
 
 class PredictablePolicy(Protocol):
@@ -29,35 +29,35 @@ class PredictablePolicy(Protocol):
 
 def _mapping(value: object, name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise ActorConfigurationError(f"{name} must be an object")
+        raise AlgorithmConfigurationError(f"{name} must be an object")
     return value
 
 
 def _positive_int(value: object, name: str) -> int:
     if isinstance(value, bool):
-        raise ActorConfigurationError(f"{name} must be a positive integer")
+        raise AlgorithmConfigurationError(f"{name} must be a positive integer")
     try:
         parsed = int(value)
     except (TypeError, ValueError) as exc:
-        raise ActorConfigurationError(f"{name} must be a positive integer") from exc
+        raise AlgorithmConfigurationError(f"{name} must be a positive integer") from exc
     if parsed <= 0 or parsed != value:
-        raise ActorConfigurationError(f"{name} must be a positive integer")
+        raise AlgorithmConfigurationError(f"{name} must be a positive integer")
     return parsed
 
 
 def _finite_positive_float(value: object, name: str) -> float:
     if isinstance(value, bool):
-        raise ActorConfigurationError(f"{name} must be positive and finite")
+        raise AlgorithmConfigurationError(f"{name} must be positive and finite")
     try:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
-        raise ActorConfigurationError(f"{name} must be positive and finite") from exc
+        raise AlgorithmConfigurationError(f"{name} must be positive and finite") from exc
     if not math.isfinite(parsed) or parsed <= 0.0:
-        raise ActorConfigurationError(f"{name} must be positive and finite")
+        raise AlgorithmConfigurationError(f"{name} must be positive and finite")
     return parsed
 
 
-def load_actor_settings(path: str | Path) -> dict[str, Any]:
+def load_algorithm_settings(path: str | Path) -> dict[str, Any]:
     """Load and validate policy settings without importing d3rlpy."""
 
     config_path = Path(path).expanduser().resolve()
@@ -67,14 +67,14 @@ def load_actor_settings(path: str | Path) -> dict[str, Any]:
 
     action_names = policy.get("action_names")
     if not isinstance(action_names, list) or tuple(action_names) != TENDONS:
-        raise ActorConfigurationError(
+        raise AlgorithmConfigurationError(
             f"policy.action_names must be {list(TENDONS)} in canonical order"
         )
 
     network = _mapping(policy.get("network"), "policy.network")
     hidden_units = network.get("hidden_units")
     if not isinstance(hidden_units, list) or not hidden_units:
-        raise ActorConfigurationError(
+        raise AlgorithmConfigurationError(
             "policy.network.hidden_units must be a non-empty list"
         )
     validated_units = [
@@ -83,26 +83,26 @@ def load_actor_settings(path: str | Path) -> dict[str, Any]:
     ]
     activation = network.get("activation")
     if not isinstance(activation, str) or not activation:
-        raise ActorConfigurationError(
+        raise AlgorithmConfigurationError(
             "policy.network.activation must be a non-empty string"
         )
     for option in ("use_batch_norm", "use_layer_norm"):
         if not isinstance(network.get(option), bool):
-            raise ActorConfigurationError(f"policy.network.{option} must be boolean")
+            raise AlgorithmConfigurationError(f"policy.network.{option} must be boolean")
     dropout_rate = network.get("dropout_rate")
     if dropout_rate is not None:
         if isinstance(dropout_rate, bool):
-            raise ActorConfigurationError(
+            raise AlgorithmConfigurationError(
                 "policy.network.dropout_rate must be null or in [0, 1)"
             )
         try:
             dropout_rate = float(dropout_rate)
         except (TypeError, ValueError) as exc:
-            raise ActorConfigurationError(
+            raise AlgorithmConfigurationError(
                 "policy.network.dropout_rate must be null or in [0, 1)"
             ) from exc
         if not math.isfinite(dropout_rate) or not 0.0 <= dropout_rate < 1.0:
-            raise ActorConfigurationError(
+            raise AlgorithmConfigurationError(
                 "policy.network.dropout_rate must be null or in [0, 1)"
             )
 
@@ -139,7 +139,7 @@ def build_algorithm(
 
     normalized_algorithm = algorithm.lower()
     if normalized_algorithm not in ("bc", "awac"):
-        raise ActorConfigurationError("algorithm must be 'bc' or 'awac'")
+        raise AlgorithmConfigurationError("algorithm must be 'bc' or 'awac'")
 
     try:
         import d3rlpy

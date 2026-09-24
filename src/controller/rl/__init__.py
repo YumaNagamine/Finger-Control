@@ -1,15 +1,15 @@
 """Offline reinforcement-learning utilities for tendon control."""
 
-from controller.rl.actor import (
-    ActorConfigurationError,
+from controller.rl.algorithm_factory import (
+    AlgorithmConfigurationError,
     build_algorithm,
-    load_actor_settings,
+    load_algorithm_settings,
     predict_actions,
 )
 
 __all__ = [
-    "ActorConfigurationError",
+    "AlgorithmConfigurationError",
     "build_algorithm",
-    "load_actor_settings",
+    "load_algorithm_settings",
     "predict_actions",
 ]
