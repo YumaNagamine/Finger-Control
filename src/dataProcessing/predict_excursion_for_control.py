@@ -36,7 +36,7 @@ TARGET_INPUT_CSV = (
     / "dual_processed_controlTest_20260708_132620.csv"
 )
 
-TENDON_COLUMNS = ["FDP", "FDS", "EI", "DI", "PI", "LUM"]
+TENDON_COLUMNS = ["FDP", "FDS", "ED", "DI", "PI", "LUM"]
 JOINT_COLUMNS = ["DIP", "PIP", "MCP"]
 FLEXION_RAD_COLUMNS = {
     "DIP": "DIP_flexion_angle_rad",

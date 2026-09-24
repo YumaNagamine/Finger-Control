@@ -37,7 +37,7 @@ RAW_DATA_ALPHA = 0.2
 TENDON_EXCURSION_COLUMNS = {
     "FDP": "weight_0_disp_mm",
     "FDS": "weight_1_disp_mm",
-    "EI": "weight_2_disp_mm",
+    "ED": "weight_2_disp_mm",
     "PI": "weight_3_disp_mm",
     "DI": "weight_4_disp_mm",
     "LUM": "weight_5_disp_mm",

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "policy": {
-    "action_names": ["FDP", "FDS", "EI", "DI", "PI", "LUM"],
+    "action_names": ["FDP", "FDS", "ED", "DI", "PI", "LUM"],
     "observation_schema": "defined_by_future_training_dataset",
     "network": {
       "hidden_units": [256, 256],

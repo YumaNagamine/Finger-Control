@@ -27,7 +27,7 @@ DEFAULT_INPUT_CSV = (
     PROJECT_ROOT / "logs" / "dual_camera" / "processed_csv" / "ValidateExtension.csv"
 )
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "logs" / "dual_camera" / "processed_data"
-TENDON_COLUMNS = ["FDP", "FDS", "EI", "DI", "PI", "LUM"]
+TENDON_COLUMNS = ["FDP", "FDS", "ED", "DI", "PI", "LUM"]
 JOINT_COLUMNS = ["DIP", "PIP", "MCP"]
 EVALUATION_ANGLE_RANGES_DEG = {
     "DIP": (-10.0, 40.0),
@@ -54,7 +54,7 @@ FLEXION_RAD_COLUMNS = {
 DISP_MM_RENAME_MAP = {
     "weight_0_disp_mm": "FDP",
     "weight_1_disp_mm": "FDS",
-    "weight_2_disp_mm": "EI",
+    "weight_2_disp_mm": "ED",
     "weight_3_disp_mm": "PI",
     "weight_4_disp_mm": "DI",
     "weight_5_disp_mm": "LUM",
@@ -62,7 +62,7 @@ DISP_MM_RENAME_MAP = {
 DISP_QUALITY_COLUMNS = {
     "FDP": "weight_0_quality",
     "FDS": "weight_1_quality",
-    "EI": "weight_2_quality",
+    "ED": "weight_2_quality",
     "PI": "weight_3_quality",
     "DI": "weight_4_quality",
     "LUM": "weight_5_quality",

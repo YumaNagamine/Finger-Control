@@ -31,7 +31,7 @@ OUTPUT_PLOT_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_excur
 OUTPUT_CSV_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_excursion.csv"
 OUTPUT_TIME_ANGLE_PLOT_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_time_vs_joint_angle.png"
 
-TENDON_COLUMNS = ["FDP", "FDS", "EI", "DI", "PI", "LUM"]
+TENDON_COLUMNS = ["FDP", "FDS", "ED", "DI", "PI", "LUM"]
 JOINT_COLUMNS = ["DIP", "PIP", "MCP"]
 FLEXION_RAD_COLUMNS = {
     "DIP": "DIP_flexion_angle_rad",
@@ -41,7 +41,7 @@ FLEXION_RAD_COLUMNS = {
 DISP_MM_RENAME_MAP = {
     "weight_0_disp_mm": "FDP",
     "weight_1_disp_mm": "FDS",
-    "weight_2_disp_mm": "EI",
+    "weight_2_disp_mm": "ED",
     "weight_3_disp_mm": "PI",
     "weight_4_disp_mm": "DI",
     "weight_5_disp_mm": "LUM",

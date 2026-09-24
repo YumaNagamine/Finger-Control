@@ -11,7 +11,7 @@ first CSV row::
 rotation direction winds the corresponding tendon.  It must be measured for
 the actual spool/tendon mechanism; this script deliberately does not guess it.
 
-The tendon order used by all six-value settings is: FDP, FDS, EI, DI, PI, LUM.
+The tendon order used by all six-value settings is: FDP, FDS, ED, DI, PI, LUM.
 
 Set ``EXECUTE = True`` in the user settings block to send commands to the
 physical servos. Leave it ``False`` for a dry-run simulation.
@@ -52,7 +52,7 @@ SERVO_POSITION_MAX = 4095
 
 # ---------------------------------------------------------------------------
 # User settings
-# All six-value tuples use this order: FDP, FDS, EI, DI, PI, LUM.
+# All six-value tuples use this order: FDP, FDS, ED, DI, PI, LUM.
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = SRC_ROOT.parent
 PREDICTION_CSV_PATH = (

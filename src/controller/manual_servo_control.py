@@ -44,7 +44,7 @@ from servo.control import (
 
 # ---------------------------------------------------------------------------
 # User settings
-# GUI-compatible mapping: FDP->5, FDS->4, EI(ED)->2, DI->3, PI->1, LUM(LU)->0.
+# GUI-compatible mapping: FDP->5, FDS->4, ED->2, DI->3, PI->1, LUM(LU)->0.
 # Change TENDON only; SERVO_ID is derived from the shared mapping.
 # ---------------------------------------------------------------------------
 TENDON = "LUM"

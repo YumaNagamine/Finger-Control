@@ -30,7 +30,7 @@ from utils.config_loader import load_config
 
 # ---------------------------------------------------------------------------
 # User settings
-# All six-value tuples use this order: FDP, FDS, EI, DI, PI, LUM.
+# All six-value tuples use this order: FDP, FDS, ED, DI, PI, LUM.
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = SRC_ROOT.parent
 PREDICTION_CSV_PATH = (

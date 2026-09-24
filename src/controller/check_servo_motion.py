@@ -1,6 +1,6 @@
 """Check each servo by moving it away from and back to its start position.
 
-The tendon/servo order is FDP, FDS, EI, DI, PI, LUM, mapped to servo IDs
+The tendon/servo order is FDP, FDS, ED, DI, PI, LUM, mapped to servo IDs
 5, 4, 2, 3, 1, 0. Positive ``--distance-mm`` follows the signed conversion
 defined in ``excursion_servo_calibration.json``.
 

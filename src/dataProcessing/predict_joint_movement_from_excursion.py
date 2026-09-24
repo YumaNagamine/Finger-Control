@@ -30,7 +30,7 @@ OUTPUT_FILE_PREFIX = TARGET_INPUT_CSV.stem
 OUTPUT_PLOT_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_joint_angles.png"
 OUTPUT_CSV_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_joint_angles.csv"
 
-TENDON_COLUMNS = ["FDP", "FDS", "EI", "DI", "PI", "LUM"]
+TENDON_COLUMNS = ["FDP", "FDS", "ED", "DI", "PI", "LUM"]
 JOINT_COLUMNS = ["DIP", "PIP", "MCP"]
 FLEXION_DEG_COLUMNS = {
     "DIP": "DIP_flexion_angle_deg",

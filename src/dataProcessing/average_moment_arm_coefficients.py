@@ -16,7 +16,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DATA_ROOT = PROJECT_ROOT / "logs" / "dual_camera" / "processed_data"
 OUTPUT_ROOT = PROJECT_ROOT / "logs" / "dual_camera" / "moment_arm_average"
-TENDON_COLUMNS = ["FDP", "FDS", "EI", "DI", "PI", "LUM"]
+TENDON_COLUMNS = ["FDP", "FDS", "ED", "DI", "PI", "LUM"]
 MOMENT_ARM_COEFFICIENT_COLUMNS = ["moment_arm_c3", "moment_arm_c2", "moment_arm_c1", "moment_arm_c0"]
 PLOT_DEGREE_LIMITS = {
     "DIP": (0.0, 90.0),
