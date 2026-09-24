@@ -4,6 +4,7 @@ import math
 import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +21,10 @@ from controller.step_response_analysis import (
     robust_noise,
     threshold_from_noise,
 )
-from controller.measure_servo_dlc_step_response import resolve_analysis_args
+from controller.measure_servo_dlc_step_response import (
+    analyse_step_response,
+    resolve_analysis_args,
+)
 
 
 class StepResponseAnalysisTest(TestCase):
@@ -93,6 +97,16 @@ class StepResponseAnalysisTest(TestCase):
             )
         )
 
+    def test_zero_threshold_does_not_treat_stationary_samples_as_motion(self):
+        self.assertIsNone(
+            detect_onset(
+                [TimedScalar(0.1, 100.0), TimedScalar(0.2, 100.0)],
+                baseline=100.0,
+                threshold=0.0,
+                consecutive_count=1,
+            )
+        )
+
     def test_noise_threshold_uses_configured_minimum(self):
         noise = robust_noise([10.0, 10.0, 10.0, 11.0, 9.0])
         self.assertGreaterEqual(noise, 0.0)
@@ -135,3 +149,74 @@ class StepResponseAnalysisTest(TestCase):
         self.assertIsNotNone(detection)
         assert detection is not None
         self.assertEqual(detection.first_at, 0.3)
+
+    def test_overall_joint_settling_uses_last_joint_to_settle(self):
+        args = SimpleNamespace(
+            movement_direction="increase",
+            servo_onset_threshold_count=1.0,
+            noise_scale=0.0,
+            consecutive_detection_count=1,
+            servo_settling_band_count=0.0,
+            servo_speed_threshold=0.0,
+            settling_consecutive_count=1,
+            joint_onset_threshold_deg=1.0,
+            settling_terminal_window=2,
+            joint_settling_band_deg=0.1,
+            joint_settling_slope_deg=0.1,
+        )
+        measurements = [
+            SimpleNamespace(
+                captured_at=-1.0,
+                inference_finished_at=-0.9,
+                flexion_angles_rad=(0.0, 0.0, 0.0),
+                valid=True,
+                held_last=False,
+            ),
+            SimpleNamespace(
+                captured_at=1.0,
+                inference_finished_at=1.1,
+                flexion_angles_rad=(0.2, 0.0, 0.0),
+                valid=True,
+                held_last=False,
+            ),
+            SimpleNamespace(
+                captured_at=2.0,
+                inference_finished_at=2.1,
+                flexion_angles_rad=(0.2, 0.3, 0.0),
+                valid=True,
+                held_last=False,
+            ),
+            SimpleNamespace(
+                captured_at=3.0,
+                inference_finished_at=3.1,
+                flexion_angles_rad=(0.2, 0.3, 0.4),
+                valid=True,
+                held_last=False,
+            ),
+            SimpleNamespace(
+                captured_at=4.0,
+                inference_finished_at=4.1,
+                flexion_angles_rad=(0.2, 0.3, 0.4),
+                valid=True,
+                held_last=False,
+            ),
+        ]
+        telemetry = [
+            SimpleNamespace(received_at=-1.0, positions=(0,), speeds=(0,)),
+            SimpleNamespace(received_at=1.0, positions=(1,), speeds=(0,)),
+        ]
+
+        result = analyse_step_response(
+            args=args,
+            measurements=measurements,
+            telemetry_records=telemetry,
+            commanded_at=0.0,
+            command_requested_at=0.0,
+            return_requested_at=None,
+            servo_id=0,
+            start_position=0,
+            target_position=1,
+        )
+
+        self.assertEqual(result["joint_settled_at"], 3.0)
+        self.assertEqual(result["joint_settling_time_ms"], 3000.0)

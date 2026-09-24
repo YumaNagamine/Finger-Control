@@ -540,7 +540,7 @@ def analyse_step_response(
         "joint_motion_observed_at": first_joint_onset,
         "servo_settled_at": None if servo_settling is None else servo_settling.first_at,
         "joint_settled_at": (
-            min(
+            max(
                 value["first_at"]
                 for value in joint_settlings.values()
                 if value is not None
@@ -567,7 +567,7 @@ def analyse_step_response(
             else _latency_ms(servo_settling.first_at, commanded_at)
         ),
         "joint_settling_time_ms": (
-            min(value["settling_time_ms"] for value in joint_settlings.values() if value is not None)
+            max(value["settling_time_ms"] for value in joint_settlings.values() if value is not None)
             if any(value is not None for value in joint_settlings.values())
             else None
         ),

@@ -85,7 +85,7 @@ def detect_onset(
     run_start = -1
     for index, sample in enumerate(samples):
         delta = float(sample.value) - baseline
-        if not math.isfinite(delta) or abs(delta) < threshold:
+        if not math.isfinite(delta) or abs(delta) <= threshold:
             run_direction = None
             run_start = -1
             continue
