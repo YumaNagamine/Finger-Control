@@ -36,6 +36,11 @@ class ForceControlGuiConfigTest(unittest.TestCase):
         self.assertTrue(all(row["zero_std_deg"] is not None for row in mapping))
         self.assertEqual(Path(mapping[0]["calibration_path"]).parent, DEFAULT_CALIBRATION_DIR)
 
+    def test_drain_samples_returns_empty_list_when_queue_is_empty(self):
+        session = ForceControlSession(load_gui_force_config())
+
+        self.assertEqual(session.drain_samples(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

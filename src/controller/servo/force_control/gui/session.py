@@ -241,7 +241,7 @@ class ForceControlSession:
                 samples.append(self._sample_queue.get_nowait())
             except queue.Empty:
                 break
-                return samples
+        return samples
 
     @staticmethod
     def _format_file_time(path: Path) -> Optional[str]:
@@ -802,10 +802,11 @@ class ForceControlSession:
                         self._update_ramp(state, now)
                         if state.controller is None:
                             raise RuntimeError("Controller is not armed")
-                        state.controller.config = replace(
-                            state.controller.config,
-                            target_force_n=state.target_force_n,
-                        )
+                        if state.controller.config.target_force_n != state.target_force_n:
+                            state.controller.config = replace(
+                                state.controller.config,
+                                target_force_n=state.target_force_n,
+                            )
                         output = state.controller.step(
                             self._feedback_object(state, item),
                             now=now,
