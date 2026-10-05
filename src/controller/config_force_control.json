@@ -1,6 +1,12 @@
 {
   "version": 1,
   "default": {
-    "min_target_force_n": 0.5
+    "min_target_force_n": 0.5,
+    "max_target_force_n": 2.0,
+    "target_force_levels_n": [0.5, 1.0, 1.5, 2.0],
+    "ramp_duration_s": 1.0,
+    "control_hz": 20.0,
+    "encoder_rate_hz": 70.0,
+    "feedback_timeout_s": 0.2
   }
 }
