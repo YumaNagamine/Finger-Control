@@ -1,2 +1,0 @@
-"""servoAPI-based GUI package."""
-

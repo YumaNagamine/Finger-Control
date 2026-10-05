@@ -14,6 +14,8 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
+# TEMPORARY MIGRATION: rebuild this verification path on
+# third_party/ServoHardwareAPI, then remove this note and the legacy imports.
 from servo.control import TelemetryMonitor
 from servo.servo_APIs import ServoAPI
 

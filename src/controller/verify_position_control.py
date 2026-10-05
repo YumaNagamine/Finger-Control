@@ -187,6 +187,8 @@ def run_hardware(
     positive_target: int,
     negative_target: int,
 ) -> None:
+    # TEMPORARY MIGRATION: rebuild this verification path on
+    # third_party/ServoHardwareAPI, then remove this note and the legacy import.
     from servo.servo_APIs import ServoAPI
 
     with ServoAPI(

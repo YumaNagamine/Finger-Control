@@ -39,6 +39,8 @@ from controller.csv_player.excursion_player import (
     load_position_calibration,
 )
 from controller.servo_mapping import SERVO_IDS_BY_TENDON, TENDONS
+# TEMPORARY MIGRATION: rebuild this servo path on third_party/ServoHardwareAPI,
+# then remove this note and the legacy import below.
 from servo.control import (
     PositionControlConfig,
     ReliablePositionController,

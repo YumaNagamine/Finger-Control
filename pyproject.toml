@@ -29,4 +29,7 @@ rl = [
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
-where = ["src", "third_party/pyftdi"]
+# TEMPORARY MIGRATION: the legacy servo package and bundled pyftdi copy are
+# intentionally removed in this cleanup. Rebuild the servo layer on top of
+# third_party/ServoHardwareAPI, then remove this note.
+where = ["src"]

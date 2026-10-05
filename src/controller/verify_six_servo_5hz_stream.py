@@ -26,6 +26,8 @@ from controller.verify_six_servo_position_control import (
     build_controller_config,
     run_phase,
 )
+# TEMPORARY MIGRATION: rebuild this verification path on
+# third_party/ServoHardwareAPI, then remove this note and the legacy import.
 from servo.control import ReliablePositionController, TelemetryMonitor
 
 
