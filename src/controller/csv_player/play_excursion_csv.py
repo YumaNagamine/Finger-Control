@@ -38,6 +38,8 @@ from controller.csv_player.excursion_player import (
     ExcursionPlayer,
     load_position_calibration,
 )
+# TEMPORARY MIGRATION: rebuild this servo path on third_party/ServoHardwareAPI,
+# then remove this note and the legacy import below.
 from servo.control import (
     PositionControlConfig,
     ReliablePositionController,

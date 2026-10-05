@@ -28,6 +28,8 @@ from observation.vision.realtime_joint_angle_source import (
     JointAngleMeasurement,
     RealtimeJointAngleSource,
 )
+# TEMPORARY MIGRATION: rebuild this servo path on third_party/ServoHardwareAPI,
+# then remove this note and the legacy import below.
 from servo.control import (
     PositionControlConfig,
     ReliablePositionController,

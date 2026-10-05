@@ -169,6 +169,8 @@ def main() -> None:
 
     try:
         camera_recorder.prepare()
+        # TEMPORARY MIGRATION: rebuild this servo path on
+        # third_party/ServoHardwareAPI, then remove this note and the legacy import.
         from servo.servo_APIs import ServoAPI
 
         with ServoAPI(
