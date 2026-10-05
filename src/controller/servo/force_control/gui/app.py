@@ -33,6 +33,7 @@ class ForceControlApp(tk.Tk):
         self.title("Tendon Force Control")
         self.geometry("1500x950")
         self.minsize(1180, 760)
+        self.state("zoomed")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.session = ForceControlSession(config)
