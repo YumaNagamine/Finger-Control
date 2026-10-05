@@ -32,6 +32,7 @@ DEFAULT_CALIBRATION_DIR = API_ROOT / "calibration" / "current"
 
 SERVO_IDS = (1, 2, 3, 4, 5, 6)
 SERVO_NAMES = ("ED", "DI", "FDS", "FDP", "LU", "PI")
+MANUAL_SPEED_PRESETS = (-500, -100, 0, 100, 500)
 DEFAULT_ZERO_OFFSET_FILE = DEFAULT_CALIBRATION_DIR / "as5048a_unloaded_zero_offsets.json"
 
 
@@ -197,6 +198,9 @@ class ForceControlSession:
         self._control_thread: Optional[threading.Thread] = None
         self._states: Dict[int, _ServoState] = {}
         self._servo_index: Dict[int, int] = {}
+        self._manual_speed_commands: Dict[int, int] = {
+            servo_id: 0 for servo_id in SERVO_IDS
+        }
         self._last_parameters: Optional[dict] = None
         self._calibration_dir = DEFAULT_CALIBRATION_DIR
         self._zero_offset_path = DEFAULT_ZERO_OFFSET_FILE
@@ -243,6 +247,15 @@ class ForceControlSession:
             except queue.Empty:
                 break
         return samples
+
+    def baseline_snapshot(self) -> Dict[int, Optional[float]]:
+        """Return baseline forces without exposing mutable session state."""
+
+        with self._lock:
+            return {
+                servo_id: state.baseline_force_n
+                for servo_id, state in self._states.items()
+            }
 
     @staticmethod
     def _format_file_time(path: Path) -> Optional[str]:
@@ -521,6 +534,9 @@ class ForceControlSession:
                 self._encoder_reader = encoder_reader
                 self._stop_event = stop_event
                 self._states = states
+                self._manual_speed_commands = {
+                    servo_id: 0 for servo_id in SERVO_IDS
+                }
                 self._connected = True
                 self._armed = False
                 self._running = False
@@ -576,6 +592,9 @@ class ForceControlSession:
                 self._encoder_reader = None
                 self._control_thread = None
                 self._states = {}
+                self._manual_speed_commands = {
+                    servo_id: 0 for servo_id in SERVO_IDS
+                }
                 self._stop_event = threading.Event()
             raise
 
@@ -704,6 +723,8 @@ class ForceControlSession:
         from controller.servo.force_control import PID, PIDConfig, ForceControlConfig
 
         with self._lock:
+            if any(self._manual_speed_commands.values()):
+                raise RuntimeError("Stop manual speed control before arming")
             for state in self._states.values():
                 state.controller = ForcePIDControllerWithConfig(
                     PID(
@@ -754,6 +775,9 @@ class ForceControlSession:
             self._armed = False
             for state in self._states.values():
                 state.active = False
+            self._manual_speed_commands = {
+                servo_id: 0 for servo_id in SERVO_IDS
+            }
         self._send_zero_all()
         self._emit("All servos stopped and disarmed.")
 
@@ -763,6 +787,7 @@ class ForceControlSession:
             if state is None:
                 raise ValueError(f"Unknown servo ID: {servo_id}")
             state.active = False
+            self._manual_speed_commands[int(servo_id)] = 0
         with self._command_lock:
             servo = self._servo
             if servo is not None:
@@ -795,6 +820,41 @@ class ForceControlSession:
                 state.ramp_duration_s = duration
                 state.ramp_started_at = time.monotonic()
         self._emit(f"Servo {servo_id} target set to {target:.3f} N ({mode}).")
+
+    def set_manual_speed(self, servo_id: int, speed: int) -> None:
+        """Send one persistent raw speed command while force control is stopped."""
+
+        servo_id = int(servo_id)
+        speed = int(speed)
+        if speed not in MANUAL_SPEED_PRESETS:
+            raise ValueError(
+                f"Manual speed must be one of {MANUAL_SPEED_PRESETS}"
+            )
+
+        with self._command_lock:
+            with self._lock:
+                if not self._connected or self._servo is None:
+                    raise RuntimeError("Connect before using speed control")
+                if self._armed or self._running:
+                    raise RuntimeError("Stop force control before using speed control")
+                if servo_id not in self._states:
+                    raise ValueError(f"Unknown servo ID: {servo_id}")
+                servo = self._servo
+                self._manual_speed_commands[servo_id] = speed
+            try:
+                servo.send_speed_by_id(servo_id, speed)
+            except Exception as exc:
+                with self._lock:
+                    self._manual_speed_commands[servo_id] = 0
+                send_error = exc
+            else:
+                send_error = None
+
+        if send_error is not None:
+            self._handle_fault(send_error)
+            raise send_error
+
+        self._emit(f"Servo {servo_id} manual speed set to {speed}.")
 
     def _update_ramp(self, state: _ServoState, now: float) -> None:
         if state.ramp_started_at is None:
@@ -833,6 +893,7 @@ class ForceControlSession:
                     running = self._running
                     armed = self._armed
                     states = list(self._states.values())
+                    manual_speeds = dict(self._manual_speed_commands)
                 commands: List[tuple] = []
                 for state in states:
                     item = feedback[state.servo_id]
@@ -854,6 +915,7 @@ class ForceControlSession:
                         commands.append((state.servo_id, speed_command))
                         force_error = output.force_error_n
                     else:
+                        speed_command = manual_speeds.get(state.servo_id, 0)
                         force_error = state.target_force_n - item["force_n"]
                     self._publish(
                         ControlSample(
@@ -969,6 +1031,9 @@ class ForceControlSession:
             self._encoder_reader = None
             self._control_thread = None
             self._states = {}
+            self._manual_speed_commands = {
+                servo_id: 0 for servo_id in SERVO_IDS
+            }
             self._stop_event = threading.Event()
         if was_connected:
             self._emit("Disconnected.")
