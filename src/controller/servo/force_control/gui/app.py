@@ -60,11 +60,11 @@ class ForceControlApp(tk.Tk):
         self.ramp_duration_var = tk.StringVar(
             value=f"{self.config_model.ramp_duration_s:g}"
         )
-        self.kp_var = tk.StringVar()
+        self.kp_var = tk.StringVar(value="5.0")
         self.ki_var = tk.StringVar(value="0.0")
         self.kd_var = tk.StringVar(value="0.0")
         self.max_speed_var = tk.StringVar(value="20.0")
-        self.hard_limit_var = tk.StringVar()
+        self.hard_limit_var = tk.StringVar(value="3.0")
         self.control_sign_var = tk.StringVar(value="1.0")
         for servo_id, tendon in zip(SERVO_IDS, SERVO_NAMES):
             self._row_vars[servo_id] = {
