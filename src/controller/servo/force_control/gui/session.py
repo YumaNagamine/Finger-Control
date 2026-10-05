@@ -177,6 +177,7 @@ class ForceControlSession:
         self.config = config or load_gui_force_config()
         self.status_callback = status_callback
         self._lock = threading.RLock()
+        self._command_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._sample_queue: queue.Queue = queue.Queue(maxsize=3000)
         self._event_queue: queue.Queue = queue.Queue()
@@ -461,6 +462,12 @@ class ForceControlSession:
 
         servo_transport = None
         encoder_transport = None
+        servo = None
+        encoder = None
+        servo_reader = None
+        encoder_reader = None
+        stop_event = None
+        control_thread = None
         try:
             servo_transport = SerialTransport(
                 str(servo_port),
@@ -522,14 +529,27 @@ class ForceControlSession:
 
             self._emit("Feedback connected; capturing stable initial force...")
             self.capture_baseline()
-            self._control_thread = threading.Thread(
+            control_thread = threading.Thread(
                 target=self._loop,
                 name="force-gui-control-loop",
                 daemon=True,
             )
-            self._control_thread.start()
+            self._control_thread = control_thread
+            control_thread.start()
             self._emit("Connected and disarmed. No motion command is being sent.")
         except Exception:
+            if stop_event is not None:
+                stop_event.set()
+            if encoder is not None:
+                try:
+                    encoder.stop_stream()
+                except Exception:
+                    pass
+            for reader in (servo_reader, encoder_reader):
+                if reader is not None:
+                    reader.join(1.0)
+            if control_thread is not None and control_thread is not threading.current_thread():
+                control_thread.join(1.0)
             if servo_transport is not None:
                 try:
                     servo_transport.close()
@@ -540,6 +560,23 @@ class ForceControlSession:
                     encoder_transport.close()
                 except Exception:
                     pass
+            with self._lock:
+                self._connected = False
+                self._armed = False
+                self._running = False
+                self._faulted = False
+                self._servo = None
+                self._encoder = None
+                self._servo_transport = None
+                self._encoder_transport = None
+                self._servo_store = None
+                self._encoder_reader_store = None
+                self._encoder_stores = {}
+                self._servo_reader = None
+                self._encoder_reader = None
+                self._control_thread = None
+                self._states = {}
+                self._stop_event = threading.Event()
             raise
 
     @staticmethod
@@ -726,8 +763,10 @@ class ForceControlSession:
             if state is None:
                 raise ValueError(f"Unknown servo ID: {servo_id}")
             state.active = False
-        if self._servo is not None:
-            self._servo.send_speed_by_id(int(servo_id), 0)
+        with self._command_lock:
+            servo = self._servo
+            if servo is not None:
+                servo.send_speed_by_id(int(servo_id), 0)
 
     def set_target(self, servo_id: int, target_force_n: float, mode: str, duration_s: float) -> None:
         target = float(target_force_n)
@@ -829,9 +868,20 @@ class ForceControlSession:
                             active=bool(running and armed and state.active),
                         )
                     )
-                if running and armed and self._servo is not None:
-                    for servo_id, command in commands:
-                        self._servo.send_speed_by_id(servo_id, command)
+                if commands:
+                    with self._command_lock:
+                        with self._lock:
+                            should_send = self._running and self._armed and not self._faulted
+                            active_ids = {
+                                state.servo_id
+                                for state in self._states.values()
+                                if state.active
+                            }
+                            servo = self._servo
+                        if should_send and servo is not None:
+                            for servo_id, command in commands:
+                                if servo_id in active_ids:
+                                    servo.send_speed_by_id(servo_id, command)
             except Exception as exc:
                 self._handle_fault(exc)
                 break
@@ -864,14 +914,15 @@ class ForceControlSession:
         self._emit(f"FAULT: all servos stopped: {exc}")
 
     def _send_zero_all(self) -> None:
-        servo = self._servo
-        if servo is None:
-            return
-        for servo_id in SERVO_IDS:
-            try:
-                servo.send_speed_by_id(servo_id, 0)
-            except Exception as exc:
-                self._emit(f"WARNING: failed to stop servo {servo_id}: {exc}")
+        with self._command_lock:
+            servo = self._servo
+            if servo is None:
+                return
+            for servo_id in SERVO_IDS:
+                try:
+                    servo.send_speed_by_id(servo_id, 0)
+                except Exception as exc:
+                    self._emit(f"WARNING: failed to stop servo {servo_id}: {exc}")
 
     def disconnect(self) -> None:
         with self._lock:
