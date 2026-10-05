@@ -52,7 +52,7 @@ class ForceControlApp(tk.Tk):
 
     def _build_variables(self) -> None:
         self.status_var = tk.StringVar(value="Disconnected")
-        self.servo_port_var = tk.StringVar(value="COM6")
+        self.servo_port_var = tk.StringVar(value="COM3")
         self.encoder_port_var = tk.StringVar(value="COM5")
         self.calibration_dir_var = tk.StringVar(value=str(DEFAULT_CALIBRATION_DIR))
         self.zero_offset_var = tk.StringVar(value=str(DEFAULT_ZERO_OFFSET_FILE))
