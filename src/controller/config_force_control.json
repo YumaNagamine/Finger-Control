@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "default": {
+    "min_target_force_n": 0.5
+  }
+}
