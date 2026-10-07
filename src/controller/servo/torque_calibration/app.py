@@ -28,6 +28,7 @@ DEFAULT_CALIBRATION_DIR = API_ROOT / "calibration" / "current"
 SERVO_IDS = tuple(range(1, 7))
 SERVO_NAMES_BY_ID = ("ED", "DI", "FDS", "FDP", "LU", "PI")
 MAX_POINTS_PER_SERVO = 1000
+SPEED_PRESETS = (-500, -300, -100, 100, 300, 500)
 
 
 class TorqueCalibrationApp:
@@ -57,7 +58,7 @@ class TorqueCalibrationApp:
         self._destroyed = False
         self._health_error: Exception | None = None
 
-        self.servo_port_var = tk.StringVar(value="COM6")
+        self.servo_port_var = tk.StringVar(value="COM3")
         self.encoder_port_var = tk.StringVar(value="COM5")
         self.servo_id_var = tk.StringVar(value="1")
         self.force_var = tk.StringVar()
@@ -68,8 +69,16 @@ class TorqueCalibrationApp:
         self.current_b_var = tk.StringVar()
         self.pending_b_var = tk.StringVar(value="not calculated")
         self.pending_count_var = tk.StringVar(value="0 / 6 servos ready")
+        self.speed_status_var = tk.StringVar(value="Disconnected")
+        self.speed_command_vars = {
+            servo_id: tk.StringVar(value="0") for servo_id in SERVO_IDS
+        }
+        self._speed_command_values = {servo_id: 0 for servo_id in SERVO_IDS}
+        self._speed_buttons: dict[int, list[ttk.Button]] = {}
+        self.stop_all_speed_button: ttk.Button | None = None
 
         self._build_ui()
+        self._update_speed_controls()
         self._refresh_selected_servo()
         self._refresh_pending_table()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -78,7 +87,7 @@ class TorqueCalibrationApp:
     def _build_ui(self) -> None:
         root = self.root
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(3, weight=1)
+        root.rowconfigure(1, weight=1)
 
         connection = ttk.LabelFrame(root, text="Connection")
         connection.grid(row=0, column=0, sticky="ew", padx=10, pady=8)
@@ -103,7 +112,16 @@ class TorqueCalibrationApp:
             row=0, column=6, columnspan=2, sticky="w", padx=10, pady=5
         )
 
-        selection = ttk.LabelFrame(root, text="Selected motor")
+        notebook = ttk.Notebook(root)
+        notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        calibration_tab = ttk.Frame(notebook)
+        speed_tab = ttk.Frame(notebook)
+        notebook.add(calibration_tab, text="Calibration")
+        notebook.add(speed_tab, text="Motor speed")
+        calibration_tab.columnconfigure(0, weight=1)
+        calibration_tab.rowconfigure(3, weight=1)
+
+        selection = ttk.LabelFrame(calibration_tab, text="Selected motor")
         selection.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
         ttk.Label(selection, text="Servo ID").grid(row=0, column=0, padx=5, pady=5)
         self.servo_id_combo = ttk.Combobox(
@@ -127,7 +145,7 @@ class TorqueCalibrationApp:
             row=0, column=6, sticky="w", padx=5, pady=5
         )
 
-        measurement = ttk.LabelFrame(root, text="Add force-gauge point")
+        measurement = ttk.LabelFrame(calibration_tab, text="Add force-gauge point")
         measurement.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
         ttk.Label(measurement, text="Force gauge [N]").grid(
             row=0, column=0, padx=5, pady=5
@@ -164,7 +182,7 @@ class TorqueCalibrationApp:
         )
         self.clear_button.grid(row=0, column=8, padx=5, pady=5)
 
-        points_frame = ttk.LabelFrame(root, text="Selected servo points")
+        points_frame = ttk.LabelFrame(calibration_tab, text="Selected servo points")
         points_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=4)
         points_frame.rowconfigure(0, weight=1)
         points_frame.columnconfigure(0, weight=1)
@@ -192,7 +210,7 @@ class TorqueCalibrationApp:
         points_scroll.grid(row=0, column=1, sticky="ns")
         self.points_tree.configure(yscrollcommand=points_scroll.set)
 
-        bottom = ttk.Frame(root)
+        bottom = ttk.Frame(calibration_tab)
         bottom.grid(row=4, column=0, sticky="ew", padx=10, pady=8)
         bottom.columnconfigure(0, weight=1)
         ttk.Label(bottom, textvariable=self.pending_count_var).grid(
@@ -206,12 +224,12 @@ class TorqueCalibrationApp:
         self.update_button.grid(row=0, column=1, padx=5)
 
         self.pending_tree = ttk.Treeview(
-            root,
+            calibration_tab,
             columns=("servo", "tendon", "points", "b", "spread"),
             show="headings",
             height=6,
         )
-        root.rowconfigure(5, weight=0)
+        calibration_tab.rowconfigure(5, weight=0)
         self.pending_tree.grid(row=5, column=0, sticky="ew", padx=10, pady=4)
         for column, heading in {
             "servo": "Servo ID",
@@ -222,6 +240,74 @@ class TorqueCalibrationApp:
         }.items():
             self.pending_tree.heading(column, text=heading)
             self.pending_tree.column(column, width=160, anchor="center")
+
+        self._build_speed_tab(speed_tab)
+
+    def _build_speed_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        ttk.Label(
+            parent,
+            text=(
+                "Raw motor speed commands. Positive and negative values select "
+                "the motor direction. Stop all motors before calibration capture."
+            ),
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        ttk.Label(parent, textvariable=self.speed_status_var).grid(
+            row=1, column=0, sticky="w", padx=8, pady=(0, 4)
+        )
+
+        table = ttk.LabelFrame(parent, text="Per-motor speed control")
+        table.grid(row=2, column=0, sticky="nsew", padx=8, pady=4)
+        headers = ("Servo ID", "Motor", "Current command", "Speed")
+        for column, heading in enumerate(headers):
+            ttk.Label(table, text=heading).grid(
+                row=0, column=column, padx=5, pady=5, sticky="w"
+            )
+
+        for row, (servo_id, motor_name) in enumerate(
+            zip(SERVO_IDS, SERVO_NAMES_BY_ID), start=1
+        ):
+            ttk.Label(table, text=str(servo_id), width=8).grid(
+                row=row, column=0, padx=5, pady=4
+            )
+            ttk.Label(table, text=motor_name, width=10).grid(
+                row=row, column=1, padx=5, pady=4, sticky="w"
+            )
+            ttk.Label(
+                table,
+                textvariable=self.speed_command_vars[servo_id],
+                width=16,
+            ).grid(row=row, column=2, padx=5, pady=4, sticky="w")
+            button_frame = ttk.Frame(table)
+            button_frame.grid(row=row, column=3, padx=5, pady=4, sticky="w")
+            buttons: list[ttk.Button] = []
+            for speed in SPEED_PRESETS:
+                button = ttk.Button(
+                    button_frame,
+                    text=f"{speed:+d}",
+                    width=6,
+                    command=lambda sid=servo_id, value=speed: self._set_motor_speed(
+                        sid, value
+                    ),
+                )
+                button.pack(side="left", padx=1)
+                buttons.append(button)
+            stop_button = ttk.Button(
+                button_frame,
+                text="STOP",
+                width=6,
+                command=lambda sid=servo_id: self._set_motor_speed(sid, 0),
+            )
+            stop_button.pack(side="left", padx=(5, 1))
+            buttons.append(stop_button)
+            self._speed_buttons[servo_id] = buttons
+
+        self.stop_all_speed_button = ttk.Button(
+            parent,
+            text="STOP ALL MOTORS",
+            command=self._stop_all_motors,
+        )
+        self.stop_all_speed_button.grid(row=3, column=0, sticky="w", padx=8, pady=8)
 
     def _selected_servo_id(self) -> int:
         return int(self.servo_id_var.get())
@@ -312,6 +398,35 @@ class TorqueCalibrationApp:
         )
         if status is not None:
             self.status_var.set(status)
+        self._update_speed_controls()
+
+    def _update_speed_controls(self) -> None:
+        enabled = (
+            not self.busy
+            and not self._close_requested
+            and self.session is not None
+            and self.session.connected
+        )
+        if self.session is None or not self.session.connected:
+            status = "Disconnected"
+        elif self.busy:
+            status = "Unavailable while another operation is running"
+        elif any(self._speed_command_values.values()):
+            status = "Ready; one or more motors are moving"
+        else:
+            status = "Ready"
+        self.speed_status_var.set(status)
+        state = "normal" if enabled else "disabled"
+        for buttons in self._speed_buttons.values():
+            for button in buttons:
+                button.configure(state=state)
+        if self.stop_all_speed_button is not None:
+            self.stop_all_speed_button.configure(state=state)
+
+    def _reset_speed_commands(self) -> None:
+        for servo_id in SERVO_IDS:
+            self._speed_command_values[servo_id] = 0
+            self.speed_command_vars[servo_id].set("0")
 
     def _schedule_job_poll(self, delay_ms: int = 100) -> None:
         if self._destroyed or self._poll_after_id is not None:
@@ -391,6 +506,7 @@ class TorqueCalibrationApp:
                 raise TimeoutError("Servo telemetry became stale")
         except Exception as exc:
             self.session = None
+            self._reset_speed_commands()
             self._health_error = exc
             self._set_busy(True, "Hardware communication lost; disconnecting...")
             self._run_worker(
@@ -403,6 +519,7 @@ class TorqueCalibrationApp:
         if kind in {"connect", "capture"}:
             self.session = None
             self._pending_session = None
+            self._reset_speed_commands()
 
         if self._close_requested:
             self._begin_shutdown_cleanup()
@@ -489,6 +606,7 @@ class TorqueCalibrationApp:
         session = self.session
         self.session = None
         self._pending_session = None
+        self._reset_speed_commands()
         if session is None:
             self._set_busy(False, "Disconnected")
             return
@@ -506,6 +624,12 @@ class TorqueCalibrationApp:
         session = self.session
         if session is None or not session.connected:
             messagebox.showerror("Capture point", "Connect both devices first")
+            return
+        if any(self._speed_command_values.values()):
+            messagebox.showerror(
+                "Capture point",
+                "Stop all motors before capturing a calibration point",
+            )
             return
         try:
             force_n = float(self.force_var.get())
@@ -613,6 +737,39 @@ class TorqueCalibrationApp:
             kind="save",
         )
 
+    def _set_motor_speed(self, servo_id: int, speed: int) -> None:
+        if self.busy or self._close_requested:
+            return
+        session = self.session
+        if session is None or not session.connected:
+            messagebox.showerror("Motor speed", "Connect both devices first")
+            return
+        try:
+            session.check_health()
+            session.submit_speed_to_servos({int(servo_id): int(speed)})
+        except Exception as exc:
+            messagebox.showerror("Motor speed", str(exc))
+            return
+        self._speed_command_values[int(servo_id)] = int(speed)
+        self.speed_command_vars[int(servo_id)].set(str(int(speed)))
+        self._update_speed_controls()
+
+    def _stop_all_motors(self) -> None:
+        if self.busy or self._close_requested:
+            return
+        session = self.session
+        if session is None or not session.connected:
+            messagebox.showerror("Motor speed", "Connect both devices first")
+            return
+        try:
+            session.check_health()
+            session.submit_speed_to_servos({servo_id: 0 for servo_id in SERVO_IDS})
+        except Exception as exc:
+            messagebox.showerror("Motor speed", str(exc))
+            return
+        self._reset_speed_commands()
+        self._update_speed_controls()
+
     def _handle_connected(self, session: ServoHardwareSession) -> None:
         self.session = session
         self._pending_session = None
@@ -654,6 +811,7 @@ class TorqueCalibrationApp:
         self._closing_session = self.session or self._pending_session
         self.session = None
         self._pending_session = None
+        self._reset_speed_commands()
         self._set_busy(True, "Closing...")
         self._begin_shutdown_cleanup()
 

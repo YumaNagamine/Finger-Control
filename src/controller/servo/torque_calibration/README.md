@@ -11,8 +11,11 @@ set PYTHONPATH=src
 python -m controller.servo.torque_calibration
 ```
 
-The GUI does not send movement commands. It reads synchronized Servo and
+The calibration workflow does not send movement commands. It reads synchronized Servo and
 AS5048A telemetry, while the force-gauge value is entered manually in newtons.
+The `Motor speed` tab can send raw speed commands of `-500`, `-300`, `-100`,
+`0` (stop), `+100`, `+300`, and `+500` to an individual motor, or stop all
+motors at once. Stop all motors before capturing a calibration point.
 For each selected Servo ID:
 
 1. Hold the measured force steadily.
