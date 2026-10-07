@@ -5,14 +5,21 @@ from __future__ import annotations
 
 TENDONS = ("FDP", "FDS", "ED", "DI", "PI", "LUM")
 
-# GUI motor order for servo IDs 0-5 is LU, PI, ED, DI, FDS, FDP.
-# Controller name LUM corresponds to the GUI label LU; ED is already the GUI label.
+# Current ServoHardwareAPI uses physical STS3215 IDs 1-6.  Keep this mapping
+# independent of GUI row order and legacy internal indexes.
 TENDON_TO_SERVO_ID = {
-    "FDP": 5,
-    "FDS": 4,
-    "ED": 2,
-    "DI": 3,
-    "PI": 1,
-    "LUM": 0,
+    "FDP": 4,
+    "FDS": 3,
+    "ED": 1,
+    "DI": 2,
+    "PI": 6,
+    "LUM": 5,
 }
 SERVO_IDS_BY_TENDON = tuple(TENDON_TO_SERVO_ID[tendon] for tendon in TENDONS)
+
+# Names and encoder channels in physical-ID order used by the current API.
+SERVO_IDS = (1, 2, 3, 4, 5, 6)
+SERVO_NAMES_BY_ID = ("ED", "DI", "FDS", "FDP", "LUM", "PI")
+ENCODER_SENSOR_IDS_BY_SERVO_ID = {
+    servo_id: servo_id for servo_id in SERVO_IDS
+}
