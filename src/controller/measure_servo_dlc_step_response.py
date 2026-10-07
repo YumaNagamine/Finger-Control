@@ -11,11 +11,11 @@ import argparse
 import csv
 import json
 import math
-import queue
 import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import median
@@ -25,7 +25,15 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
     sys.path.append(str(SRC_ROOT))
 
-from controller.servo_mapping import SERVO_IDS_BY_TENDON, TENDONS
+from controller.csv_player.speed_controller import SpeedControlConfig, SpeedController
+from controller.servo.hardware_session import HardwareFeedback, ServoHardwareSession
+from controller.servo_mapping import (
+    ENCODER_SENSOR_IDS_BY_SERVO_ID,
+    SERVO_IDS as PHYSICAL_SERVO_IDS,
+    SERVO_IDS_BY_TENDON,
+    SERVO_NAMES_BY_ID,
+    TENDONS,
+)
 from controller.step_response_analysis import (
     TimedScalar,
     TimedServoSample,
@@ -40,12 +48,6 @@ from observation.vision.realtime_joint_angle_source import (
     JointAngleMeasurement,
     RealtimeJointAngleSource,
 )
-from servo.control import (
-    PositionControlConfig,
-    ReliablePositionController,
-    TelemetryMonitor,
-    TelemetrySnapshot,
-)
 from utils.config_loader import load_config
 from utils.path_utils import resolve_path
 
@@ -53,6 +55,53 @@ from utils.path_utils import resolve_path
 PROJECT_ROOT = SRC_ROOT.parent
 DEFAULT_CONFIG_PATH = SRC_ROOT / "controller" / "config_dlc_excursion_feedback.json"
 SERVO_IDS = SERVO_IDS_BY_TENDON
+
+
+@dataclass(frozen=True)
+class TelemetrySnapshot:
+    """Recorded servo telemetry indexed by physical servo ID.
+
+    The old analysis code indexes ``positions[servo_id]``.  Keeping a padded
+    physical-ID array here lets the existing analysis and CSV schema survive
+    the migration from the removed legacy ``servo.control`` package.
+    """
+
+    sequence: int
+    received_at: float
+    timestamp_ms: int | None
+    positions: tuple[float, ...]
+    speeds: tuple[float, ...] | None
+    loads: tuple[float, ...]
+
+
+def _feedback_to_snapshot(
+    session: ServoHardwareSession,
+    feedback: HardwareFeedback,
+    sequence: int,
+) -> TelemetrySnapshot:
+    size = max(PHYSICAL_SERVO_IDS) + 1
+    positions = [0.0] * size
+    speeds = [0.0] * size
+    loads = [0.0] * size
+    telemetry = feedback.servo
+    for servo_id in PHYSICAL_SERVO_IDS:
+        index = session.system.index_for_servo_id(servo_id)
+        positions[servo_id] = float(telemetry["positions"][index])
+        loads[servo_id] = float(telemetry["loads"][index])
+        if telemetry.get("speeds") is not None:
+            speeds[servo_id] = float(telemetry["speeds"][index])
+    return TelemetrySnapshot(
+        sequence=sequence,
+        received_at=feedback.servo_received_at,
+        timestamp_ms=(
+            None
+            if telemetry.get("device_ms") is None
+            else int(telemetry["device_ms"])
+        ),
+        positions=tuple(positions),
+        speeds=tuple(speeds),
+        loads=tuple(loads),
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -75,6 +124,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--observation-timeout-s", type=float)
     parser.add_argument("--baseline-sample-count", type=int)
+    parser.add_argument("--control-frequency-hz", type=float)
     parser.add_argument("--servo-onset-threshold-count", type=float)
     parser.add_argument("--joint-onset-threshold-deg", type=float)
     parser.add_argument("--consecutive-detection-count", type=int)
@@ -104,7 +154,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="Send one command to the physical servo. Without this flag, dry-run only.",
+        help="Run the speed-control step on the physical servo. Without this flag, dry-run only.",
     )
     return parser.parse_args(argv)
 
@@ -150,6 +200,9 @@ def resolve_analysis_args(
     defaults = {
         "observation_timeout_s": step_response.get("observation_timeout_s"),
         "baseline_sample_count": step_response.get("baseline_sample_count"),
+        # This is deliberately independent from the legacy 5 Hz DLC feedback
+        # loop in ``control.frequency_hz``.
+        "control_frequency_hz": step_response.get("control_frequency_hz", 50.0),
         "servo_onset_threshold_count": detection.get(
             "servo_onset_threshold_count"
         ),
@@ -192,45 +245,27 @@ def _make_angle_source(config: dict) -> RealtimeJointAngleSource:
     )
 
 
-def _make_position_controller(
-    api,
-    telemetry: TelemetryMonitor,
-    config: dict,
-    position_limits: Sequence[tuple[int, int]],
-) -> ReliablePositionController:
-    hardware = config["hardware"]
-    safety = config["safety"]
-    return ReliablePositionController(
-        api,
-        telemetry,
-        PositionControlConfig(
-            telemetry_stale_s=float(safety["telemetry_stale_s"]),
-            telemetry_wait_s=float(hardware["telemetry_wait_s"]),
-            id_map_reset_wait_s=0.1,
-            speed_init_wait_s=float(hardware["prepare_wait_s"]),
-            prime_command_count=int(hardware["prime_command_count"]),
-            prime_interval_s=float(hardware["prime_wait_s"]),
-            start_observation_s=0.3,
-            start_min_delta=3,
-            position_tolerance=int(hardware["return_tolerance"]),
-            speed_tolerance=5,
-            stable_frame_count=3,
-            arrival_timeout_s=float(hardware["telemetry_wait_s"]),
-            max_start_retries=1,
-            reset_id_map_on_prepare=True,
-            multiturn=bool(hardware["multiturn"]),
-            position_min=min(value[0] for value in position_limits),
-            position_max=max(value[1] for value in position_limits),
-        ),
+def _make_speed_controller(config: dict) -> SpeedController:
+    step_response = config.get("step_response", {})
+    speed_control = step_response.get("speed_control", {})
+    if not isinstance(speed_control, dict):
+        raise ValueError("step_response.speed_control must be an object")
+    return SpeedController(
+        SpeedControlConfig(
+            kp=float(speed_control.get("kp", 0.5)),
+            max_speed=int(speed_control.get("max_speed", 500)),
+            max_acceleration=float(speed_control.get("max_acceleration", 3000.0)),
+            position_deadband=float(speed_control.get("position_deadband", 3.0)),
+        )
     )
 
 
 class TelemetryRecorder:
-    """Drain a TelemetryMonitor subscription without reading the serial port."""
+    """Record fresh project-level telemetry without reading the serial port."""
 
-    def __init__(self, telemetry: TelemetryMonitor) -> None:
-        self._telemetry = telemetry
-        self._subscription: queue.Queue[TelemetrySnapshot | None] | None = None
+    def __init__(self, session: ServoHardwareSession, *, max_age_s: float) -> None:
+        self._session = session
+        self._max_age_s = float(max_age_s)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.records: list[TelemetrySnapshot] = []
@@ -239,7 +274,6 @@ class TelemetryRecorder:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("TelemetryRecorder has already been started")
-        self._subscription = self._telemetry.subscribe()
         self._thread = threading.Thread(
             target=self._run,
             name="step-response-telemetry-recorder",
@@ -248,23 +282,25 @@ class TelemetryRecorder:
         self._thread.start()
 
     def stop(self) -> None:
-        subscription = self._subscription
-        if subscription is None:
+        if self._thread is None:
             return
-        self._telemetry.unsubscribe(subscription)
-        subscription.put(None)
+        self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        self._subscription = None
+        self._thread = None
 
     def _run(self) -> None:
-        assert self._subscription is not None
+        last_received_at: float | None = None
+        sequence = 0
         try:
             while not self._stop.is_set():
-                snapshot = self._subscription.get()
-                if snapshot is None:
-                    return
-                self.records.append(snapshot)
+                self._session.check_health()
+                feedback = self._session.latest_feedback(self._max_age_s)
+                if feedback is not None and feedback.servo_received_at != last_received_at:
+                    sequence += 1
+                    self.records.append(_feedback_to_snapshot(self._session, feedback, sequence))
+                    last_received_at = feedback.servo_received_at
+                self._stop.wait(0.001)
         except Exception as exc:
             self.error = exc
 
@@ -310,39 +346,39 @@ def _read_baseline(
 
 
 def _return_to_start(
-    controller: ReliablePositionController,
-    telemetry: TelemetryMonitor,
-    start_positions: Sequence[int],
+    session: ServoHardwareSession,
+    start_positions: dict[int, float],
+    speed_controller: SpeedController,
     config: dict,
+    control_frequency_hz: float,
 ) -> float:
     hardware = config["hardware"]
     safety = config["safety"]
     return_requested_at = time.monotonic()
-    controller.stream_positions(
-        SERVO_IDS,
-        start_positions,
-        time_ms=int(hardware["return_time_ms"]),
-    )
+    speed_controller.reset()
     deadline = return_requested_at + float(hardware["return_timeout_s"])
     tolerance = int(hardware["return_tolerance"])
-    sequence = 0
-    latest = telemetry.latest(float(safety["telemetry_stale_s"]))
-    if latest is not None:
-        sequence = latest.sequence
+    period_s = 1.0 / float(control_frequency_hz)
+    previous_at = return_requested_at
     while time.monotonic() < deadline:
-        remaining_s = deadline - time.monotonic()
-        if remaining_s <= 0.0:
-            break
-        try:
-            latest = telemetry.wait_for_newer(sequence, min(0.25, remaining_s))
-        except TimeoutError:
-            continue
-        sequence = latest.sequence
+        feedback = session.wait_for_feedback(
+            min(period_s, max(0.01, deadline - time.monotonic())),
+            require_encoder=False,
+        )
+        actual_positions = session.position_by_servo_id(feedback)
+        now = time.monotonic()
+        dt_s = max(1e-3, now - previous_at)
+        previous_at = now
+        speeds = speed_controller.update(start_positions, actual_positions, dt_s)
+        session.submit_speed_to_servos(speeds)
         if all(
-            abs(target - latest.positions[servo_id]) <= tolerance
-            for servo_id, target in zip(SERVO_IDS, start_positions)
+            abs(start_positions[servo_id] - actual_positions[servo_id]) <= tolerance
+            for servo_id in start_positions
         ):
+            session.stop_servos()
             return return_requested_at
+        time.sleep(min(period_s, max(0.0, deadline - time.monotonic())))
+    session.stop_servos()
     raise TimeoutError("Servos did not return to the initial positions before timeout")
 
 
@@ -671,6 +707,8 @@ def _validate_measurement_args(args: argparse.Namespace) -> None:
         )
     if args.observation_timeout_s <= 0.0:
         raise ValueError("--observation-timeout-s must be positive")
+    if not math.isfinite(args.control_frequency_hz) or args.control_frequency_hz <= 0.0:
+        raise ValueError("--control-frequency-hz must be finite and positive")
     if args.baseline_sample_count <= 0:
         raise ValueError("--baseline-sample-count must be positive")
     if args.consecutive_detection_count <= 0 or args.settling_consecutive_count <= 0:
@@ -713,7 +751,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     dry_positions = tuple(int(value) for value in config["hardware"]["dry_run_start_positions"])
     if len(dry_positions) != len(TENDONS):
         raise ValueError("hardware.dry_run_start_positions must contain six values")
-    dry_target = dry_positions[servo_id] + direction * args.position_step_count
+    dry_start_position = dry_positions[tendon_index]
+    dry_target = dry_start_position + direction * args.position_step_count
     if not position_limits[tendon_index][0] <= dry_target <= position_limits[tendon_index][1]:
         raise ValueError(f"dry-run target {dry_target} is outside {args.tendon} position limits")
 
@@ -733,16 +772,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         else bool(args.return_to_start)
     )
     metadata: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "trial_id": trial_id,
         "tendon": args.tendon,
         "servo_id": servo_id,
+        "servo_ids": list(PHYSICAL_SERVO_IDS),
+        "telemetry_indexing": "physical_id_padded",
         "movement_direction": args.movement_direction,
         "position_step_count": args.position_step_count,
+        "command_mode": "speed_control",
+        "control_frequency_hz": args.control_frequency_hz,
         "start_position": None,
         "target_position": None,
         "command_requested_at": None,
         "commanded_at": None,
+        "command_sequence": None,
+        "command_write_duration_s": None,
         "return_requested_at": None,
         "return_to_start": return_to_start,
         "config_path": str(config_path),
@@ -752,7 +797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "analysis": None,
     }
     if not args.execute:
-        metadata["start_position"] = dry_positions[servo_id]
+        metadata["start_position"] = dry_start_position
         metadata["target_position"] = dry_target
         metadata["completion_reason"] = "dry_run"
         _save_trial(
@@ -770,47 +815,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     angle_source = _make_angle_source(config)
-    api = None
-    telemetry: TelemetryMonitor | None = None
+    hardware_session: ServoHardwareSession | None = None
     recorder: TelemetryRecorder | None = None
-    controller: ReliablePositionController | None = None
+    speed_controller = _make_speed_controller(config)
     measurements: list[JointAngleMeasurement] = []
-    start_positions: tuple[int, ...] | None = None
+    start_positions: dict[int, float] | None = None
     command_requested_at: float | None = None
     commanded_at: float | None = None
     return_requested_at: float | None = None
     error_text: str | None = None
     stop_sent = False
-    tracking_counts = [0] * len(SERVO_IDS)
+    tracking_counts = {servo: 0 for servo in PHYSICAL_SERVO_IDS}
 
     try:
         angle_source.open()
         angle_source.warm_up(int(config["vision"]["warmup_frames"]))
-        from servo.servo_APIs import ServoAPI
-
         hardware = config["hardware"]
-        api = ServoAPI(
-            port=str(hardware["serial_port"]),
-            baud_rate=int(hardware["baud_rate"]),
-            timeout=float(hardware["serial_timeout_s"]),
+        safety = config["safety"]
+        hardware_session = ServoHardwareSession(
+            servo_ids=tuple(PHYSICAL_SERVO_IDS),
+            servo_names=tuple(SERVO_NAMES_BY_ID),
+            encoder_sensor_ids=tuple(
+                ENCODER_SENSOR_IDS_BY_SERVO_ID[servo]
+                for servo in PHYSICAL_SERVO_IDS
+            ),
+            servo_port=str(hardware["serial_port"]),
+            encoder_port=(
+                None
+                if hardware.get("encoder_port") in (None, "")
+                else str(hardware["encoder_port"])
+            ),
+            baudrate=int(hardware["baud_rate"]),
+            serial_timeout_s=float(hardware["serial_timeout_s"]),
         )
-        telemetry = TelemetryMonitor(
-            api,
-            num_servos=len(TENDONS),
-            read_timeout_s=float(hardware["serial_timeout_s"]),
+        hardware_session.connect(
+            startup_timeout_s=float(hardware["telemetry_wait_s"]),
         )
-        controller = _make_position_controller(api, telemetry, config, position_limits)
-        telemetry.start()
-        recorder = TelemetryRecorder(telemetry)
+        recorder = TelemetryRecorder(
+            hardware_session,
+            max_age_s=float(safety["telemetry_stale_s"]),
+        )
         recorder.start()
-        controller.prepare(
-            SERVO_IDS,
-            force_init_servo_ids=tuple(range(len(TENDONS))),
-        )
         angle_source.reset_temporal_history()
         angle_source.warm_up(int(config["vision"]["warmup_frames"]))
-        start_positions = tuple(controller.current_position(servo) for servo in SERVO_IDS)
-        start_position = start_positions[tendon_index]
+        latest_feedback = hardware_session.wait_for_feedback(
+            float(hardware["telemetry_wait_s"])
+        )
+        start_positions = hardware_session.position_by_servo_id(latest_feedback)
+        start_position = start_positions[servo_id]
         target_position = start_position + direction * args.position_step_count
         if not position_limits[tendon_index][0] <= target_position <= position_limits[tendon_index][1]:
             raise ValueError(f"target {target_position} is outside {args.tendon} position limits")
@@ -823,48 +875,78 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_s=args.observation_timeout_s,
             start_frame_index=0,
         )
-        latest = telemetry.latest(float(config["safety"]["telemetry_stale_s"]))
-        if latest is None:
-            raise RuntimeError("Fresh telemetry is not available before command")
         if not _measurement_is_usable(measurements[-1]):
             raise RuntimeError("DLC observation is not valid before command")
-
-        command_requested_at = time.monotonic()
-        stream_result = controller.stream_positions(
-            (servo_id,),
-            (target_position,),
-            time_ms=int(config["control"].get("stream_time_ms", 0)),
+        # Use a servo sample captured immediately before the first speed
+        # command; the sample used to determine the initial target may now be
+        # stale because baseline vision acquisition takes time.
+        latest_feedback = hardware_session.wait_for_feedback(
+            float(safety["telemetry_stale_s"])
         )
-        commanded_at = stream_result.commanded_at
+
+        target_positions = {servo_id: float(target_position)}
+        speed_controller.reset()
+        control_period_s = 1.0 / float(args.control_frequency_hz)
+        previous_control_at = time.monotonic()
+        command_requested_at = time.monotonic()
+        initial_speeds = speed_controller.update(
+            target_positions,
+            hardware_session.position_by_servo_id(latest_feedback),
+            control_period_s,
+        )
+        command_ticket = hardware_session.submit_speed_to_servos(initial_speeds)
+        receipt = command_ticket.wait(
+            max(0.5, 2.0 * float(hardware["serial_timeout_s"]))
+        )
+        if receipt.status != "sent" or receipt.write_finished_at is None:
+            raise RuntimeError(
+                f"Initial speed command was not sent: {receipt.status}"
+            )
+        commanded_at = receipt.write_finished_at
         metadata["command_requested_at"] = command_requested_at
         metadata["commanded_at"] = commanded_at
+        metadata["command_sequence"] = receipt.sequence
+        metadata["command_write_duration_s"] = receipt.write_duration_s
 
         response_deadline = command_requested_at + args.observation_timeout_s
         tracking_limit = int(config["safety"]["tracking_error_limit"])
         tracking_cycles = int(config["safety"]["tracking_error_cycles"])
-        expected_targets = list(start_positions)
-        expected_targets[tendon_index] = target_position
-        last_tracking_sequence = stream_result.telemetry_sequence
+        expected_targets = dict(start_positions)
+        expected_targets[servo_id] = float(target_position)
+        last_tracking_received_at: float | None = None
+        next_control_at = commanded_at + control_period_s
         while time.monotonic() < response_deadline:
-            telemetry.raise_if_failed()
-            tracking_snapshot = telemetry.latest(
+            hardware_session.check_health()
+            tracking_feedback = hardware_session.latest_feedback(
                 float(config["safety"]["telemetry_stale_s"])
             )
-            if tracking_snapshot is None:
+            if tracking_feedback is None:
                 raise RuntimeError("Telemetry became stale during response observation")
-            if tracking_snapshot.sequence > last_tracking_sequence:
-                last_tracking_sequence = tracking_snapshot.sequence
-                for index, servo in enumerate(SERVO_IDS):
-                    error = expected_targets[index] - tracking_snapshot.positions[servo]
+            if tracking_feedback.servo_received_at != last_tracking_received_at:
+                last_tracking_received_at = tracking_feedback.servo_received_at
+                actual_positions = hardware_session.position_by_servo_id(tracking_feedback)
+                for servo in PHYSICAL_SERVO_IDS:
+                    error = expected_targets[servo] - actual_positions[servo]
                     if abs(error) > tracking_limit:
-                        tracking_counts[index] += 1
+                        tracking_counts[servo] += 1
                     else:
-                        tracking_counts[index] = 0
-                    if tracking_counts[index] >= tracking_cycles:
+                        tracking_counts[servo] = 0
+                    if tracking_counts[servo] >= tracking_cycles:
                         raise RuntimeError(
-                            f"Servo {servo} tracking error {error:+d} exceeded "
-                            f"{tracking_limit} for {tracking_counts[index]} telemetry samples"
+                            f"Servo {servo} tracking error {error:+.0f} exceeded "
+                            f"{tracking_limit} for {tracking_counts[servo]} telemetry samples"
                         )
+            now = time.monotonic()
+            if now >= next_control_at:
+                dt_s = max(1e-3, now - previous_control_at)
+                previous_control_at = now
+                speeds = speed_controller.update(
+                    target_positions,
+                    hardware_session.position_by_servo_id(tracking_feedback),
+                    dt_s,
+                )
+                hardware_session.submit_speed_to_servos(speeds)
+                next_control_at = now + control_period_s
             measurement = angle_source.read(next_frame_index)
             next_frame_index += 1
             measurements.append(measurement)
@@ -875,13 +957,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if return_to_start:
             return_requested_at = _return_to_start(
-                controller,
-                telemetry,
+                hardware_session,
                 start_positions,
+                speed_controller,
                 config,
+                args.control_frequency_hz,
             )
             metadata["return_requested_at"] = return_requested_at
-        controller.stop_all()
+        hardware_session.stop_servos()
         stop_sent = True
         metadata["completion_reason"] = "observation_complete"
     except KeyboardInterrupt:
@@ -889,20 +972,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         error_text = f"{type(exc).__name__}: {exc}"
     finally:
-        if error_text is not None and controller is not None:
+        if error_text is not None and hardware_session is not None:
             try:
-                controller.stop_all()
+                hardware_session.stop_servos()
                 stop_sent = True
             except Exception as exc:
-                error_text += f"; stop_all failed: {exc}"
+                error_text += f"; stop_servos failed: {exc}"
         if recorder is not None:
             recorder.stop()
             if recorder.error is not None and error_text is None:
                 error_text = f"Telemetry recorder failed: {recorder.error}"
-        if telemetry is not None:
-            telemetry.stop()
-        if api is not None:
-            api.close()
+        if hardware_session is not None:
+            hardware_session.close()
         angle_source.close()
 
     if recorder is not None and recorder.error is not None and error_text is None:

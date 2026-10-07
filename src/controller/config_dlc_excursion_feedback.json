@@ -46,6 +46,13 @@
   },
   "step_response": {
     "observation_timeout_s": 5.0,
+    "control_frequency_hz": 50.0,
+    "speed_control": {
+      "kp": 0.5,
+      "max_speed": 500,
+      "max_acceleration": 3000.0,
+      "position_deadband": 3.0
+    },
     "baseline_sample_count": 20,
     "detection": {
       "servo_onset_threshold_count": 3.0,
