@@ -28,7 +28,7 @@ DEFAULT_CALIBRATION_DIR = API_ROOT / "calibration" / "current"
 SERVO_IDS = tuple(range(1, 7))
 SERVO_NAMES_BY_ID = ("ED", "DI", "FDS", "FDP", "LU", "PI")
 MAX_POINTS_PER_SERVO = 1000
-SPEED_PRESETS = (-500, -300, -100, 100, 300, 500)
+SPEED_PRESETS = (-500, -300, -100, 0, 100, 300, 500)
 
 
 class TorqueCalibrationApp:
@@ -284,7 +284,7 @@ class TorqueCalibrationApp:
             for speed in SPEED_PRESETS:
                 button = ttk.Button(
                     button_frame,
-                    text=f"{speed:+d}",
+                    text="0" if speed == 0 else f"{speed:+d}",
                     width=6,
                     command=lambda sid=servo_id, value=speed: self._set_motor_speed(
                         sid, value
@@ -292,14 +292,6 @@ class TorqueCalibrationApp:
                 )
                 button.pack(side="left", padx=1)
                 buttons.append(button)
-            stop_button = ttk.Button(
-                button_frame,
-                text="STOP",
-                width=6,
-                command=lambda sid=servo_id: self._set_motor_speed(sid, 0),
-            )
-            stop_button.pack(side="left", padx=(5, 1))
-            buttons.append(stop_button)
             self._speed_buttons[servo_id] = buttons
 
         self.stop_all_speed_button = ttk.Button(
