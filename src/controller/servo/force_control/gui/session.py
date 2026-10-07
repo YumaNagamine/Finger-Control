@@ -41,6 +41,8 @@ class GuiForceConfig:
     min_target_force_n: float
     max_target_force_n: float
     target_force_levels_n: tuple
+    target_force_levels_by_tendon: Dict[str, tuple]
+    hard_force_limits_n_by_tendon: Dict[str, float]
     ramp_duration_s: float
     control_hz: float
     encoder_rate_hz: float
@@ -60,7 +62,7 @@ def _finite_number(value: Any, field_name: str) -> float:
 
 
 def load_gui_force_config(path: Path = DEFAULT_FORCE_CONFIG_PATH) -> GuiForceConfig:
-    """Load and validate the fixed target levels used by the GUI."""
+    """Load and validate the tendon-specific target levels used by the GUI."""
 
     with Path(path).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -73,14 +75,55 @@ def load_gui_force_config(path: Path = DEFAULT_FORCE_CONFIG_PATH) -> GuiForceCon
     if minimum < 0.0 or minimum >= maximum:
         raise ValueError("min_target_force_n must be non-negative and below max_target_force_n")
 
-    levels_value = default.get("target_force_levels_n")
-    if not isinstance(levels_value, list) or not levels_value:
-        raise ValueError("target_force_levels_n must be a non-empty list")
-    levels = tuple(_finite_number(value, "target_force_levels_n") for value in levels_value)
-    if tuple(sorted(set(levels))) != levels:
-        raise ValueError("target_force_levels_n must be strictly increasing")
-    if levels[0] < minimum or levels[-1] > maximum:
-        raise ValueError("target_force_levels_n must be inside the target force range")
+    levels_by_tendon_value = default.get("target_force_levels_n_by_tendon")
+    if levels_by_tendon_value is None:
+        levels_value = default.get("target_force_levels_n")
+        if not isinstance(levels_value, list) or not levels_value:
+            raise ValueError("target_force_levels_n must be a non-empty list")
+        levels_by_tendon_value = {
+            tendon: levels_value for tendon in SERVO_NAMES
+        }
+    if not isinstance(levels_by_tendon_value, dict):
+        raise ValueError("target_force_levels_n_by_tendon must be an object")
+
+    levels_by_tendon = {}
+    for tendon in SERVO_NAMES:
+        levels_value = levels_by_tendon_value.get(tendon)
+        if not isinstance(levels_value, list) or not levels_value:
+            raise ValueError(
+                f"target_force_levels_n_by_tendon[{tendon}] must be a non-empty list"
+            )
+        levels = tuple(
+            _finite_number(value, f"target_force_levels_n_by_tendon[{tendon}]")
+            for value in levels_value
+        )
+        if tuple(sorted(set(levels))) != levels:
+            raise ValueError(
+                f"target_force_levels_n_by_tendon[{tendon}] must be strictly increasing"
+            )
+        if levels[0] < minimum or levels[-1] > maximum:
+            raise ValueError(
+                f"target_force_levels_n_by_tendon[{tendon}] must be inside the target force range"
+            )
+        levels_by_tendon[tendon] = levels
+    levels = tuple(sorted(set(value for values in levels_by_tendon.values() for value in values)))
+
+    hard_limits_value = default.get("hard_force_limits_n_by_tendon")
+    if not isinstance(hard_limits_value, dict):
+        raise ValueError("hard_force_limits_n_by_tendon must be an object")
+    hard_limits_by_tendon = {}
+    for tendon in SERVO_NAMES:
+        if tendon not in hard_limits_value:
+            raise ValueError(f"hard_force_limits_n_by_tendon must define {tendon}")
+        hard_limit = _finite_number(
+            hard_limits_value[tendon],
+            f"hard_force_limits_n_by_tendon[{tendon}]",
+        )
+        if hard_limit <= max(levels_by_tendon[tendon]):
+            raise ValueError(
+                f"hard_force_limits_n_by_tendon[{tendon}] must be above its maximum target"
+            )
+        hard_limits_by_tendon[tendon] = hard_limit
 
     ramp_duration = _finite_number(default.get("ramp_duration_s"), "ramp_duration_s")
     control_hz = _finite_number(default.get("control_hz"), "control_hz")
@@ -97,6 +140,8 @@ def load_gui_force_config(path: Path = DEFAULT_FORCE_CONFIG_PATH) -> GuiForceCon
         min_target_force_n=minimum,
         max_target_force_n=maximum,
         target_force_levels_n=levels,
+        target_force_levels_by_tendon=levels_by_tendon,
+        hard_force_limits_n_by_tendon=hard_limits_by_tendon,
         ramp_duration_s=ramp_duration,
         control_hz=control_hz,
         encoder_rate_hz=encoder_rate_hz,
@@ -186,6 +231,7 @@ class ForceControlSession:
         self._armed = False
         self._running = False
         self._faulted = False
+        self._last_fault_message: Optional[str] = None
         self._servo = None
         self._encoder = None
         self._servo_transport = None
@@ -201,6 +247,7 @@ class ForceControlSession:
         self._manual_speed_commands: Dict[int, int] = {
             servo_id: 0 for servo_id in SERVO_IDS
         }
+        self._manual_feedback_recovering = False
         self._last_parameters: Optional[dict] = None
         self._calibration_dir = DEFAULT_CALIBRATION_DIR
         self._zero_offset_path = DEFAULT_ZERO_OFFSET_FILE
@@ -225,6 +272,16 @@ class ForceControlSession:
     def faulted(self) -> bool:
         with self._lock:
             return self._faulted
+
+    @property
+    def fault_message(self) -> Optional[str]:
+        with self._lock:
+            return self._last_fault_message
+
+    @property
+    def manual_feedback_recovering(self) -> bool:
+        with self._lock:
+            return self._manual_feedback_recovering
 
     def _emit(self, message: str) -> None:
         self._event_queue.put(message)
@@ -537,10 +594,12 @@ class ForceControlSession:
                 self._manual_speed_commands = {
                     servo_id: 0 for servo_id in SERVO_IDS
                 }
+                self._manual_feedback_recovering = False
                 self._connected = True
                 self._armed = False
                 self._running = False
                 self._faulted = False
+                self._last_fault_message = None
                 self._last_parameters = None
 
             self._emit("Feedback connected; capturing stable initial force...")
@@ -595,6 +654,8 @@ class ForceControlSession:
                 self._manual_speed_commands = {
                     servo_id: 0 for servo_id in SERVO_IDS
                 }
+                self._manual_feedback_recovering = False
+                self._last_fault_message = None
                 self._stop_event = threading.Event()
             raise
 
@@ -676,8 +737,14 @@ class ForceControlSession:
                 raise RuntimeError("Stop control before capturing a new baseline")
         values: Dict[int, List[float]] = {servo_id: [] for servo_id in SERVO_IDS}
         deadline = time.monotonic() + max(0.1, float(duration_s))
+        last_error: Optional[Exception] = None
         while time.monotonic() < deadline:
-            feedback = self._feedback()
+            try:
+                feedback = self._feedback()
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.01)
+                continue
             for servo_id, item in feedback.items():
                 values[servo_id].append(item["force_n"])
             time.sleep(0.01)
@@ -685,6 +752,10 @@ class ForceControlSession:
         with self._lock:
             for servo_id, samples in values.items():
                 if not samples:
+                    if last_error is not None:
+                        raise RuntimeError(
+                            f"Unable to capture baseline for servo {servo_id}: {last_error}"
+                        ) from last_error
                     raise RuntimeError(f"No baseline samples for servo {servo_id}")
                 baseline = float(median(samples))
                 baselines[servo_id] = baseline
@@ -706,15 +777,44 @@ class ForceControlSession:
         ki: float,
         kd: float,
         max_speed: float,
-        hard_force_limit_n: float,
         control_sign: float,
+        hard_force_limit_n: Optional[float] = None,
+        hard_force_limits_n: Optional[Dict[str, float]] = None,
     ) -> None:
         if not self.connected:
             raise RuntimeError("Connect before arming")
-        if max_speed <= 0.0 or hard_force_limit_n <= 0.0:
-            raise ValueError("max_speed and hard_force_limit_n must be greater than zero")
-        if hard_force_limit_n <= self.config.max_target_force_n:
-            raise ValueError("hard_force_limit_n must be above the maximum target force")
+        if self.manual_feedback_recovering:
+            raise RuntimeError("Wait for feedback recovery before arming")
+        with self._lock:
+            if max_speed <= 0.0:
+                raise ValueError("max_speed must be greater than zero")
+            if hard_force_limits_n is None:
+                if hard_force_limit_n is None or hard_force_limit_n <= 0.0:
+                    raise ValueError("hard force limits must be greater than zero")
+                limits_by_tendon = {
+                    tendon: float(hard_force_limit_n) for tendon in SERVO_NAMES
+                }
+            else:
+                if not isinstance(hard_force_limits_n, dict):
+                    raise ValueError("hard_force_limits_n must be an object")
+                limits_by_tendon = {}
+                for tendon in SERVO_NAMES:
+                    if tendon not in hard_force_limits_n:
+                        raise ValueError(f"hard_force_limits_n must define {tendon}")
+                    limit = _finite_number(
+                        hard_force_limits_n[tendon],
+                        f"hard_force_limits_n[{tendon}]",
+                    )
+                    if limit <= 0.0:
+                        raise ValueError(
+                            f"hard_force_limits_n[{tendon}] must be greater than zero"
+                        )
+                    limits_by_tendon[tendon] = limit
+            for state in self._states.values():
+                if limits_by_tendon[state.tendon] <= state.target_force_n:
+                    raise ValueError(
+                        f"hard force limit for {state.tendon} must be above its selected target"
+                    )
         if control_sign not in (-1.0, 1.0):
             raise ValueError("control_sign must be either -1 or 1")
 
@@ -741,7 +841,7 @@ class ForceControlSession:
                     ForceControlConfig(
                         target_force_n=state.target_force_n,
                         max_speed=float(max_speed),
-                        hard_force_limit_n=float(hard_force_limit_n),
+                        hard_force_limit_n=limits_by_tendon[state.tendon],
                         min_target_force_n=self.config.min_target_force_n,
                         max_feedback_age_s=self.config.feedback_timeout_s,
                         control_sign=float(control_sign),
@@ -753,7 +853,7 @@ class ForceControlSession:
                 "ki": float(ki),
                 "kd": float(kd),
                 "max_speed": float(max_speed),
-                "hard_force_limit_n": float(hard_force_limit_n),
+                "hard_force_limits_n": dict(limits_by_tendon),
                 "control_sign": float(control_sign),
             }
             self._armed = True
@@ -837,6 +937,8 @@ class ForceControlSession:
                     raise RuntimeError("Connect before using speed control")
                 if self._armed or self._running:
                     raise RuntimeError("Stop force control before using speed control")
+                if self._manual_feedback_recovering:
+                    raise RuntimeError("Wait for feedback recovery before using speed control")
                 if servo_id not in self._states:
                     raise ValueError(f"Unknown servo ID: {servo_id}")
                 servo = self._servo
@@ -888,6 +990,8 @@ class ForceControlSession:
         while not self._stop_event.is_set():
             try:
                 feedback = self._feedback()
+                with self._lock:
+                    self._manual_feedback_recovering = False
                 now = time.monotonic()
                 with self._lock:
                     running = self._running
@@ -945,6 +1049,10 @@ class ForceControlSession:
                                 if servo_id in active_ids:
                                     servo.send_speed_by_id(servo_id, command)
             except Exception as exc:
+                if self._handle_manual_feedback_error(exc):
+                    next_tick = time.monotonic()
+                    self._stop_event.wait(period_s)
+                    continue
                 self._handle_fault(exc)
                 break
 
@@ -966,14 +1074,40 @@ class ForceControlSession:
         )
 
     def _handle_fault(self, exc: Exception) -> None:
+        message = str(exc)
         with self._lock:
             self._running = False
             self._armed = False
             self._faulted = True
+            self._last_fault_message = message
             for state in self._states.values():
                 state.active = False
         self._send_zero_all()
-        self._emit(f"FAULT: all servos stopped: {exc}")
+        self._emit(f"FAULT: all servos stopped: {message}")
+
+    def _handle_manual_feedback_error(self, exc: Exception) -> bool:
+        """Keep a connected, non-running session alive while feedback recovers."""
+
+        with self._lock:
+            force_control_active = self._running and self._armed
+            manual_speed_active = any(self._manual_speed_commands.values())
+            recovering = self._manual_feedback_recovering
+            if force_control_active or not self._connected:
+                return False
+            if manual_speed_active:
+                self._manual_speed_commands = {
+                    servo_id: 0 for servo_id in SERVO_IDS
+                }
+            self._manual_feedback_recovering = True
+
+        if manual_speed_active:
+            self._send_zero_all()
+            self._emit(
+                f"WARNING: manual speed stopped; waiting for feedback recovery: {exc}"
+            )
+        elif not recovering:
+            self._emit(f"WARNING: feedback unavailable; waiting for recovery: {exc}")
+        return True
 
     def _send_zero_all(self) -> None:
         with self._command_lock:
@@ -1034,6 +1168,8 @@ class ForceControlSession:
             self._manual_speed_commands = {
                 servo_id: 0 for servo_id in SERVO_IDS
             }
+            self._manual_feedback_recovering = False
+            self._last_fault_message = None
             self._stop_event = threading.Event()
         if was_connected:
             self._emit("Disconnected.")

@@ -68,7 +68,9 @@ class ForceControlApp(tk.Tk):
         self.ki_var = tk.StringVar(value="0.0")
         self.kd_var = tk.StringVar(value="0.0")
         self.max_speed_var = tk.StringVar(value="20.0")
-        self.hard_limit_var = tk.StringVar(value="3.0")
+        self.hard_limit_summary_var = tk.StringVar(
+            value=self._format_hard_limits(self.config_model.hard_force_limits_n_by_tendon)
+        )
         self.control_sign_var = tk.StringVar(value="1.0")
         for servo_id, tendon in zip(SERVO_IDS, SERVO_NAMES):
             self._row_vars[servo_id] = {
@@ -131,7 +133,14 @@ class ForceControlApp(tk.Tk):
         self._entry(parameters, "Ki", self.ki_var, 0, 2, width=8)
         self._entry(parameters, "Kd", self.kd_var, 0, 4, width=8)
         self._entry(parameters, "Max speed", self.max_speed_var, 0, 6, width=8)
-        self._entry(parameters, "Hard force limit N", self.hard_limit_var, 0, 8, width=10)
+        ttk.Label(parameters, text="Hard limits N").grid(
+            row=0, column=8, padx=(4, 2), pady=4, sticky="w"
+        )
+        ttk.Label(
+            parameters,
+            textvariable=self.hard_limit_summary_var,
+            width=30,
+        ).grid(row=0, column=9, padx=(0, 6), pady=4, sticky="w")
         self._entry(parameters, "Control sign", self.control_sign_var, 0, 10, width=8)
         self.arm_button = ttk.Button(parameters, text="Arm", command=self._arm, state="disabled")
         self.arm_button.grid(row=1, column=0, padx=4, pady=4, sticky="w")
@@ -154,7 +163,7 @@ class ForceControlApp(tk.Tk):
         )
         ttk.Label(
             parameters,
-            text="Targets: " + ", ".join(f"{value:g}" for value in self.config_model.target_force_levels_n) + " N",
+            text="Target presets: tendon-specific",
         ).grid(row=1, column=10, columnspan=2, padx=(12, 4), pady=4, sticky="w")
 
         controls = ttk.LabelFrame(control_tab, text="Per-tendon force control")
@@ -174,7 +183,7 @@ class ForceControlApp(tk.Tk):
             ttk.Label(controls, textvariable=variables["state"], width=14).grid(row=row, column=7, padx=4, pady=2)
             target_frame = ttk.Frame(controls)
             target_frame.grid(row=row, column=8, padx=4, pady=2, sticky="w")
-            for value in self.config_model.target_force_levels_n:
+            for value in self.config_model.target_force_levels_by_tendon[tendon]:
                 ttk.Button(
                     target_frame,
                     text=f"{value:g}",
@@ -201,7 +210,8 @@ class ForceControlApp(tk.Tk):
             axis.set_title(f"ID{servo_id} {tendon}")
             axis.set_xlabel("time (s)")
             axis.set_ylabel("force (N)")
-            axis.set_ylim(0.0, max(2.2, self.config_model.max_target_force_n * 1.2))
+            tendon_max = max(self.config_model.target_force_levels_by_tendon[tendon])
+            axis.set_ylim(0.0, max(2.2, tendon_max * 1.2))
             actual_line, = axis.plot([], [], "-", label="actual")
             target_line, = axis.plot([], [], "--", label="target")
             axis.legend(loc="upper left", fontsize=8)
@@ -209,6 +219,16 @@ class ForceControlApp(tk.Tk):
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.draw()
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+    @staticmethod
+    def _format_hard_limits(limits: dict) -> str:
+        grouped = {}
+        for tendon, limit in limits.items():
+            grouped.setdefault(float(limit), []).append(tendon)
+        return " | ".join(
+            f"{'/'.join(tendons)} {limit:g}N"
+            for limit, tendons in grouped.items()
+        )
 
     def _build_speed_widgets(self, parent) -> None:
         parent.columnconfigure(0, weight=1)
@@ -417,7 +437,7 @@ class ForceControlApp(tk.Tk):
             "ki": float(self.ki_var.get()),
             "kd": float(self.kd_var.get()),
             "max_speed": float(self.max_speed_var.get()),
-            "hard_force_limit_n": float(self.hard_limit_var.get()),
+            "hard_force_limits_n": dict(self.config_model.hard_force_limits_n_by_tendon),
             "control_sign": float(self.control_sign_var.get()),
         }
 
@@ -527,19 +547,27 @@ class ForceControlApp(tk.Tk):
             )
 
     def _set_connection_states(self, connected: bool) -> None:
+        feedback_recovering = self.session.manual_feedback_recovering
         self.connect_button.configure(
             state="disabled" if connected or self._connection_pending else "normal"
         )
         self.disconnect_button.configure(state="normal" if connected else "disabled")
-        self.baseline_button.configure(state="normal" if connected else "disabled")
-        self.arm_button.configure(state="normal" if connected else "disabled")
-        self.start_button.configure(state="normal" if connected else "disabled")
+        self.baseline_button.configure(
+            state="normal" if connected and not feedback_recovering else "disabled"
+        )
+        self.arm_button.configure(
+            state="normal" if connected and not feedback_recovering else "disabled"
+        )
+        self.start_button.configure(
+            state="normal" if connected and not feedback_recovering else "disabled"
+        )
         self.stop_button.configure(state="normal" if connected else "disabled")
         speed_enabled = (
             connected
             and not self.session.armed
             and not self.session.running
             and not self.session.faulted
+            and not feedback_recovering
         )
         if not connected:
             speed_reason = "connect first"
@@ -547,6 +575,8 @@ class ForceControlApp(tk.Tk):
             speed_reason = "faulted; disconnect and reconnect"
         elif self.session.armed or self.session.running:
             speed_reason = "stop force control or press STOP ALL"
+        elif self.session.manual_feedback_recovering:
+            speed_reason = "feedback recovering; motion commands blocked"
         else:
             speed_reason = "ready"
         self.speed_status_var.set(f"Speed control: {speed_reason}")
@@ -561,7 +591,8 @@ class ForceControlApp(tk.Tk):
                 variables["state"].set("disconnected")
 
     def _poll_session(self) -> None:
-        for event in self.session.drain_events():
+        events = self.session.drain_events()
+        for event in events:
             self._set_status(event)
         samples = self.session.drain_samples()
         for sample in samples:
@@ -585,7 +616,11 @@ class ForceControlApp(tk.Tk):
                 self._row_vars[servo_id]["baseline"].set(f"{baseline:.3f}")
         self._set_connection_states(self.session.connected)
         if self.session.faulted:
-            self._set_status("FAULT: disconnect and reconnect")
+            fault_message = self.session.fault_message
+            if fault_message:
+                self._set_status(f"FAULT: {fault_message}")
+            elif not events:
+                self._set_status("FAULT: disconnect and reconnect")
         if time.monotonic() - self._last_logger_update >= 0.5:
             self._update_logger()
             self._last_logger_update = time.monotonic()
@@ -610,12 +645,11 @@ class ForceControlApp(tk.Tk):
             actual_line.set_data(times, actual)
             target_line.set_data(times, target)
             end_time = max(times[-1], 10.0)
-            axis.set_xlim(max(0.0, end_time - 30.0), max(30.0, end_time))
+            axis.set_xlim(max(0.0, end_time - 10.0), max(10.0, end_time))
             low = min(0.0, min(actual) * 1.1)
-            high = max(
-                self.config_model.max_target_force_n * 1.1,
-                max(actual + target + [0.0]) * 1.2,
-            )
+            tendon = SERVO_NAMES[servo_id - 1]
+            tendon_max = max(self.config_model.target_force_levels_by_tendon[tendon])
+            high = max(tendon_max * 1.1, max(actual + target + [0.0]) * 1.2)
             if high <= low:
                 high = low + 1.0
             axis.set_ylim(low, high)
