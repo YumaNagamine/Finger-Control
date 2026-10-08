@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -210,6 +211,9 @@ class RealtimeJointAngleSource:
         self._calibration = None
         self._runtime_config: dict | None = None
         self._overlay_recorder: OverlayVideoRecorder | None = None
+        self._latest_lock = threading.Lock()
+        self._latest_overlay: np.ndarray | None = None
+        self._latest_measurement: JointAngleMeasurement | None = None
 
     def open(self) -> None:
         if self._capture is not None:
@@ -244,7 +248,26 @@ class RealtimeJointAngleSource:
         )
         self.reset_temporal_history()
 
-    def calibrate_meta1(self) -> Meta1CalibrationResult | None:
+    @property
+    def latest_overlay(self) -> np.ndarray | None:
+        """Return a copy of the newest DLC-rendered frame, if available."""
+
+        with self._latest_lock:
+            if self._latest_overlay is None:
+                return None
+            return self._latest_overlay.copy()
+
+    @property
+    def latest_measurement(self) -> JointAngleMeasurement | None:
+        """Return the newest measurement without exposing mutable state."""
+
+        with self._latest_lock:
+            return self._latest_measurement
+
+    def calibrate_meta1(
+        self,
+        stop_event: threading.Event | None = None,
+    ) -> Meta1CalibrationResult | None:
         """Optionally determine and latch meta1 before feedback control starts."""
         if self._capture is None or self._processor is None or self._runtime_config is None:
             raise RuntimeError("Joint-angle source is not open")
@@ -270,11 +293,15 @@ class RealtimeJointAngleSource:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise Meta1CalibrationAbortedError("Static meta1 calibration was aborted")
                 candidates: list[tuple[float, float, float]] = []
                 last_overlay: np.ndarray | None = None
                 frames_examined = 0
 
                 for frame_offset in range(max_frames):
+                    if stop_event is not None and stop_event.is_set():
+                        raise Meta1CalibrationAbortedError("Static meta1 calibration was aborted")
                     ok, frame = self._capture.read()
                     if not ok or frame is None:
                         raise RuntimeError("Failed to read a frame during meta1 calibration")
@@ -378,6 +405,8 @@ class RealtimeJointAngleSource:
 
                 while True:
                     key = cv2.waitKeyEx(50) & 0xFF
+                    if stop_event is not None and stop_event.is_set():
+                        raise Meta1CalibrationAbortedError("Static meta1 calibration was aborted")
                     if key == 27 or self._window_was_closed(window_name):
                         raise Meta1CalibrationAbortedError("Static meta1 calibration was aborted")
                     if key in (10, 13):
@@ -536,7 +565,7 @@ class RealtimeJointAngleSource:
             valid = decision.valid
             reason = decision.reason
 
-        return JointAngleMeasurement(
+        measurement = JointAngleMeasurement(
             frame_index=int(frame_index),
             captured_at=captured_at,
             inference_finished_at=inference_finished_at,
@@ -547,6 +576,10 @@ class RealtimeJointAngleSource:
             reason=reason,
             held_last=held_last,
         )
+        with self._latest_lock:
+            self._latest_overlay = overlay.copy()
+            self._latest_measurement = measurement
+        return measurement
 
     def close(self) -> None:
         try:
@@ -558,6 +591,9 @@ class RealtimeJointAngleSource:
             self._runtime_config = None
             self._calibration = None
             self.reset_temporal_history()
+            with self._latest_lock:
+                self._latest_overlay = None
+                self._latest_measurement = None
             if capture is not None:
                 capture.release()
 
