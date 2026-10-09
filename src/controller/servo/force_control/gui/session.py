@@ -22,6 +22,15 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence
 
+from controller.servo.torque_calibration.storage import (
+    DEFAULT_ENCODER_POSITION_PATH,
+    intercept_for_model,
+    load_encoder_calibration_positions,
+    load_torque_intercept_calibration,
+    save_encoder_calibration_positions,
+    save_torque_intercept_calibration,
+)
+
 
 CONTROLLER_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = CONTROLLER_ROOT.parent
@@ -33,7 +42,11 @@ DEFAULT_CALIBRATION_DIR = API_ROOT / "calibration" / "current"
 SERVO_IDS = (1, 2, 3, 4, 5, 6)
 SERVO_NAMES = ("ED", "DI", "FDS", "FDP", "LU", "PI")
 MANUAL_SPEED_PRESETS = (-500, -100, 0, 100, 500)
+FEEDBACK_SYNC_TOLERANCE_S = 0.030
 DEFAULT_ZERO_OFFSET_FILE = DEFAULT_CALIBRATION_DIR / "as5048a_unloaded_zero_offsets.json"
+DEFAULT_INTERCEPT_CALIBRATION_FILE = (
+    DEFAULT_CALIBRATION_DIR / "torque_intercept_calibration.json"
+)
 
 
 @dataclass(frozen=True)
@@ -159,6 +172,8 @@ class ControlSample:
     force_error_n: float
     speed_command: int
     position: float
+    encoder_position_deg: float
+    angle_delta_deg: float
     active: bool
 
 
@@ -224,9 +239,12 @@ class ForceControlSession:
         self.status_callback = status_callback
         self._lock = threading.RLock()
         self._command_lock = threading.Lock()
+        self._feedback_lock = threading.Lock()
+        self._baseline_lock = threading.Lock()
+        self._calibration_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._sample_queue: queue.Queue = queue.Queue(maxsize=3000)
-        self._event_queue: queue.Queue = queue.Queue()
+        self._event_queue: queue.Queue = queue.Queue(maxsize=256)
         self._connected = False
         self._armed = False
         self._running = False
@@ -251,7 +269,11 @@ class ForceControlSession:
         self._last_parameters: Optional[dict] = None
         self._calibration_dir = DEFAULT_CALIBRATION_DIR
         self._zero_offset_path = DEFAULT_ZERO_OFFSET_FILE
+        self._intercept_calibration_path = DEFAULT_INTERCEPT_CALIBRATION_FILE
+        self._encoder_position_path = DEFAULT_ENCODER_POSITION_PATH
         self._zero_offsets: Dict[int, dict] = {}
+        self._encoder_calibration_positions: Dict[int, dict] = {}
+        self._connect_cancel_event: Optional[threading.Event] = None
 
     @property
     def connected(self) -> bool:
@@ -284,17 +306,33 @@ class ForceControlSession:
             return self._manual_feedback_recovering
 
     def _emit(self, message: str) -> None:
-        self._event_queue.put(message)
+        try:
+            self._event_queue.put_nowait(message)
+        except queue.Full:
+            try:
+                self._event_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._event_queue.put_nowait(message)
+            except queue.Full:
+                pass
         if self.status_callback is not None:
             self.status_callback(message)
 
-    def drain_events(self) -> List[str]:
+    @staticmethod
+    def _check_cancelled(cancel_event: threading.Event) -> None:
+        if cancel_event.is_set():
+            raise RuntimeError("Connection cancelled")
+
+    def drain_events(self, limit: int = 100) -> List[str]:
         events: List[str] = []
-        while True:
+        for _ in range(max(1, int(limit))):
             try:
                 events.append(self._event_queue.get_nowait())
             except queue.Empty:
                 return events
+        return events
 
     def drain_samples(self, limit: int = 300) -> List[ControlSample]:
         samples: List[ControlSample] = []
@@ -311,6 +349,24 @@ class ForceControlSession:
         with self._lock:
             return {
                 servo_id: state.baseline_force_n
+                for servo_id, state in self._states.items()
+            }
+
+    def calibration_state_snapshot(self) -> Dict[int, dict]:
+        """Return fixed model values and remembered positions for the calibration tab."""
+
+        with self._lock:
+            positions = dict(self._encoder_calibration_positions)
+            return {
+                servo_id: {
+                    "slope_nmm_per_deg": float(state.model["slope_nmm_per_deg"]),
+                    "intercept_nmm": float(state.intercept_nmm),
+                    "remembered_encoder_position_deg": (
+                        None
+                        if servo_id not in positions
+                        else float(positions[servo_id]["encoder_position_deg"])
+                    ),
+                }
                 for servo_id, state in self._states.items()
             }
 
@@ -433,7 +489,12 @@ class ForceControlSession:
             "mapping": mapping,
         }
 
-    def _load_models(self, calibration_dir: Path, zero_offset_path: Path) -> Dict[int, _ServoState]:
+    def _load_models(
+        self,
+        calibration_dir: Path,
+        zero_offset_path: Path,
+        intercept_calibration_path: Path,
+    ) -> Dict[int, _ServoState]:
         if str(API_ROOT / "python") not in sys.path:
             sys.path.insert(0, str(API_ROOT / "python"))
         from drivers.as5048a.calibration_store import (  # pylint: disable=import-outside-toplevel
@@ -449,6 +510,7 @@ class ForceControlSession:
             offsets = load_zero_offsets(str(zero_offset_path))
         else:
             self._emit(f"WARNING: zero-offset file not found: {zero_offset_path}")
+        intercept_records = load_torque_intercept_calibration(intercept_calibration_path)
 
         states: Dict[int, _ServoState] = {}
         for servo_id, tendon in zip(SERVO_IDS, SERVO_NAMES):
@@ -466,8 +528,15 @@ class ForceControlSession:
                 )
             sensor_id = int(model["sensor_id"])
             intercept_nmm = model["intercept_nmm"]
+            calibrated_intercept = intercept_for_model(intercept_records, model)
             offset = offsets.get(sensor_id)
-            if offset is not None:
+            if calibrated_intercept is not None:
+                intercept_nmm = calibrated_intercept
+                self._emit(
+                    f"Using calibrated torque intercept for servo {servo_id}: "
+                    f"{intercept_nmm:.6g} Nmm"
+                )
+            elif offset is not None:
                 if int(offset["servo_id"]) != servo_id:
                     raise ValueError(f"Zero-offset servo ID mismatch for sensor {sensor_id}")
                 intercept_nmm = -model["slope_nmm_per_deg"] * offset["mean_delta_deg"]
@@ -495,41 +564,22 @@ class ForceControlSession:
         *,
         calibration_dir: Path = DEFAULT_CALIBRATION_DIR,
         zero_offset_path: Path = DEFAULT_ZERO_OFFSET_FILE,
+        intercept_calibration_path: Path = DEFAULT_INTERCEPT_CALIBRATION_FILE,
     ) -> None:
         """Connect and initialize feedback without arming motion."""
 
         self.disconnect()
+        connect_cancel_event = threading.Event()
         with self._lock:
+            if self._connect_cancel_event is not None:
+                raise RuntimeError("Another connection attempt is still stopping")
+            self._connect_cancel_event = connect_cancel_event
             self._calibration_dir = Path(calibration_dir)
             self._zero_offset_path = Path(zero_offset_path)
-        if not API_ROOT.exists():
-            raise FileNotFoundError(f"ServoHardwareAPI was not found: {API_ROOT}")
-
-        if str(API_ROOT / "python") not in sys.path:
-            sys.path.insert(0, str(API_ROOT / "python"))
-        from drivers import (  # pylint: disable=import-outside-toplevel
-            AS5048ABridgeDriver,
-            SerialTransport,
-            ServoControllerDriver,
-            ServoSystem,
-        )
-        from controller.servo.force_control.runner import (  # pylint: disable=import-outside-toplevel
-            LatestSampleStore,
-            ReaderTask,
-        )
-
-        self._emit("Loading force calibration files...")
-        states = self._load_models(Path(calibration_dir), Path(zero_offset_path))
-        system = ServoSystem(
-            count=6,
-            servo_ids=list(SERVO_IDS),
-            names=list(SERVO_NAMES),
-            as5048a_sensor_map=list(SERVO_IDS),
-        )
-        self._servo_index = {
-            servo_id: system.index_for_servo_id(servo_id) for servo_id in SERVO_IDS
-        }
-
+            self._intercept_calibration_path = Path(intercept_calibration_path)
+            self._encoder_position_path = (
+                Path(calibration_dir) / DEFAULT_ENCODER_POSITION_PATH.name
+            )
         servo_transport = None
         encoder_transport = None
         servo = None
@@ -539,6 +589,43 @@ class ForceControlSession:
         stop_event = None
         control_thread = None
         try:
+            self._check_cancelled(connect_cancel_event)
+            if not API_ROOT.exists():
+                raise FileNotFoundError(f"ServoHardwareAPI was not found: {API_ROOT}")
+
+            if str(API_ROOT / "python") not in sys.path:
+                sys.path.insert(0, str(API_ROOT / "python"))
+            from drivers import (  # pylint: disable=import-outside-toplevel
+                AS5048ABridgeDriver,
+                SerialTransport,
+                ServoControllerDriver,
+                ServoSystem,
+            )
+            from controller.servo.force_control.runner import (  # pylint: disable=import-outside-toplevel
+                LatestSampleStore,
+                ReaderTask,
+            )
+
+            self._emit("Loading force calibration files...")
+            states = self._load_models(
+                Path(calibration_dir),
+                Path(zero_offset_path),
+                Path(intercept_calibration_path),
+            )
+            encoder_calibration_positions = load_encoder_calibration_positions(
+                self._encoder_position_path
+            )
+            self._check_cancelled(connect_cancel_event)
+            system = ServoSystem(
+                count=6,
+                servo_ids=list(SERVO_IDS),
+                names=list(SERVO_NAMES),
+                as5048a_sensor_map=list(SERVO_IDS),
+            )
+            self._servo_index = {
+                servo_id: system.index_for_servo_id(servo_id) for servo_id in SERVO_IDS
+            }
+
             servo_transport = SerialTransport(
                 str(servo_port),
                 baudrate=921600,
@@ -570,16 +657,25 @@ class ForceControlSession:
                 name="force-gui-encoder-reader",
             )
 
+            self._check_cancelled(connect_cancel_event)
             encoder.stop_stream()
             encoder.set_rate_hz(self.config.encoder_rate_hz)
             encoder.start_all_stream()
             servo_reader.start()
             encoder_reader.start()
-            servo_store.wait_for_sample(self.config.feedback_timeout_s * 10.0)
+            servo_store.wait_for_sample(
+                self.config.feedback_timeout_s * 10.0,
+                stop_event=connect_cancel_event,
+            )
             for store in encoder_stores.values():
-                store.wait_for_sample(self.config.feedback_timeout_s * 10.0)
+                store.wait_for_sample(
+                    self.config.feedback_timeout_s * 10.0,
+                    stop_event=connect_cancel_event,
+                )
 
+            self._check_cancelled(connect_cancel_event)
             with self._lock:
+                self._check_cancelled(connect_cancel_event)
                 self._servo = servo
                 self._encoder = encoder
                 self._servo_transport = servo_transport
@@ -591,6 +687,7 @@ class ForceControlSession:
                 self._encoder_reader = encoder_reader
                 self._stop_event = stop_event
                 self._states = states
+                self._encoder_calibration_positions = encoder_calibration_positions
                 self._manual_speed_commands = {
                     servo_id: 0 for servo_id in SERVO_IDS
                 }
@@ -604,8 +701,10 @@ class ForceControlSession:
 
             self._emit("Feedback connected; capturing stable initial force...")
             self.capture_baseline()
+            self._check_cancelled(connect_cancel_event)
             control_thread = threading.Thread(
                 target=self._loop,
+                args=(stop_event,),
                 name="force-gui-control-loop",
                 daemon=True,
             )
@@ -651,6 +750,7 @@ class ForceControlSession:
                 self._encoder_reader = None
                 self._control_thread = None
                 self._states = {}
+                self._encoder_calibration_positions = {}
                 self._manual_speed_commands = {
                     servo_id: 0 for servo_id in SERVO_IDS
                 }
@@ -658,6 +758,10 @@ class ForceControlSession:
                 self._last_fault_message = None
                 self._stop_event = threading.Event()
             raise
+        finally:
+            with self._lock:
+                if self._connect_cancel_event is connect_cancel_event:
+                    self._connect_cancel_event = None
 
     @staticmethod
     def _accept_servo(parsed: Any) -> Optional[dict]:
@@ -666,6 +770,10 @@ class ForceControlSession:
         return None
 
     def _feedback(self) -> Dict[int, dict]:
+        with self._feedback_lock:
+            return self._feedback_unlocked()
+
+    def _feedback_unlocked(self) -> Dict[int, dict]:
         from drivers.as5048a.torque import compute_torque_snapshot  # pylint: disable=import-outside-toplevel
 
         with self._lock:
@@ -692,42 +800,288 @@ class ForceControlSession:
             servo_age_s = max(0.0, now - servo_record.received_at)
             encoder_age_s = max(0.0, now - encoder_record.received_at)
             sync_age_s = abs(encoder_record.received_at - servo_record.received_at)
-            snapshot = compute_torque_snapshot(
-                sample=encoder_record.value,
-                servo_id=state.servo_id,
-                motor_name=state.model["motor_name"],
-                servo_raw=telemetry["positions"][servo_index],
-                counts_per_rev=state.model["servo_counts_per_rev"],
-                servo_zero_raw=state.model["servo_zero_raw"],
-                servo_direction=state.model["servo_direction"],
-                encoder_direction=state.model["encoder_direction"],
-                torque_zero_delta_deg=state.model["torque_zero_delta_deg"],
-                calibration_slope=state.model["slope_nmm_per_deg"],
-                calibration_intercept=state.intercept_nmm,
-                calibration_angle_reference_deg=state.model["angle_reference_deg"],
-                spring_k=0.0,
-                moment_arm_mm=state.model["moment_arm_mm"],
-                pull_angle_deg=state.model["pull_angle_deg"],
-                telemetry_age_s=sync_age_s,
-                telemetry_stale_after_s=self.config.feedback_timeout_s,
-                previous_snapshot=state.previous_snapshot,
+            telemetry_age_s = max(servo_age_s, encoder_age_s, sync_age_s)
+            hold_previous_snapshot = (
+                sync_age_s > FEEDBACK_SYNC_TOLERANCE_S
+                and state.previous_snapshot is not None
+                and sync_age_s <= self.config.feedback_timeout_s
             )
+            if hold_previous_snapshot:
+                snapshot = state.previous_snapshot
+            else:
+                snapshot = compute_torque_snapshot(
+                    sample=encoder_record.value,
+                    servo_id=state.servo_id,
+                    motor_name=state.model["motor_name"],
+                    servo_raw=telemetry["positions"][servo_index],
+                    counts_per_rev=state.model["servo_counts_per_rev"],
+                    servo_zero_raw=state.model["servo_zero_raw"],
+                    servo_direction=state.model["servo_direction"],
+                    encoder_direction=state.model["encoder_direction"],
+                    torque_zero_delta_deg=state.model["torque_zero_delta_deg"],
+                    calibration_slope=state.model["slope_nmm_per_deg"],
+                    calibration_intercept=state.intercept_nmm,
+                    calibration_angle_reference_deg=state.model["angle_reference_deg"],
+                    spring_k=0.0,
+                    moment_arm_mm=state.model["moment_arm_mm"],
+                    pull_angle_deg=state.model["pull_angle_deg"],
+                    telemetry_age_s=telemetry_age_s,
+                    telemetry_stale_after_s=self.config.feedback_timeout_s,
+                    jump_filter_enabled=True,
+                    previous_snapshot=state.previous_snapshot,
+                )
             if snapshot is None or snapshot["force_n"] is None:
                 raise RuntimeError(f"Force estimate is unavailable for ID {state.servo_id}")
-            state.previous_snapshot = snapshot
             force_n = float(snapshot["force_n"])
             position = float(telemetry["positions"][servo_index])
-            state.latest_force_n = force_n
-            state.latest_position = position
+            with self._lock:
+                if self._states.get(state.servo_id) is not state:
+                    raise RuntimeError("Session changed during feedback capture")
+                state.previous_snapshot = snapshot
+                state.latest_force_n = force_n
+                state.latest_position = position
             result[state.servo_id] = {
                 "force_n": force_n,
                 "position": position,
+                "encoder_position_deg": float(snapshot["encoder_angle_deg"]),
+                "angle_delta_deg": float(snapshot["angle_delta_deg"]),
+                "encoder_received_at": float(encoder_record.received_at),
+                "multiturn_angle_model": bool(snapshot["multiturn_angle_model"]),
                 "servo_age_s": servo_age_s,
                 "encoder_age_s": encoder_age_s,
             }
         return result
 
+    def _validate_calibration_ready(self, servo_id: int) -> _ServoState:
+        servo_id = int(servo_id)
+        with self._lock:
+            if not self._connected:
+                raise RuntimeError("Connect before torque calibration")
+            if self._faulted or self._manual_feedback_recovering:
+                raise RuntimeError("Wait for healthy feedback before torque calibration")
+            if self._armed or self._running:
+                raise RuntimeError("Stop and disarm force control before torque calibration")
+            if any(self._manual_speed_commands.values()):
+                raise RuntimeError("Set every manual speed command to 0 before torque calibration")
+            state = self._states.get(servo_id)
+            if state is None:
+                raise ValueError(f"Unknown servo ID: {servo_id}")
+            return state
+
+    def calibrate_current_force_as_zero(
+        self, servo_id: int, duration_s: float = 1.0
+    ) -> dict:
+        """Set the current loose position to zero torque without changing slope k."""
+
+        duration_s = float(duration_s)
+        if not math.isfinite(duration_s) or duration_s <= 0.0:
+            raise ValueError("Calibration duration must be greater than zero")
+        if not self._calibration_lock.acquire(blocking=False):
+            raise RuntimeError("Another torque calibration action is already in progress")
+        try:
+            state = self._validate_calibration_ready(servo_id)
+            samples: List[float] = []
+            encoder_positions: List[float] = []
+            previous_received_at: Optional[float] = None
+            deadline = time.monotonic() + duration_s
+            while time.monotonic() < deadline:
+                self._validate_calibration_ready(servo_id)
+                item = self._feedback()[int(servo_id)]
+                received_at = item["encoder_received_at"]
+                if received_at != previous_received_at:
+                    samples.append(float(item["angle_delta_deg"]))
+                    encoder_positions.append(float(item["encoder_position_deg"]))
+                    previous_received_at = received_at
+                time.sleep(0.005)
+            if not samples:
+                raise RuntimeError("No valid magnetic-encoder samples were captured")
+
+            if str(API_ROOT / "python") not in sys.path:
+                sys.path.insert(0, str(API_ROOT / "python"))
+            from drivers.as5048a.torque import (  # pylint: disable=import-outside-toplevel
+                zero_intercept_from_angle_samples,
+            )
+
+            slope = float(state.model["slope_nmm_per_deg"])
+            result = zero_intercept_from_angle_samples(slope, samples)
+            intercept = float(result["intercept_nmm"])
+            self._validate_calibration_ready(servo_id)
+            records = load_torque_intercept_calibration(self._intercept_calibration_path)
+            records[int(servo_id)] = {
+                "servo_id": int(servo_id),
+                "encoder_sensor_id": int(state.sensor_id),
+                "slope_nmm_per_deg": slope,
+                "intercept_nmm": intercept,
+                "point_count": 1,
+                "method": "loose_position_zero",
+                "mean_delta_deg": float(result["mean_delta_deg"]),
+                "std_delta_deg": float(result["std_delta_deg"]),
+                "sample_count": int(result["sample_count"]),
+                "capture_duration_s": duration_s,
+                "mean_encoder_position_deg": sum(encoder_positions) / len(encoder_positions),
+                "calibrated_at_unix_s": time.time(),
+            }
+            save_torque_intercept_calibration(self._intercept_calibration_path, records)
+            with self._lock:
+                current_state = self._states.get(int(servo_id))
+                if current_state is not state:
+                    raise RuntimeError("Session changed while saving torque calibration")
+                state.intercept_nmm = intercept
+                state.baseline_force_n = 0.0
+            self._emit(
+                f"Servo {servo_id} torque zero calibrated: b={intercept:.6g} Nmm "
+                f"from {len(samples)} samples"
+            )
+            return dict(records[int(servo_id)])
+        finally:
+            self._calibration_lock.release()
+
+    def calibrate_all_current_force_as_zero(
+        self, duration_s: float = 1.0
+    ) -> Dict[int, dict]:
+        """Set all current loose positions to zero torque in one capture window."""
+
+        duration_s = float(duration_s)
+        if not math.isfinite(duration_s) or duration_s <= 0.0:
+            raise ValueError("Calibration duration must be greater than zero")
+        if not self._calibration_lock.acquire(blocking=False):
+            raise RuntimeError("Another torque calibration action is already in progress")
+        try:
+            states = {
+                servo_id: self._validate_calibration_ready(servo_id)
+                for servo_id in SERVO_IDS
+            }
+            samples_by_servo: Dict[int, List[float]] = {
+                servo_id: [] for servo_id in SERVO_IDS
+            }
+            encoder_positions_by_servo: Dict[int, List[float]] = {
+                servo_id: [] for servo_id in SERVO_IDS
+            }
+            previous_received_at: Dict[int, Optional[float]] = {
+                servo_id: None for servo_id in SERVO_IDS
+            }
+            deadline = time.monotonic() + duration_s
+            while time.monotonic() < deadline:
+                for servo_id in SERVO_IDS:
+                    self._validate_calibration_ready(servo_id)
+                feedback = self._feedback()
+                for servo_id in SERVO_IDS:
+                    item = feedback[servo_id]
+                    received_at = item["encoder_received_at"]
+                    if received_at != previous_received_at[servo_id]:
+                        samples_by_servo[servo_id].append(
+                            float(item["angle_delta_deg"])
+                        )
+                        encoder_positions_by_servo[servo_id].append(
+                            float(item["encoder_position_deg"])
+                        )
+                        previous_received_at[servo_id] = received_at
+                time.sleep(0.005)
+
+            missing = [
+                str(servo_id)
+                for servo_id in SERVO_IDS
+                if not samples_by_servo[servo_id]
+            ]
+            if missing:
+                raise RuntimeError(
+                    "No valid magnetic-encoder samples were captured for servo ID(s) "
+                    + ", ".join(missing)
+                )
+
+            if str(API_ROOT / "python") not in sys.path:
+                sys.path.insert(0, str(API_ROOT / "python"))
+            from drivers.as5048a.torque import (  # pylint: disable=import-outside-toplevel
+                zero_intercept_from_angle_samples,
+            )
+
+            records = load_torque_intercept_calibration(self._intercept_calibration_path)
+            calibrated_at = time.time()
+            results: Dict[int, dict] = {}
+            for servo_id in SERVO_IDS:
+                state = states[servo_id]
+                samples = samples_by_servo[servo_id]
+                result = zero_intercept_from_angle_samples(
+                    float(state.model["slope_nmm_per_deg"]),
+                    samples,
+                )
+                intercept = float(result["intercept_nmm"])
+                records[servo_id] = {
+                    "servo_id": int(servo_id),
+                    "encoder_sensor_id": int(state.sensor_id),
+                    "slope_nmm_per_deg": float(state.model["slope_nmm_per_deg"]),
+                    "intercept_nmm": intercept,
+                    "point_count": 1,
+                    "method": "loose_position_zero",
+                    "mean_delta_deg": float(result["mean_delta_deg"]),
+                    "std_delta_deg": float(result["std_delta_deg"]),
+                    "sample_count": int(result["sample_count"]),
+                    "capture_duration_s": duration_s,
+                    "mean_encoder_position_deg": (
+                        sum(encoder_positions_by_servo[servo_id])
+                        / len(encoder_positions_by_servo[servo_id])
+                    ),
+                    "calibrated_at_unix_s": calibrated_at,
+                }
+                results[servo_id] = dict(records[servo_id])
+
+            for servo_id in SERVO_IDS:
+                self._validate_calibration_ready(servo_id)
+            save_torque_intercept_calibration(self._intercept_calibration_path, records)
+            with self._lock:
+                for servo_id, state in states.items():
+                    if self._states.get(servo_id) is not state:
+                        raise RuntimeError("Session changed while saving torque calibration")
+                for servo_id, state in states.items():
+                    state.intercept_nmm = records[servo_id]["intercept_nmm"]
+                    state.baseline_force_n = 0.0
+            self._emit(
+                f"All {len(SERVO_IDS)} tendon torque zeros calibrated from a "
+                f"{duration_s:g} s capture"
+            )
+            return results
+        finally:
+            self._calibration_lock.release()
+
+    def remember_encoder_position_for_calibration(self, servo_id: int) -> dict:
+        """Persist the current magnetic-encoder position for future auto calibration."""
+
+        if not self._calibration_lock.acquire(blocking=False):
+            raise RuntimeError("Another torque calibration action is already in progress")
+        try:
+            state = self._validate_calibration_ready(servo_id)
+            item = self._feedback()[int(servo_id)]
+            if not item["multiturn_angle_model"]:
+                raise RuntimeError("Multi-turn magnetic-encoder position is unavailable")
+            record = {
+                "servo_id": int(servo_id),
+                "encoder_sensor_id": int(state.sensor_id),
+                "encoder_position_deg": float(item["encoder_position_deg"]),
+                "recorded_at_unix_s": time.time(),
+            }
+            with self._lock:
+                positions = dict(self._encoder_calibration_positions)
+            positions[int(servo_id)] = record
+            save_encoder_calibration_positions(self._encoder_position_path, positions)
+            with self._lock:
+                self._encoder_calibration_positions = positions
+            self._emit(
+                f"Remembered servo {servo_id} calibration encoder position: "
+                f"{record['encoder_position_deg']:.6f} deg"
+            )
+            return dict(record)
+        finally:
+            self._calibration_lock.release()
+
     def capture_baseline(self, duration_s: float = 0.5) -> Dict[int, float]:
+        if not self._baseline_lock.acquire(blocking=False):
+            raise RuntimeError("Baseline capture is already in progress")
+        try:
+            return self._capture_baseline(duration_s)
+        finally:
+            self._baseline_lock.release()
+
+    def _capture_baseline(self, duration_s: float = 0.5) -> Dict[int, float]:
         """Capture a median baseline without moving any servo."""
 
         if not self.connected:
@@ -750,6 +1104,8 @@ class ForceControlSession:
             time.sleep(0.01)
         baselines: Dict[int, float] = {}
         with self._lock:
+            if not self._connected:
+                raise RuntimeError("Session disconnected during baseline capture")
             for servo_id, samples in values.items():
                 if not samples:
                     if last_error is not None:
@@ -786,6 +1142,8 @@ class ForceControlSession:
         if self.manual_feedback_recovering:
             raise RuntimeError("Wait for feedback recovery before arming")
         with self._lock:
+            if self._faulted:
+                raise RuntimeError("Disconnect and reconnect after a fault")
             if max_speed <= 0.0:
                 raise ValueError("max_speed must be greater than zero")
             if hard_force_limits_n is None:
@@ -882,14 +1240,14 @@ class ForceControlSession:
         self._emit("All servos stopped and disarmed.")
 
     def stop_servo(self, servo_id: int) -> None:
-        with self._lock:
-            state = self._states.get(int(servo_id))
-            if state is None:
-                raise ValueError(f"Unknown servo ID: {servo_id}")
-            state.active = False
-            self._manual_speed_commands[int(servo_id)] = 0
         with self._command_lock:
-            servo = self._servo
+            with self._lock:
+                state = self._states.get(int(servo_id))
+                if state is None:
+                    raise ValueError(f"Unknown servo ID: {servo_id}")
+                state.active = False
+                self._manual_speed_commands[int(servo_id)] = 0
+                servo = self._servo
             if servo is not None:
                 servo.send_speed_by_id(int(servo_id), 0)
 
@@ -984,34 +1342,50 @@ class ForceControlSession:
             except queue.Full:
                 pass
 
-    def _loop(self) -> None:
+    def _loop(self, stop_event: threading.Event) -> None:
         period_s = 1.0 / self.config.control_hz
         next_tick = time.monotonic()
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
+            with self._lock:
+                if (
+                    self._stop_event is not stop_event
+                    or self._control_thread is not threading.current_thread()
+                ):
+                    break
             try:
                 feedback = self._feedback()
                 with self._lock:
                     self._manual_feedback_recovering = False
                 now = time.monotonic()
                 with self._lock:
-                    running = self._running
-                    armed = self._armed
                     states = list(self._states.values())
-                    manual_speeds = dict(self._manual_speed_commands)
                 commands: List[tuple] = []
                 for state in states:
                     item = feedback[state.servo_id]
-                    speed_command = 0
-                    if running and armed and state.active:
-                        self._update_ramp(state, now)
-                        if state.controller is None:
-                            raise RuntimeError("Controller is not armed")
-                        if state.controller.config.target_force_n != state.target_force_n:
-                            state.controller.config = replace(
-                                state.controller.config,
-                                target_force_n=state.target_force_n,
+                    with self._lock:
+                        if self._states.get(state.servo_id) is not state:
+                            continue
+                        active = bool(self._running and self._armed and state.active)
+                        if active:
+                            self._update_ramp(state, now)
+                            controller = state.controller
+                            target_force_n = state.target_force_n
+                        else:
+                            controller = None
+                            target_force_n = state.target_force_n
+                            manual_speed = self._manual_speed_commands.get(
+                                state.servo_id, 0
                             )
-                        output = state.controller.step(
+                    speed_command = 0
+                    if active:
+                        if controller is None:
+                            raise RuntimeError("Controller is not armed")
+                        if controller.config.target_force_n != target_force_n:
+                            controller.config = replace(
+                                controller.config,
+                                target_force_n=target_force_n,
+                            )
+                        output = controller.step(
                             self._feedback_object(state, item),
                             now=now,
                         )
@@ -1019,25 +1393,36 @@ class ForceControlSession:
                         commands.append((state.servo_id, speed_command))
                         force_error = output.force_error_n
                     else:
-                        speed_command = manual_speeds.get(state.servo_id, 0)
-                        force_error = state.target_force_n - item["force_n"]
+                        speed_command = manual_speed
+                        force_error = target_force_n - item["force_n"]
                     self._publish(
                         ControlSample(
                             received_at=time.time(),
                             servo_id=state.servo_id,
                             tendon=state.tendon,
                             force_n=item["force_n"],
-                            target_force_n=state.target_force_n,
+                            target_force_n=target_force_n,
                             force_error_n=force_error,
                             speed_command=speed_command,
                             position=item["position"],
-                            active=bool(running and armed and state.active),
+                            encoder_position_deg=item["encoder_position_deg"],
+                            angle_delta_deg=item["angle_delta_deg"],
+                            active=active,
                         )
                     )
                 if commands:
                     with self._command_lock:
                         with self._lock:
-                            should_send = self._running and self._armed and not self._faulted
+                            current_session = (
+                                self._stop_event is stop_event
+                                and self._control_thread is threading.current_thread()
+                            )
+                            should_send = (
+                                current_session
+                                and self._running
+                                and self._armed
+                                and not self._faulted
+                            )
                             active_ids = {
                                 state.servo_id
                                 for state in self._states.values()
@@ -1049,9 +1434,16 @@ class ForceControlSession:
                                 if servo_id in active_ids:
                                     servo.send_speed_by_id(servo_id, command)
             except Exception as exc:
+                with self._lock:
+                    current_session = (
+                        self._stop_event is stop_event
+                        and self._control_thread is threading.current_thread()
+                    )
+                if not current_session:
+                    break
                 if self._handle_manual_feedback_error(exc):
                     next_tick = time.monotonic()
-                    self._stop_event.wait(period_s)
+                    stop_event.wait(period_s)
                     continue
                 self._handle_fault(exc)
                 break
@@ -1059,7 +1451,7 @@ class ForceControlSession:
             next_tick += period_s
             sleep_s = next_tick - time.monotonic()
             if sleep_s > 0.0:
-                self._stop_event.wait(sleep_s)
+                stop_event.wait(sleep_s)
             else:
                 next_tick = time.monotonic()
 
@@ -1121,7 +1513,9 @@ class ForceControlSession:
                     self._emit(f"WARNING: failed to stop servo {servo_id}: {exc}")
 
     def disconnect(self) -> None:
+        cleanup_errors: List[str] = []
         with self._lock:
+            connect_cancel_event = self._connect_cancel_event
             control_thread = self._control_thread
             servo_reader = self._servo_reader
             encoder_reader = self._encoder_reader
@@ -1133,25 +1527,35 @@ class ForceControlSession:
             self._running = False
             self._armed = False
             stop_event.set()
+            if connect_cancel_event is not None:
+                connect_cancel_event.set()
         if was_connected:
             self._send_zero_all()
         if encoder is not None:
             try:
                 encoder.stop_stream()
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_errors.append(f"encoder stop failed: {exc}")
         if control_thread is not None and control_thread is not threading.current_thread():
             control_thread.join(timeout=1.0)
+            if control_thread.is_alive():
+                cleanup_errors.append("control thread did not stop within 1 second")
         if servo_reader is not None:
             servo_reader.join(1.0)
+            reader_thread = getattr(servo_reader, "_thread", None)
+            if reader_thread is not None and reader_thread.is_alive():
+                cleanup_errors.append("servo reader did not stop within 1 second")
         if encoder_reader is not None:
             encoder_reader.join(1.0)
+            reader_thread = getattr(encoder_reader, "_thread", None)
+            if reader_thread is not None and reader_thread.is_alive():
+                cleanup_errors.append("encoder reader did not stop within 1 second")
         for transport in (encoder_transport, servo_transport):
             if transport is not None:
                 try:
                     transport.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    cleanup_errors.append(f"transport close failed: {exc}")
         with self._lock:
             self._connected = False
             self._servo = None
@@ -1161,6 +1565,7 @@ class ForceControlSession:
             self._servo_store = None
             self._encoder_reader_store = None
             self._encoder_stores = {}
+            self._encoder_calibration_positions = {}
             self._servo_reader = None
             self._encoder_reader = None
             self._control_thread = None
@@ -1173,6 +1578,8 @@ class ForceControlSession:
             self._stop_event = threading.Event()
         if was_connected:
             self._emit("Disconnected.")
+        for error in cleanup_errors:
+            self._emit(f"WARNING: cleanup incomplete: {error}")
 
     def shutdown(self) -> None:
         self.disconnect()

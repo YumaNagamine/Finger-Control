@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import tempfile
+import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from controller.servo.force_control.gui.session import (
+    API_ROOT,
     DEFAULT_CALIBRATION_DIR,
     DEFAULT_FORCE_CONFIG_PATH,
     ForceControlSession,
     MANUAL_SPEED_PRESETS,
     load_gui_force_config,
 )
+from controller.servo.force_control.runner import LatestSampleStore
+from controller.servo.torque_calibration.storage import load_torque_intercept_calibration
 
 
 class ForceControlGuiConfigTest(unittest.TestCase):
@@ -156,6 +162,147 @@ class ForceControlGuiConfigTest(unittest.TestCase):
                 hard_force_limit_n=3.0,
                 control_sign=1.0,
             )
+
+    def test_zero_force_calibration_updates_only_runtime_intercept(self):
+        session = ForceControlSession(load_gui_force_config())
+        model = {"slope_nmm_per_deg": -2.0}
+        state = SimpleNamespace(
+            model=model,
+            sensor_id=1,
+            intercept_nmm=99.0,
+            baseline_force_n=4.0,
+        )
+        session._connected = True
+        session._states = {1: state}
+        session._feedback = Mock(
+            return_value={
+                1: {
+                    "angle_delta_deg": 3.0,
+                    "encoder_position_deg": 720.0,
+                    "encoder_received_at": 1.0,
+                    "multiturn_angle_model": True,
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            session._intercept_calibration_path = (
+                Path(directory) / "torque_intercept_calibration.json"
+            )
+
+            result = session.calibrate_current_force_as_zero(1, duration_s=0.01)
+
+        self.assertEqual(model["slope_nmm_per_deg"], -2.0)
+        self.assertAlmostEqual(result["intercept_nmm"], 6.0)
+        self.assertAlmostEqual(state.intercept_nmm, 6.0)
+        self.assertEqual(state.baseline_force_n, 0.0)
+
+    def test_remember_encoder_position_uses_magnetic_encoder(self):
+        session = ForceControlSession(load_gui_force_config())
+        state = SimpleNamespace(sensor_id=3)
+        session._connected = True
+        session._states = {3: state}
+        session._feedback = Mock(
+            return_value={
+                3: {
+                    "encoder_position_deg": -361.5,
+                    "multiturn_angle_model": True,
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            session._encoder_position_path = Path(directory) / "encoder_positions.json"
+
+            result = session.remember_encoder_position_for_calibration(3)
+
+        self.assertAlmostEqual(result["encoder_position_deg"], -361.5)
+
+    def test_all_tendon_zero_force_calibration_updates_every_runtime_intercept(self):
+        session = ForceControlSession(load_gui_force_config())
+        states = {}
+        feedback = {}
+        for servo_id in range(1, 7):
+            states[servo_id] = SimpleNamespace(
+                model={"slope_nmm_per_deg": -2.0},
+                sensor_id=servo_id,
+                intercept_nmm=99.0,
+                baseline_force_n=4.0,
+            )
+            feedback[servo_id] = {
+                "angle_delta_deg": 3.0,
+                "encoder_position_deg": 720.0 + servo_id,
+                "encoder_received_at": 1.0,
+                "multiturn_angle_model": True,
+            }
+        session._connected = True
+        session._states = states
+        session._feedback = Mock(return_value=feedback)
+
+        with tempfile.TemporaryDirectory() as directory:
+            calibration_path = Path(directory) / "torque_intercept_calibration.json"
+            session._intercept_calibration_path = calibration_path
+
+            result = session.calibrate_all_current_force_as_zero(duration_s=0.01)
+
+            saved = load_torque_intercept_calibration(calibration_path)
+
+        self.assertEqual(set(result), set(range(1, 7)))
+        self.assertEqual(set(saved), set(range(1, 7)))
+        for servo_id, state in states.items():
+            self.assertAlmostEqual(result[servo_id]["intercept_nmm"], 6.0)
+            self.assertAlmostEqual(saved[servo_id]["intercept_nmm"], 6.0)
+            self.assertAlmostEqual(state.intercept_nmm, 6.0)
+            self.assertEqual(state.baseline_force_n, 0.0)
+
+    def test_feedback_holds_previous_force_when_streams_are_not_synchronized(self):
+        api_python = str(API_ROOT / "python")
+        if api_python not in sys.path:
+            sys.path.insert(0, api_python)
+
+        session = ForceControlSession(load_gui_force_config())
+        state = SimpleNamespace(
+            servo_id=1,
+            sensor_id=1,
+            model={
+                "motor_name": "ED",
+                "servo_counts_per_rev": 4096.0,
+                "servo_zero_raw": 2048.0,
+                "servo_direction": "1",
+                "encoder_direction": "1",
+                "torque_zero_delta_deg": 0.0,
+                "slope_nmm_per_deg": -1.0,
+                "angle_reference_deg": 0.0,
+                "moment_arm_mm": 20.0,
+                "pull_angle_deg": 90.0,
+            },
+            intercept_nmm=0.0,
+            previous_snapshot=None,
+            latest_force_n=None,
+            latest_position=None,
+        )
+        servo_store = LatestSampleStore()
+        encoder_store = LatestSampleStore()
+        session._servo = object()
+        session._servo_store = servo_store
+        session._encoder_stores = {1: encoder_store}
+        session._servo_index = {1: 0}
+        session._states = {1: state}
+
+        timestamp = time.monotonic()
+        servo_store.publish({"valid": [True], "positions": [2048]}, received_at=timestamp)
+        encoder_store.publish(
+            {"status": "OK", "relative_multi_turn_deg": 0.0},
+            received_at=timestamp,
+        )
+        initial = session._feedback()[1]
+
+        encoder_store.publish(
+            {"status": "OK", "relative_multi_turn_deg": 45.0},
+            received_at=timestamp + 0.040,
+        )
+        held = session._feedback()[1]
+
+        self.assertAlmostEqual(held["force_n"], initial["force_n"])
+        self.assertAlmostEqual(held["angle_delta_deg"], initial["angle_delta_deg"])
 
 
 if __name__ == "__main__":
