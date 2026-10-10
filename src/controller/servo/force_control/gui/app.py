@@ -30,16 +30,27 @@ from controller.servo.force_control.gui.session import (
 ACTUAL_PLOT_COLOR = "#1565c0"
 TARGET_PLOT_COLOR = "#d84315"
 POLL_INTERVAL_MS = 33
-PLOT_INTERVAL_MS = 33
+PLOT_INTERVAL_MS = 200
 
 
 class SharedPlotPanel(ttk.LabelFrame):
     """Persistent six-tendon force plot shared by every control tab."""
 
-    def __init__(self, parent, config: GuiForceConfig):
+    def __init__(self, parent, config: GuiForceConfig, on_refresh):
         super().__init__(parent, text="Realtime tendon force", padding=(8, 6))
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.rowconfigure(0, weight=0)
+        self.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(self)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        toolbar.columnconfigure(0, weight=1)
+        ttk.Button(
+            toolbar,
+            text="Refresh plot",
+            command=on_refresh,
+            style="Control.TButton",
+        ).grid(row=0, column=1, sticky="e")
 
         self.figure = Figure(figsize=(12, 5.4), dpi=100, constrained_layout=True)
         self.axes = self.figure.subplots(2, 3).flatten()
@@ -87,7 +98,7 @@ class SharedPlotPanel(ttk.LabelFrame):
             self.value_texts[servo_id] = value_text
 
         self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
         self.canvas.draw()
 
     def update(self, history: Dict[int, Deque[ControlSample]], start_time: float) -> None:
@@ -146,7 +157,10 @@ class ForceControlApp(tk.Tk):
         self._plot_start_time = None
         self._last_plot_update = 0.0
         self._last_logger_update = 0.0
+        self._log_history = deque(maxlen=500)
+        self._live_log_text = None
         self._last_connection_state = None
+        self._shown_fault_message = None
         self._connection_pending = False
         self._baseline_pending = False
         self._closing = False
@@ -166,7 +180,9 @@ class ForceControlApp(tk.Tk):
         self._speed_row_vars = {}
         self._speed_buttons = {}
         self._calibration_row_vars = {}
-        self._calibration_buttons = []
+        self._calibrate_all_button = None
+        self._calibrate_buttons = {}
+        self._remember_calibration_buttons = {}
         self._target_buttons = []
         self._stop_servo_buttons = []
         self._build_variables()
@@ -176,6 +192,9 @@ class ForceControlApp(tk.Tk):
     def _build_variables(self) -> None:
         self.status_var = tk.StringVar(value="Disconnected")
         self.speed_status_var = tk.StringVar(value="Speed control: connect first")
+        self.calibration_status_var = tk.StringVar(
+            value="Torque calibration: connect first"
+        )
         self.servo_port_var = tk.StringVar(value="COM3")
         self.encoder_port_var = tk.StringVar(value="COM5")
         self.calibration_dir_var = tk.StringVar(value=str(DEFAULT_CALIBRATION_DIR))
@@ -303,12 +322,15 @@ class ForceControlApp(tk.Tk):
 
         main_area = ttk.Frame(self, padding=(12, 0, 12, 12))
         main_area.grid(row=2, column=0, sticky="nsew")
-        main_area.columnconfigure(0, weight=1)
+        main_area.columnconfigure(0, weight=4)
+        main_area.columnconfigure(1, weight=1)
         main_area.rowconfigure(0, weight=2)
         main_area.rowconfigure(1, weight=3)
 
         self.notebook = ttk.Notebook(main_area)
-        self.notebook.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        self.notebook.grid(
+            row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 8)
+        )
         control_tab = ttk.Frame(self.notebook)
         speed_tab = ttk.Frame(self.notebook)
         calibration_tab = ttk.Frame(self.notebook)
@@ -320,7 +342,13 @@ class ForceControlApp(tk.Tk):
         parameters = ttk.LabelFrame(control_tab, text="Controller parameters")
         control_tab.columnconfigure(0, weight=1)
         control_tab.rowconfigure(1, weight=1)
-        parameters.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        parameters.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=(10, 4),
+        )
         self._entry(parameters, "Kp", self.kp_var, 0, 0, width=8)
         self._entry(parameters, "Ki", self.ki_var, 0, 2, width=8)
         self._entry(parameters, "Kd", self.kd_var, 0, 4, width=8)
@@ -406,9 +434,14 @@ class ForceControlApp(tk.Tk):
         self._build_speed_widgets(speed_tab)
         self._build_calibration_widgets(calibration_tab)
         self._build_logger_widgets(logger_tab)
+        self._build_live_log_widgets(main_area)
 
-        self.shared_plot_panel = SharedPlotPanel(main_area, self.config_model)
-        self.shared_plot_panel.grid(row=1, column=0, sticky="nsew")
+        self.shared_plot_panel = SharedPlotPanel(
+            main_area,
+            self.config_model,
+            self._refresh_plot,
+        )
+        self.shared_plot_panel.grid(row=1, column=0, columnspan=2, sticky="nsew")
         self.figure = self.shared_plot_panel.figure
         self.axes = self.shared_plot_panel.axes
         self.canvas = self.shared_plot_panel.canvas
@@ -599,7 +632,12 @@ class ForceControlApp(tk.Tk):
             style="Control.TButton",
         )
         all_calibration_button.pack(side="left")
-        self._calibration_buttons.append(all_calibration_button)
+        self._calibrate_all_button = all_calibration_button
+        ttk.Label(
+            actions,
+            textvariable=self.calibration_status_var,
+            style="Subtitle.TLabel",
+        ).pack(side="left", padx=(12, 0))
 
         table = ttk.LabelFrame(parent, text="Per-servo zero-torque calibration", padding=(8, 6))
         table.grid(row=2, column=0, sticky="nsew", padx=10, pady=(4, 8))
@@ -641,7 +679,8 @@ class ForceControlApp(tk.Tk):
                 style="Small.TButton",
             )
             remember_button.pack(side="left")
-            self._calibration_buttons.extend((calibrate_button, remember_button))
+            self._calibrate_buttons[servo_id] = calibrate_button
+            self._remember_calibration_buttons[servo_id] = remember_button
 
     def _build_logger_widgets(self, parent) -> None:
         parent.columnconfigure(0, weight=1)
@@ -691,6 +730,8 @@ class ForceControlApp(tk.Tk):
             "servo_id",
             "tendon",
             "cs",
+            "servo_link",
+            "encoder_link",
             "calibration_path",
             "calibration_updated",
             "zero_updated",
@@ -705,6 +746,8 @@ class ForceControlApp(tk.Tk):
             "servo_id": "Servo ID",
             "tendon": "Tendon",
             "cs": "AS5048A CS",
+            "servo_link": "Servo 5 s: Hz / max gap / valid",
+            "encoder_link": "Encoder 5 s: Hz / max gap / valid",
             "calibration_path": "Calibration CSV",
             "calibration_updated": "CSV updated",
             "zero_updated": "Zero offset updated",
@@ -716,6 +759,8 @@ class ForceControlApp(tk.Tk):
             "servo_id": 70,
             "tendon": 90,
             "cs": 100,
+            "servo_link": 220,
+            "encoder_link": 220,
             "calibration_path": 420,
             "calibration_updated": 165,
             "zero_updated": 165,
@@ -733,6 +778,36 @@ class ForceControlApp(tk.Tk):
         x_scroll.grid(row=1, column=0, sticky="ew")
         self.logger_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
+    def _build_live_log_widgets(self, parent) -> None:
+        log_frame = ttk.LabelFrame(
+            parent,
+            text="Logger / event history",
+            padding=(8, 6),
+        )
+        log_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 8))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self._live_log_text = tk.Text(
+            log_frame,
+            width=42,
+            height=12,
+            wrap="word",
+            state="disabled",
+            background="#fafafa",
+            foreground="#263238",
+            relief="flat",
+            padx=6,
+            pady=6,
+        )
+        self._live_log_text.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(
+            log_frame,
+            orient="vertical",
+            command=self._live_log_text.yview,
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self._live_log_text.configure(yscrollcommand=scrollbar.set)
+
     @staticmethod
     def _entry(parent, label, variable, row, column, *, width=18):
         ttk.Label(parent, text=label).grid(row=row, column=column, padx=(4, 2), pady=4, sticky="w")
@@ -742,6 +817,22 @@ class ForceControlApp(tk.Tk):
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
+
+    def _append_log(self, text: str) -> None:
+        entry = f"[{time.strftime('%H:%M:%S')}] {text}"
+        remove_oldest = (
+            self._log_history.maxlen is not None
+            and len(self._log_history) == self._log_history.maxlen
+        )
+        self._log_history.append(entry)
+        if self._live_log_text is None:
+            return
+        self._live_log_text.configure(state="normal")
+        if remove_oldest:
+            self._live_log_text.delete("1.0", "2.0")
+        self._live_log_text.insert("end", entry + "\n")
+        self._live_log_text.configure(state="disabled")
+        self._live_log_text.see("end")
 
     def _connect(self) -> None:
         servo_port = self.servo_port_var.get().strip()
@@ -876,15 +967,33 @@ class ForceControlApp(tk.Tk):
         )
 
     def _start_calibration_action(
-        self, action, error_label: str, *, clear_plot: bool = False
+        self,
+        action,
+        error_label: str,
+        *,
+        clear_plot: bool = False,
+        refresh_baseline: bool = False,
     ) -> None:
         if self._calibration_pending or self._closing or self._disconnect_pending:
+            self.session._emit(f"INFO: {error_label} was not started; another GUI action is pending")
             return
         self._calibration_pending = True
+        self.session._emit(f"START: {error_label}")
 
         def worker():
             try:
                 action()
+                if refresh_baseline:
+                    try:
+                        self.session.capture_baseline()
+                        self.session._emit(
+                            "Baseline refreshed automatically after torque calibration."
+                        )
+                    except Exception as exc:
+                        self.session._emit(
+                            "WARNING: torque calibration was saved, but automatic "
+                            f"baseline refresh failed: {exc}"
+                        )
                 if clear_plot:
                     self._plot_clear_pending = True
             except Exception as exc:
@@ -901,6 +1010,7 @@ class ForceControlApp(tk.Tk):
             lambda: self.session.calibrate_current_force_as_zero(servo_id, duration_s=1.0),
             "torque zero calibration",
             clear_plot=True,
+            refresh_baseline=True,
         )
 
     def _calibrate_all_zero_force(self) -> None:
@@ -908,6 +1018,7 @@ class ForceControlApp(tk.Tk):
             lambda: self.session.calibrate_all_current_force_as_zero(duration_s=1.0),
             "all-tendon torque zero calibration",
             clear_plot=True,
+            refresh_baseline=True,
         )
 
     def _remember_calibration_position(self, servo_id: int) -> None:
@@ -945,6 +1056,24 @@ class ForceControlApp(tk.Tk):
         if error:
             return f"{state} ({latest}; {error})"
         return f"{state} ({latest})"
+
+    @staticmethod
+    def _stream_metrics_text(info: dict) -> str:
+        if not info or not info.get("sample_count"):
+            return "--"
+        effective_hz = info.get("effective_hz")
+        max_interval_s = info.get("max_interval_s")
+        valid_percent = info.get("valid_percent")
+        hz_text = "--" if effective_hz is None else f"{effective_hz:.1f} Hz"
+        gap_text = (
+            "--"
+            if max_interval_s is None
+            else f"{1000.0 * max_interval_s:.0f} ms"
+        )
+        valid_text = (
+            "--" if valid_percent is None else f"{valid_percent:.1f}%"
+        )
+        return f"{hz_text} / {gap_text} / {valid_text}"
 
     def _update_logger(self) -> None:
         diagnostics = self.session.diagnostics_snapshot()
@@ -987,6 +1116,8 @@ class ForceControlApp(tk.Tk):
                     row["servo_id"],
                     row["tendon"],
                     f"CS{row['sensor_id']}",
+                    self._stream_metrics_text(row["servo_stream"]),
+                    self._stream_metrics_text(row["encoder_stream"]),
                     row["calibration_path"],
                     row["calibration_updated"] or "not found",
                     row["zero_offset_updated"] or "not found",
@@ -1002,10 +1133,18 @@ class ForceControlApp(tk.Tk):
 
     def _set_connection_states(self, connected: bool) -> None:
         feedback_recovering = self.session.manual_feedback_recovering
+        feedback_errors = self.session.feedback_errors_snapshot()
+        calibration_readiness = self.session.calibration_readiness_snapshot()
         faulted = self.session.faulted
         connection_state = (
             connected,
             feedback_recovering,
+            tuple(sorted(feedback_errors)),
+            calibration_readiness["all_reason"],
+            tuple(
+                (servo_id, calibration_readiness["by_servo"][servo_id])
+                for servo_id in SERVO_IDS
+            ),
             faulted,
             self.session.armed,
             self.session.running,
@@ -1092,25 +1231,64 @@ class ForceControlApp(tk.Tk):
             speed_reason = "stop force control or press STOP ALL"
         elif self.session.manual_feedback_recovering:
             speed_reason = "feedback recovering; motion commands blocked"
+        elif feedback_errors:
+            speed_reason = "feedback unavailable: " + ", ".join(
+                f"ID{servo_id}" for servo_id in sorted(feedback_errors)
+            )
         else:
             speed_reason = "ready"
         self.speed_status_var.set(f"Speed control: {speed_reason}")
-        for buttons in self._speed_buttons.values():
+        for servo_id, buttons in self._speed_buttons.items():
+            row_enabled = speed_enabled and servo_id not in feedback_errors
             for button in buttons:
-                button.configure(state="normal" if speed_enabled else "disabled")
-        calibration_enabled = (
-            connected
-            and not self.session.armed
-            and not self.session.running
-            and not faulted
-            and not feedback_recovering
-            and not self._command_pending
-            and not self._calibration_pending
-            and not self._baseline_pending
-            and not self._disconnect_pending
+                button.configure(state="normal" if row_enabled else "disabled")
+        gui_calibration_reason = None
+        if self._calibration_pending:
+            gui_calibration_reason = "calibration in progress"
+        elif self._command_pending:
+            gui_calibration_reason = "wait for the speed command to finish"
+        elif self._baseline_pending:
+            gui_calibration_reason = "wait for baseline refresh"
+        elif self._disconnect_pending:
+            gui_calibration_reason = "disconnecting"
+
+        all_calibration_reason = (
+            gui_calibration_reason or calibration_readiness["all_reason"]
         )
-        for button in self._calibration_buttons:
-            button.configure(state="normal" if calibration_enabled else "disabled")
+        self._calibrate_all_button.configure(
+            state="normal" if all_calibration_reason is None else "disabled"
+        )
+        ready_ids = []
+        for servo_id in SERVO_IDS:
+            row_reason = (
+                gui_calibration_reason
+                or calibration_readiness["by_servo"][servo_id]
+            )
+            row_state = "normal" if row_reason is None else "disabled"
+            self._calibrate_buttons[servo_id].configure(state=row_state)
+            self._remember_calibration_buttons[servo_id].configure(state=row_state)
+            if row_reason is None:
+                ready_ids.append(servo_id)
+
+        if all_calibration_reason is None:
+            if feedback_errors:
+                calibration_status = (
+                    "ready; unstable feedback for "
+                    + ", ".join(f"ID{servo_id}" for servo_id in sorted(feedback_errors))
+                    + " (calibration will wait for valid samples)"
+                )
+            else:
+                calibration_status = "ready"
+        elif ready_ids:
+            calibration_status = (
+                "ready for " + ", ".join(f"ID{servo_id}" for servo_id in ready_ids)
+                + f"; all unavailable: {all_calibration_reason}"
+            )
+        else:
+            calibration_status = all_calibration_reason
+        self.calibration_status_var.set(
+            f"Torque calibration: {calibration_status}"
+        )
         target_enabled = (
             connected
             and not faulted
@@ -1141,6 +1319,7 @@ class ForceControlApp(tk.Tk):
         try:
             events = self.session.drain_events(limit=100)
             for event in events:
+                self._append_log(event)
                 self._set_status(event)
             samples = self.session.drain_samples()
             if self._plot_clear_pending:
@@ -1174,6 +1353,26 @@ class ForceControlApp(tk.Tk):
                     f"{sample.encoder_position_deg:.4f}"
                 )
                 calibration_variables["delta"].set(f"{sample.angle_delta_deg:.4f}")
+            feedback_errors = self.session.feedback_errors_snapshot()
+            for servo_id in feedback_errors:
+                row_variables = self._row_vars[servo_id]
+                row_variables["actual"].set("--")
+                row_variables["error"].set("--")
+                row_variables["speed"].set("--")
+                row_variables["state"].set(
+                    "sync unavailable"
+                    if "synchronized feedback unavailable" in feedback_errors[servo_id]
+                    else "feedback unavailable"
+                )
+                speed_variables = self._speed_row_vars[servo_id]
+                speed_variables["force"].set("--")
+                speed_variables["position"].set("--")
+                speed_variables["speed"].set("--")
+                speed_variables["state"].set(
+                    "sync unavailable"
+                    if "synchronized feedback unavailable" in feedback_errors[servo_id]
+                    else "feedback unavailable"
+                )
             calibration_state = self.session.calibration_state_snapshot()
             for servo_id, state in calibration_state.items():
                 variables = self._calibration_row_vars[servo_id]
@@ -1191,8 +1390,16 @@ class ForceControlApp(tk.Tk):
                 fault_message = self.session.fault_message
                 if fault_message:
                     self._set_status(f"FAULT: {fault_message}")
+                    if fault_message != self._shown_fault_message:
+                        self._shown_fault_message = fault_message
+                        messagebox.showerror(
+                            "Force control safety stop",
+                            "All servos were stopped.\n\n" + fault_message,
+                        )
                 elif not events:
                     self._set_status("FAULT: disconnect and reconnect")
+            else:
+                self._shown_fault_message = None
             if time.monotonic() - self._last_logger_update >= 0.5:
                 self._update_logger()
                 self._last_logger_update = time.monotonic()
@@ -1215,6 +1422,10 @@ class ForceControlApp(tk.Tk):
         self._plot_start_time = None
         self._last_plot_update = 0.0
         self.shared_plot_panel.clear()
+
+    def _refresh_plot(self) -> None:
+        self._clear_plot()
+        self._set_status("Plot refreshed. Waiting for the next sample from time 0.")
 
     def _update_plot(self) -> None:
         if self._plot_start_time is None:

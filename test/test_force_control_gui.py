@@ -14,6 +14,8 @@ from controller.servo.force_control.gui.session import (
     DEFAULT_FORCE_CONFIG_PATH,
     ForceControlSession,
     MANUAL_SPEED_PRESETS,
+    _CompleteLineTransport,
+    _RecentStreamStats,
     load_gui_force_config,
 )
 from controller.servo.force_control.runner import LatestSampleStore
@@ -21,6 +23,20 @@ from controller.servo.torque_calibration.storage import load_torque_intercept_ca
 
 
 class ForceControlGuiConfigTest(unittest.TestCase):
+    def test_serial_transport_reassembles_a_line_split_across_timeouts(self):
+        base_transport = Mock()
+        port = Mock()
+        port.is_open = True
+        port.read_until.side_effect = [b"AS5048A,SENSOR_DATA,1,1,10", b",0,0,0,OK,10,0,0\n"]
+        base_transport.port = port
+        transport = _CompleteLineTransport(base_transport)
+
+        self.assertEqual(transport.read_raw_line(), b"")
+        self.assertEqual(
+            transport.read_raw_line(),
+            b"AS5048A,SENSOR_DATA,1,1,10,0,0,0,OK,10,0,0\n",
+        )
+
     def test_default_gui_config_has_fixed_target_levels(self):
         config = load_gui_force_config(Path(DEFAULT_FORCE_CONFIG_PATH))
         self.assertEqual(config.target_force_levels_n, (0.5, 1.0, 5.0, 10.0, 15.0, 20.0, 30.0))
@@ -65,7 +81,22 @@ class ForceControlGuiConfigTest(unittest.TestCase):
         self.assertTrue(all(row["zero_offset_updated"] for row in mapping))
         self.assertTrue(all(row["zero_sample_count"] == 78 for row in mapping))
         self.assertTrue(all(row["zero_std_deg"] is not None for row in mapping))
+        self.assertTrue(all(row["servo_stream"]["sample_count"] == 0 for row in mapping))
+        self.assertTrue(all(row["encoder_stream"]["sample_count"] == 0 for row in mapping))
         self.assertEqual(Path(mapping[0]["calibration_path"]).parent, DEFAULT_CALIBRATION_DIR)
+
+    def test_recent_stream_stats_reports_rate_gap_and_valid_percent(self):
+        stats = _RecentStreamStats()
+        stats.record(1, True, received_at=10.0)
+        stats.record(1, False, received_at=10.1)
+        stats.record(1, True, received_at=10.3)
+
+        result = stats.snapshot(1, now=10.3)
+
+        self.assertEqual(result["sample_count"], 3)
+        self.assertAlmostEqual(result["effective_hz"], 2.0 / 0.3)
+        self.assertAlmostEqual(result["max_interval_s"], 0.2)
+        self.assertAlmostEqual(result["valid_percent"], 200.0 / 3.0)
 
     def test_drain_samples_returns_empty_list_when_queue_is_empty(self):
         session = ForceControlSession(load_gui_force_config())
@@ -147,6 +178,10 @@ class ForceControlGuiConfigTest(unittest.TestCase):
 
         self.assertTrue(session.faulted)
         self.assertEqual(session.fault_message, "invalid telemetry for ID 2")
+        self.assertIn(
+            "FAULT: all servos stopped: invalid telemetry for ID 2",
+            session.drain_events(),
+        )
 
     def test_arm_is_blocked_during_manual_feedback_recovery(self):
         session = ForceControlSession(load_gui_force_config())
@@ -195,6 +230,55 @@ class ForceControlGuiConfigTest(unittest.TestCase):
         self.assertAlmostEqual(result["intercept_nmm"], 6.0)
         self.assertAlmostEqual(state.intercept_nmm, 6.0)
         self.assertEqual(state.baseline_force_n, 0.0)
+
+    def test_zero_force_calibration_skips_transient_missing_feedback(self):
+        session = ForceControlSession(load_gui_force_config())
+        model = {"slope_nmm_per_deg": -2.0}
+        state = SimpleNamespace(
+            model=model,
+            sensor_id=1,
+            intercept_nmm=99.0,
+            baseline_force_n=4.0,
+        )
+        session._connected = True
+        session._states = {1: state}
+        valid_feedback = {
+            1: {
+                "angle_delta_deg": 3.0,
+                "encoder_position_deg": 720.0,
+                "encoder_received_at": 1.0,
+                "multiturn_angle_model": True,
+            }
+        }
+        calls = 0
+
+        def feedback_with_one_dropout():
+            nonlocal calls
+            calls += 1
+            return {} if calls == 1 else valid_feedback
+
+        session._feedback = Mock(side_effect=feedback_with_one_dropout)
+        with tempfile.TemporaryDirectory() as directory:
+            session._intercept_calibration_path = (
+                Path(directory) / "torque_intercept_calibration.json"
+            )
+
+            result = session.calibrate_current_force_as_zero(1, duration_s=0.02)
+
+        self.assertGreaterEqual(calls, 2)
+        self.assertAlmostEqual(result["intercept_nmm"], 6.0)
+        self.assertEqual(model["slope_nmm_per_deg"], -2.0)
+
+    def test_calibration_readiness_allows_transient_feedback_recovery(self):
+        session = ForceControlSession(load_gui_force_config())
+        session._connected = True
+        session._manual_feedback_recovering = True
+        session._feedback_errors = {2: "temporary dropout"}
+
+        readiness = session.calibration_readiness_snapshot()
+
+        self.assertIsNone(readiness["all_reason"])
+        self.assertTrue(all(reason is None for reason in readiness["by_servo"].values()))
 
     def test_remember_encoder_position_uses_magnetic_encoder(self):
         session = ForceControlSession(load_gui_force_config())
@@ -253,7 +337,7 @@ class ForceControlGuiConfigTest(unittest.TestCase):
             self.assertAlmostEqual(state.intercept_nmm, 6.0)
             self.assertEqual(state.baseline_force_n, 0.0)
 
-    def test_feedback_holds_previous_force_when_streams_are_not_synchronized(self):
+    def test_feedback_uses_older_servo_sample_with_closest_timestamp(self):
         api_python = str(API_ROOT / "python")
         if api_python not in sys.path:
             sys.path.insert(0, api_python)
@@ -287,22 +371,91 @@ class ForceControlGuiConfigTest(unittest.TestCase):
         session._servo_index = {1: 0}
         session._states = {1: state}
 
+        timestamp = time.monotonic() - 0.1
+        with session._feedback_history_lock:
+            session._servo_feedback_history.extend(
+                (
+                    (timestamp + 0.025, {"valid": [True], "positions": [2048]}),
+                    (timestamp + 0.100, {"valid": [True], "positions": [3072]}),
+                )
+            )
+            session._encoder_feedback_histories[1].append(
+                (
+                    timestamp + 0.040,
+                    {"status": "OK", "relative_multi_turn_deg": 45.0},
+                )
+            )
+
+        paired = session._feedback()[1]
+
+        self.assertEqual(paired["position"], 2048.0)
+        self.assertAlmostEqual(paired["sync_age_s"], 0.015)
+
+    def test_feedback_rejects_when_no_synchronized_pair_exists(self):
+        session = ForceControlSession(load_gui_force_config())
+        state = SimpleNamespace(
+            servo_id=1,
+            sensor_id=1,
+            model={},
+            intercept_nmm=0.0,
+            previous_snapshot=None,
+            latest_force_n=None,
+            latest_position=None,
+        )
+        session._servo = object()
+        session._servo_store = LatestSampleStore()
+        session._encoder_stores = {1: LatestSampleStore()}
+        session._servo_index = {1: 0}
+        session._states = {1: state}
+        timestamp = time.monotonic() - 0.1
+        with session._feedback_history_lock:
+            session._servo_feedback_history.append(
+                (timestamp, {"valid": [True], "positions": [2048]})
+            )
+            session._encoder_feedback_histories[1].append(
+                (
+                    timestamp + 0.080,
+                    {"status": "OK", "relative_multi_turn_deg": 0.0},
+                )
+            )
+
+        feedback = session._feedback()
+        error = session.feedback_errors_snapshot()[1]
+
+        self.assertEqual(feedback, {})
+        self.assertIn("synchronized feedback unavailable", error)
+        self.assertIn("closest timestamp gap 80 ms exceeds 30 ms", error)
+
+    def test_feedback_rejects_encoder_sample_without_multiturn_angle(self):
+        session = ForceControlSession(load_gui_force_config())
+        state = SimpleNamespace(
+            servo_id=1,
+            sensor_id=1,
+            model={},
+            intercept_nmm=0.0,
+            previous_snapshot=None,
+            latest_force_n=None,
+            latest_position=None,
+        )
+        session._servo = object()
+        session._servo_store = LatestSampleStore()
+        session._encoder_stores = {1: LatestSampleStore()}
+        session._servo_index = {1: 0}
+        session._states = {1: state}
         timestamp = time.monotonic()
-        servo_store.publish({"valid": [True], "positions": [2048]}, received_at=timestamp)
-        encoder_store.publish(
-            {"status": "OK", "relative_multi_turn_deg": 0.0},
-            received_at=timestamp,
-        )
-        initial = session._feedback()[1]
+        with session._feedback_history_lock:
+            session._servo_feedback_history.append(
+                (timestamp, {"valid": [True], "positions": [2048]})
+            )
+            session._encoder_feedback_histories[1].append(
+                (timestamp, {"status": "OK", "relative_deg": 0.0})
+            )
 
-        encoder_store.publish(
-            {"status": "OK", "relative_multi_turn_deg": 45.0},
-            received_at=timestamp + 0.040,
-        )
-        held = session._feedback()[1]
+        feedback = session._feedback()
+        error = session.feedback_errors_snapshot()[1]
 
-        self.assertAlmostEqual(held["force_n"], initial["force_n"])
-        self.assertAlmostEqual(held["angle_delta_deg"], initial["angle_delta_deg"])
+        self.assertEqual(feedback, {})
+        self.assertIn("no multi-turn angle", error)
 
 
 if __name__ == "__main__":

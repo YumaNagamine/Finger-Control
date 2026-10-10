@@ -43,10 +43,56 @@ SERVO_IDS = (1, 2, 3, 4, 5, 6)
 SERVO_NAMES = ("ED", "DI", "FDS", "FDP", "LU", "PI")
 MANUAL_SPEED_PRESETS = (-500, -100, 0, 100, 500)
 FEEDBACK_SYNC_TOLERANCE_S = 0.030
+FEEDBACK_LOG_COOLDOWN_S = 1.0
+CALIBRATION_SAMPLE_WAIT_S = 3.0
+COMMUNICATION_STATS_WINDOW_S = 5.0
+COMMUNICATION_STATS_MAX_SAMPLES = 1024
+VALID_ENCODER_STATUSES = {"OK", "MULTITURN_UNCERTAIN"}
+FEEDBACK_HISTORY_DURATION_S = 0.5
+FEEDBACK_HISTORY_MAX_SAMPLES = 128
 DEFAULT_ZERO_OFFSET_FILE = DEFAULT_CALIBRATION_DIR / "as5048a_unloaded_zero_offsets.json"
 DEFAULT_INTERCEPT_CALIBRATION_FILE = (
     DEFAULT_CALIBRATION_DIR / "torque_intercept_calibration.json"
 )
+
+
+class _CompleteLineTransport:
+    """Keep timeout-split serial bytes until a complete newline arrives."""
+
+    def __init__(self, transport: Any):
+        self._transport = transport
+        self._read_buffer = bytearray()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._transport, name)
+
+    def reset_buffers(self) -> None:
+        self._read_buffer.clear()
+        self._transport.reset_buffers()
+
+    def read_raw_line(self) -> bytes:
+        self._transport.require_open()
+        newline_index = self._read_buffer.find(b"\n")
+        if newline_index < 0:
+            raw = self._transport.port.read_until(b"\n")
+            if raw:
+                self._read_buffer.extend(raw)
+            newline_index = self._read_buffer.find(b"\n")
+        if newline_index < 0:
+            return b""
+        line = bytes(self._read_buffer[: newline_index + 1])
+        del self._read_buffer[: newline_index + 1]
+        return line
+
+    def read_line(self, encoding: str = "utf-8") -> str:
+        raw = self.read_raw_line()
+        if not raw:
+            return ""
+        return raw.decode(encoding, errors="replace")
+
+    def close(self) -> None:
+        self._read_buffer.clear()
+        self._transport.close()
 
 
 @dataclass(frozen=True)
@@ -197,11 +243,81 @@ class _ServoState:
     latest_position: Optional[float] = None
 
 
+class _RecentStreamStats:
+    """Keep a bounded rolling window of receive timing and validity."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._samples: Dict[int, Deque[tuple]] = {}
+
+    def clear(self) -> None:
+        with self._lock:
+            self._samples.clear()
+
+    def record(
+        self,
+        stream_id: int,
+        valid: bool,
+        *,
+        received_at: Optional[float] = None,
+    ) -> None:
+        timestamp = time.monotonic() if received_at is None else float(received_at)
+        with self._lock:
+            samples = self._samples.setdefault(
+                int(stream_id),
+                deque(maxlen=COMMUNICATION_STATS_MAX_SAMPLES),
+            )
+            samples.append((timestamp, bool(valid)))
+
+    def snapshot(
+        self,
+        stream_id: int,
+        *,
+        now: Optional[float] = None,
+        window_s: float = COMMUNICATION_STATS_WINDOW_S,
+    ) -> dict:
+        current_time = time.monotonic() if now is None else float(now)
+        cutoff = current_time - float(window_s)
+        with self._lock:
+            samples = [
+                sample
+                for sample in self._samples.get(int(stream_id), ())
+                if sample[0] >= cutoff
+            ]
+        intervals = [
+            current[0] - previous[0]
+            for previous, current in zip(samples, samples[1:])
+            if current[0] >= previous[0]
+        ]
+        elapsed_s = samples[-1][0] - samples[0][0] if len(samples) >= 2 else 0.0
+        effective_hz = (
+            (len(samples) - 1) / elapsed_s
+            if len(samples) >= 2 and elapsed_s > 0.0
+            else None
+        )
+        valid_percent = (
+            100.0 * sum(1 for _, valid in samples if valid) / len(samples)
+            if samples
+            else None
+        )
+        return {
+            "window_s": float(window_s),
+            "sample_count": len(samples),
+            "effective_hz": effective_hz,
+            "max_interval_s": max(intervals) if intervals else None,
+            "valid_percent": valid_percent,
+            "last_age_s": (
+                max(0.0, current_time - samples[-1][0]) if samples else None
+            ),
+        }
+
+
 class _EncoderFanout:
     """Route six AS5048A samples from one reader to six latest stores."""
 
-    def __init__(self, stores: Dict[int, Any]):
+    def __init__(self, stores: Dict[int, Any], on_sample=None):
         self.stores = stores
+        self.on_sample = on_sample
 
     def __call__(self, parsed: Any) -> Optional[Any]:
         if not isinstance(parsed, (tuple, list)) or len(parsed) != 2:
@@ -217,7 +333,10 @@ class _EncoderFanout:
             return None
         store = self.stores.get(sensor_id)
         if store is not None:
-            store.publish(sample)
+            received_at = time.monotonic()
+            store.publish(sample, received_at=received_at)
+            if self.on_sample is not None:
+                self.on_sample(sensor_id, sample, received_at)
         return None
 
 
@@ -266,6 +385,19 @@ class ForceControlSession:
             servo_id: 0 for servo_id in SERVO_IDS
         }
         self._manual_feedback_recovering = False
+        self._feedback_errors: Dict[int, str] = {}
+        self._servo_stream_stats = _RecentStreamStats()
+        self._encoder_stream_stats = _RecentStreamStats()
+        self._feedback_history_lock = threading.Lock()
+        self._servo_feedback_history: Deque[tuple] = deque(
+            maxlen=FEEDBACK_HISTORY_MAX_SAMPLES
+        )
+        self._encoder_feedback_histories: Dict[int, Deque[tuple]] = {
+            sensor_id: deque(maxlen=FEEDBACK_HISTORY_MAX_SAMPLES)
+            for sensor_id in SERVO_IDS
+        }
+        self._last_feedback_warning_at = 0.0
+        self._feedback_warning_logged = False
         self._last_parameters: Optional[dict] = None
         self._calibration_dir = DEFAULT_CALIBRATION_DIR
         self._zero_offset_path = DEFAULT_ZERO_OFFSET_FILE
@@ -305,6 +437,31 @@ class ForceControlSession:
         with self._lock:
             return self._manual_feedback_recovering
 
+    def feedback_errors_snapshot(self) -> Dict[int, str]:
+        with self._lock:
+            return dict(self._feedback_errors)
+
+    def calibration_readiness_snapshot(self) -> dict:
+        """Return user-facing reasons why torque calibration is unavailable."""
+
+        with self._lock:
+            if not self._connected:
+                common_reason = "connect first"
+            elif self._faulted:
+                common_reason = "faulted; disconnect and reconnect"
+            elif self._armed or self._running:
+                common_reason = "stop and disarm force control"
+            elif any(self._manual_speed_commands.values()):
+                common_reason = "set every manual speed command to 0"
+            else:
+                common_reason = None
+
+            by_servo = {
+                servo_id: common_reason
+                for servo_id in SERVO_IDS
+            }
+            return {"all_reason": common_reason, "by_servo": by_servo}
+
     def _emit(self, message: str) -> None:
         try:
             self._event_queue.put_nowait(message)
@@ -319,6 +476,36 @@ class ForceControlSession:
                 pass
         if self.status_callback is not None:
             self.status_callback(message)
+
+    def _update_feedback_errors(
+        self,
+        errors: Dict[int, str],
+        *,
+        all_feedback_failed: bool,
+    ) -> None:
+        message = None
+        now = time.monotonic()
+        with self._lock:
+            previous_ids = set(self._feedback_errors)
+            self._feedback_errors = dict(errors)
+            current_ids = set(errors)
+            if not current_ids:
+                if previous_ids and self._feedback_warning_logged:
+                    self._feedback_warning_logged = False
+                    message = "Feedback recovered."
+            elif (
+                not all_feedback_failed
+                and current_ids != previous_ids
+                and now - self._last_feedback_warning_at >= FEEDBACK_LOG_COOLDOWN_S
+            ):
+                details = "; ".join(
+                    errors[servo_id] for servo_id in sorted(errors)
+                )
+                self._last_feedback_warning_at = now
+                self._feedback_warning_logged = True
+                message = f"WARNING: partial feedback unavailable: {details}"
+        if message is not None:
+            self._emit(message)
 
     @staticmethod
     def _check_cancelled(cancel_event: threading.Event) -> None:
@@ -417,6 +604,7 @@ class ForceControlSession:
             encoder_stores = dict(self._encoder_stores)
             servo_reader = self._servo_reader
             encoder_reader = self._encoder_reader
+            encoder_reader_store = self._encoder_reader_store
 
         if not offsets:
             offsets = self._read_zero_offset_records(zero_offset_path)
@@ -473,6 +661,12 @@ class ForceControlSession:
                     "zero_sample_count": offset.get("sample_count"),
                     "zero_std_deg": offset.get("std_delta_deg"),
                     "initial_force_n": None if state is None else state.baseline_force_n,
+                    "servo_stream": self._servo_stream_stats.snapshot(
+                        servo_id, now=now
+                    ),
+                    "encoder_stream": self._encoder_stream_stats.snapshot(
+                        sensor_id, now=now
+                    ),
                 }
             )
 
@@ -484,7 +678,11 @@ class ForceControlSession:
                 "faulted": faulted,
             },
             "servo_communication": reader_status(servo_reader, (servo_store,)),
-            "encoder_communication": reader_status(encoder_reader, encoder_stores.values()),
+            "encoder_communication": reader_status(
+                encoder_reader,
+                (encoder_reader_store, *encoder_stores.values()),
+            ),
+            "feedback_errors": self.feedback_errors_snapshot(),
             "control_sign": parameters.get("control_sign"),
             "mapping": mapping,
         }
@@ -631,16 +829,24 @@ class ForceControlSession:
                 baudrate=921600,
                 timeout=min(0.05, self.config.feedback_timeout_s),
             ).open()
-            encoder_transport = SerialTransport(
-                str(encoder_port),
-                baudrate=921600,
-                timeout=min(0.05, self.config.feedback_timeout_s),
-            ).open()
+            encoder_transport = _CompleteLineTransport(
+                SerialTransport(
+                    str(encoder_port),
+                    baudrate=921600,
+                    timeout=min(0.05, self.config.feedback_timeout_s),
+                ).open()
+            )
             servo = ServoControllerDriver(servo_transport, servo_system=system)
             encoder = AS5048ABridgeDriver(encoder_transport)
             servo_store = LatestSampleStore()
             encoder_reader_store = LatestSampleStore()
             encoder_stores = {sensor_id: LatestSampleStore() for sensor_id in SERVO_IDS}
+            self._servo_stream_stats.clear()
+            self._encoder_stream_stats.clear()
+            with self._feedback_history_lock:
+                self._servo_feedback_history.clear()
+                for history in self._encoder_feedback_histories.values():
+                    history.clear()
             stop_event = threading.Event()
             servo_reader = ReaderTask(
                 servo.read_parsed_line,
@@ -651,7 +857,7 @@ class ForceControlSession:
             )
             encoder_reader = ReaderTask(
                 encoder.read_parsed_line,
-                _EncoderFanout(encoder_stores),
+                _EncoderFanout(encoder_stores, self._record_encoder_sample),
                 encoder_reader_store,
                 stop_event,
                 name="force-gui-encoder-reader",
@@ -692,6 +898,7 @@ class ForceControlSession:
                     servo_id: 0 for servo_id in SERVO_IDS
                 }
                 self._manual_feedback_recovering = False
+                self._feedback_errors = {}
                 self._connected = True
                 self._armed = False
                 self._running = False
@@ -755,6 +962,7 @@ class ForceControlSession:
                     servo_id: 0 for servo_id in SERVO_IDS
                 }
                 self._manual_feedback_recovering = False
+                self._feedback_errors = {}
                 self._last_fault_message = None
                 self._stop_event = threading.Event()
             raise
@@ -763,11 +971,150 @@ class ForceControlSession:
                 if self._connect_cancel_event is connect_cancel_event:
                     self._connect_cancel_event = None
 
-    @staticmethod
-    def _accept_servo(parsed: Any) -> Optional[dict]:
+    def _accept_servo(self, parsed: Any) -> Optional[dict]:
         if isinstance(parsed, dict) and parsed.get("kind") == "telemetry":
+            received_at = time.monotonic()
+            with self._feedback_history_lock:
+                self._servo_feedback_history.append((received_at, parsed))
+                cutoff = received_at - FEEDBACK_HISTORY_DURATION_S
+                while (
+                    self._servo_feedback_history
+                    and self._servo_feedback_history[0][0] < cutoff
+                ):
+                    self._servo_feedback_history.popleft()
+            valid_values = parsed.get("valid", ())
+            for servo_id in SERVO_IDS:
+                servo_index = self._servo_index.get(servo_id)
+                valid = bool(
+                    servo_index is not None
+                    and servo_index < len(valid_values)
+                    and valid_values[servo_index]
+                )
+                self._servo_stream_stats.record(
+                    servo_id, valid, received_at=received_at
+                )
             return parsed
         return None
+
+    def _record_encoder_sample(
+        self, sensor_id: int, sample: dict, received_at: float
+    ) -> None:
+        status = str(sample.get("status", "")).strip().upper()
+        has_multiturn = sample.get("relative_multi_turn_deg") is not None
+        with self._feedback_history_lock:
+            history = self._encoder_feedback_histories.get(int(sensor_id))
+            if history is not None:
+                history.append((received_at, sample))
+                cutoff = received_at - FEEDBACK_HISTORY_DURATION_S
+                while history and history[0][0] < cutoff:
+                    history.popleft()
+        self._encoder_stream_stats.record(
+            sensor_id,
+            status in VALID_ENCODER_STATUSES and has_multiturn,
+            received_at=received_at,
+        )
+
+    def _synchronized_feedback_pair(
+        self,
+        servo_id: int,
+        sensor_id: int,
+        servo_index: int,
+        now: float,
+    ) -> tuple:
+        """Return the freshest valid servo/encoder pair inside the sync limit."""
+
+        with self._feedback_history_lock:
+            servo_history = list(self._servo_feedback_history)
+            encoder_history = list(
+                self._encoder_feedback_histories.get(sensor_id, ())
+            )
+
+        if not servo_history:
+            return None, f"ID {servo_id}: no servo telemetry history"
+        if not encoder_history:
+            return None, f"ID {servo_id}: no encoder history for CS{sensor_id}"
+
+        latest_servo_at, latest_servo = servo_history[-1]
+        latest_encoder_at, latest_encoder = encoder_history[-1]
+        servo_age_s = max(0.0, now - latest_servo_at)
+        encoder_age_s = max(0.0, now - latest_encoder_at)
+        valid_values = latest_servo.get("valid", ())
+        latest_servo_valid = bool(
+            servo_index < len(valid_values) and valid_values[servo_index]
+        )
+        latest_encoder_status = str(
+            latest_encoder.get("status", "unknown")
+        ).strip().upper()
+        latest_encoder_has_multiturn = (
+            latest_encoder.get("relative_multi_turn_deg") is not None
+        )
+
+        fresh_servos = []
+        for received_at, telemetry in servo_history:
+            age_s = max(0.0, now - received_at)
+            valid = telemetry.get("valid", ())
+            if (
+                age_s <= self.config.feedback_timeout_s
+                and servo_index < len(valid)
+                and valid[servo_index]
+            ):
+                fresh_servos.append((received_at, telemetry))
+
+        fresh_encoders = [
+            (received_at, sample)
+            for received_at, sample in encoder_history
+            if max(0.0, now - received_at) <= self.config.feedback_timeout_s
+            and str(sample.get("status", "")).strip().upper()
+            in VALID_ENCODER_STATUSES
+            and sample.get("relative_multi_turn_deg") is not None
+        ]
+
+        closest_gap_s = None
+        for encoder_entry in reversed(fresh_encoders):
+            encoder_at = encoder_entry[0]
+            if not fresh_servos:
+                break
+            servo_entry = min(
+                fresh_servos,
+                key=lambda item: abs(item[0] - encoder_at),
+            )
+            gap_s = abs(servo_entry[0] - encoder_at)
+            if closest_gap_s is None or gap_s < closest_gap_s:
+                closest_gap_s = gap_s
+            if gap_s <= FEEDBACK_SYNC_TOLERANCE_S:
+                return (servo_entry, encoder_entry, gap_s), None
+
+        if not fresh_servos:
+            if not latest_servo_valid:
+                reason = "latest servo telemetry is invalid"
+            else:
+                reason = (
+                    f"servo sample is stale ({servo_age_s * 1000.0:.0f} ms > "
+                    f"{self.config.feedback_timeout_s * 1000.0:.0f} ms)"
+                )
+        elif not fresh_encoders:
+            if (
+                latest_encoder_status in VALID_ENCODER_STATUSES
+                and not latest_encoder_has_multiturn
+            ):
+                reason = "latest encoder sample has no multi-turn angle"
+            elif latest_encoder_status not in VALID_ENCODER_STATUSES:
+                reason = f"latest encoder status is {latest_encoder_status}"
+            else:
+                reason = (
+                    f"encoder sample is stale ({encoder_age_s * 1000.0:.0f} ms > "
+                    f"{self.config.feedback_timeout_s * 1000.0:.0f} ms)"
+                )
+        else:
+            reason = (
+                f"closest timestamp gap {closest_gap_s * 1000.0:.0f} ms exceeds "
+                f"{FEEDBACK_SYNC_TOLERANCE_S * 1000.0:.0f} ms"
+            )
+        return None, (
+            f"ID {servo_id}: synchronized feedback unavailable: {reason}; "
+            f"servo age {servo_age_s * 1000.0:.0f} ms, "
+            f"encoder age {encoder_age_s * 1000.0:.0f} ms"
+        )
 
     def _feedback(self) -> Dict[int, dict]:
         with self._feedback_lock:
@@ -778,39 +1125,43 @@ class ForceControlSession:
 
         with self._lock:
             servo_store = self._servo_store
-            encoder_stores = dict(self._encoder_stores)
+            encoder_reader_store = self._encoder_reader_store
             states = list(self._states.values())
             servo = self._servo
         if servo_store is None or servo is None:
             raise RuntimeError("Feedback is not connected")
+        if servo_store.error is not None:
+            raise RuntimeError(
+                f"Servo feedback reader failed: {servo_store.error}"
+            )
+        if encoder_reader_store is not None and encoder_reader_store.error is not None:
+            raise RuntimeError(
+                f"Encoder feedback reader failed: {encoder_reader_store.error}"
+            )
 
-        servo_record = servo_store.snapshot()
-        if servo_record is None:
-            raise RuntimeError("Servo telemetry is unavailable")
         now = time.monotonic()
-        telemetry = servo_record.value
         result: Dict[int, dict] = {}
+        feedback_errors: Dict[int, str] = {}
         for state in states:
             servo_index = self._servo_index[state.servo_id]
-            if not telemetry["valid"][servo_index]:
-                raise RuntimeError(f"Servo telemetry is invalid for ID {state.servo_id}")
-            encoder_record = encoder_stores[state.sensor_id].snapshot()
-            if encoder_record is None:
-                raise RuntimeError(f"AS5048A telemetry is unavailable for CS{state.sensor_id}")
-            servo_age_s = max(0.0, now - servo_record.received_at)
-            encoder_age_s = max(0.0, now - encoder_record.received_at)
-            sync_age_s = abs(encoder_record.received_at - servo_record.received_at)
-            telemetry_age_s = max(servo_age_s, encoder_age_s, sync_age_s)
-            hold_previous_snapshot = (
-                sync_age_s > FEEDBACK_SYNC_TOLERANCE_S
-                and state.previous_snapshot is not None
-                and sync_age_s <= self.config.feedback_timeout_s
+            synchronized, sync_error = self._synchronized_feedback_pair(
+                state.servo_id,
+                state.sensor_id,
+                servo_index,
+                now,
             )
-            if hold_previous_snapshot:
-                snapshot = state.previous_snapshot
-            else:
+            if synchronized is None:
+                feedback_errors[state.servo_id] = sync_error
+                continue
+            servo_entry, encoder_entry, sync_age_s = synchronized
+            servo_received_at, telemetry = servo_entry
+            encoder_received_at, encoder_sample = encoder_entry
+            servo_age_s = max(0.0, now - servo_received_at)
+            encoder_age_s = max(0.0, now - encoder_received_at)
+            telemetry_age_s = max(servo_age_s, encoder_age_s, sync_age_s)
+            try:
                 snapshot = compute_torque_snapshot(
-                    sample=encoder_record.value,
+                    sample=encoder_sample,
                     servo_id=state.servo_id,
                     motor_name=state.model["motor_name"],
                     servo_raw=telemetry["positions"][servo_index],
@@ -830,8 +1181,20 @@ class ForceControlSession:
                     jump_filter_enabled=True,
                     previous_snapshot=state.previous_snapshot,
                 )
+            except (IndexError, KeyError, TypeError, ValueError, OverflowError) as exc:
+                feedback_errors[state.servo_id] = (
+                    f"ID {state.servo_id}: force calculation failed "
+                    f"({type(exc).__name__})"
+                )
+                continue
             if snapshot is None or snapshot["force_n"] is None:
-                raise RuntimeError(f"Force estimate is unavailable for ID {state.servo_id}")
+                sample_status = str(encoder_sample.get("status", "unknown"))
+                feedback_errors[state.servo_id] = (
+                    f"ID {state.servo_id}: force unavailable "
+                    f"(status={sample_status}, servo_age={servo_age_s:.3f}s, "
+                    f"encoder_age={encoder_age_s:.3f}s, sync={sync_age_s:.3f}s)"
+                )
+                continue
             force_n = float(snapshot["force_n"])
             position = float(telemetry["positions"][servo_index])
             with self._lock:
@@ -845,11 +1208,16 @@ class ForceControlSession:
                 "position": position,
                 "encoder_position_deg": float(snapshot["encoder_angle_deg"]),
                 "angle_delta_deg": float(snapshot["angle_delta_deg"]),
-                "encoder_received_at": float(encoder_record.received_at),
+                "encoder_received_at": float(encoder_received_at),
                 "multiturn_angle_model": bool(snapshot["multiturn_angle_model"]),
                 "servo_age_s": servo_age_s,
                 "encoder_age_s": encoder_age_s,
+                "sync_age_s": sync_age_s,
             }
+        self._update_feedback_errors(
+            feedback_errors,
+            all_feedback_failed=bool(states) and not result,
+        )
         return result
 
     def _validate_calibration_ready(self, servo_id: int) -> _ServoState:
@@ -857,8 +1225,8 @@ class ForceControlSession:
         with self._lock:
             if not self._connected:
                 raise RuntimeError("Connect before torque calibration")
-            if self._faulted or self._manual_feedback_recovering:
-                raise RuntimeError("Wait for healthy feedback before torque calibration")
+            if self._faulted:
+                raise RuntimeError("Disconnect and reconnect after a fault")
             if self._armed or self._running:
                 raise RuntimeError("Stop and disarm force control before torque calibration")
             if any(self._manual_speed_commands.values()):
@@ -883,18 +1251,40 @@ class ForceControlSession:
             samples: List[float] = []
             encoder_positions: List[float] = []
             previous_received_at: Optional[float] = None
-            deadline = time.monotonic() + duration_s
-            while time.monotonic() < deadline:
+            started_at = time.monotonic()
+            capture_deadline = started_at + duration_s
+            retry_deadline = started_at + max(duration_s, CALIBRATION_SAMPLE_WAIT_S)
+            last_feedback_error = None
+            while (
+                time.monotonic() < capture_deadline
+                or (not samples and time.monotonic() < retry_deadline)
+            ):
                 self._validate_calibration_ready(servo_id)
-                item = self._feedback()[int(servo_id)]
-                received_at = item["encoder_received_at"]
-                if received_at != previous_received_at:
-                    samples.append(float(item["angle_delta_deg"]))
-                    encoder_positions.append(float(item["encoder_position_deg"]))
-                    previous_received_at = received_at
+                try:
+                    feedback = self._feedback()
+                except RuntimeError as exc:
+                    last_feedback_error = str(exc)
+                    time.sleep(0.01)
+                    continue
+                item = feedback.get(int(servo_id))
+                if item is None:
+                    last_feedback_error = self.feedback_errors_snapshot().get(
+                        int(servo_id),
+                        f"Feedback unavailable for ID {servo_id}",
+                    )
+                else:
+                    received_at = item["encoder_received_at"]
+                    if received_at != previous_received_at:
+                        samples.append(float(item["angle_delta_deg"]))
+                        encoder_positions.append(float(item["encoder_position_deg"]))
+                        previous_received_at = received_at
                 time.sleep(0.005)
             if not samples:
-                raise RuntimeError("No valid magnetic-encoder samples were captured")
+                detail = last_feedback_error or "no valid feedback was received"
+                raise RuntimeError(
+                    f"No valid magnetic-encoder samples were captured within "
+                    f"{max(duration_s, CALIBRATION_SAMPLE_WAIT_S):g} s: {detail}"
+                )
 
             if str(API_ROOT / "python") not in sys.path:
                 sys.path.insert(0, str(API_ROOT / "python"))
@@ -960,13 +1350,32 @@ class ForceControlSession:
             previous_received_at: Dict[int, Optional[float]] = {
                 servo_id: None for servo_id in SERVO_IDS
             }
-            deadline = time.monotonic() + duration_s
-            while time.monotonic() < deadline:
+            started_at = time.monotonic()
+            capture_deadline = started_at + duration_s
+            retry_deadline = started_at + max(duration_s, CALIBRATION_SAMPLE_WAIT_S)
+            last_feedback_errors: Dict[int, str] = {}
+            while (
+                time.monotonic() < capture_deadline
+                or (
+                    any(not samples_by_servo[servo_id] for servo_id in SERVO_IDS)
+                    and time.monotonic() < retry_deadline
+                )
+            ):
                 for servo_id in SERVO_IDS:
                     self._validate_calibration_ready(servo_id)
-                feedback = self._feedback()
+                try:
+                    feedback = self._feedback()
+                except RuntimeError as exc:
+                    last_feedback_errors = {
+                        servo_id: str(exc) for servo_id in SERVO_IDS
+                    }
+                    time.sleep(0.01)
+                    continue
+                last_feedback_errors.update(self.feedback_errors_snapshot())
                 for servo_id in SERVO_IDS:
-                    item = feedback[servo_id]
+                    item = feedback.get(servo_id)
+                    if item is None:
+                        continue
                     received_at = item["encoder_received_at"]
                     if received_at != previous_received_at[servo_id]:
                         samples_by_servo[servo_id].append(
@@ -978,15 +1387,17 @@ class ForceControlSession:
                         previous_received_at[servo_id] = received_at
                 time.sleep(0.005)
 
-            missing = [
-                str(servo_id)
-                for servo_id in SERVO_IDS
-                if not samples_by_servo[servo_id]
-            ]
+            missing = [servo_id for servo_id in SERVO_IDS if not samples_by_servo[servo_id]]
             if missing:
+                details = "; ".join(
+                    last_feedback_errors.get(
+                        servo_id, f"feedback unavailable for ID {servo_id}"
+                    )
+                    for servo_id in missing
+                )
                 raise RuntimeError(
-                    "No valid magnetic-encoder samples were captured for servo ID(s) "
-                    + ", ".join(missing)
+                    "No valid magnetic-encoder samples were captured within "
+                    f"{max(duration_s, CALIBRATION_SAMPLE_WAIT_S):g} s: {details}"
                 )
 
             if str(API_ROOT / "python") not in sys.path:
@@ -1050,7 +1461,14 @@ class ForceControlSession:
             raise RuntimeError("Another torque calibration action is already in progress")
         try:
             state = self._validate_calibration_ready(servo_id)
-            item = self._feedback()[int(servo_id)]
+            feedback = self._feedback()
+            item = feedback.get(int(servo_id))
+            if item is None:
+                reason = self.feedback_errors_snapshot().get(
+                    int(servo_id),
+                    f"Feedback unavailable for ID {servo_id}",
+                )
+                raise RuntimeError(f"Remember calibration position stopped: {reason}")
             if not item["multiturn_angle_model"]:
                 raise RuntimeError("Multi-turn magnetic-encoder position is unavailable")
             record = {
@@ -1297,6 +1715,10 @@ class ForceControlSession:
                     raise RuntimeError("Stop force control before using speed control")
                 if self._manual_feedback_recovering:
                     raise RuntimeError("Wait for feedback recovery before using speed control")
+                if servo_id in self._feedback_errors and speed != 0:
+                    raise RuntimeError(
+                        f"Feedback unavailable for ID {servo_id}; wait for recovery"
+                    )
                 if servo_id not in self._states:
                     raise ValueError(f"Unknown servo ID: {servo_id}")
                 servo = self._servo
@@ -1355,13 +1777,39 @@ class ForceControlSession:
             try:
                 feedback = self._feedback()
                 with self._lock:
+                    states = list(self._states.values())
+                    feedback_errors = dict(self._feedback_errors)
+                if states and not feedback:
+                    details = "; ".join(
+                        feedback_errors[servo_id]
+                        for servo_id in sorted(feedback_errors)
+                    )
+                    raise RuntimeError(f"All force feedback unavailable: {details}")
+                with self._lock:
                     self._manual_feedback_recovering = False
                 now = time.monotonic()
-                with self._lock:
-                    states = list(self._states.values())
                 commands: List[tuple] = []
+                failed_manual_ids: List[int] = []
                 for state in states:
-                    item = feedback[state.servo_id]
+                    item = feedback.get(state.servo_id)
+                    if item is None:
+                        with self._lock:
+                            state_active = bool(
+                                self._running and self._armed and state.active
+                            )
+                            manual_speed = self._manual_speed_commands.get(
+                                state.servo_id, 0
+                            )
+                        if state_active:
+                            raise RuntimeError(
+                                feedback_errors.get(
+                                    state.servo_id,
+                                    f"Feedback unavailable for ID {state.servo_id}",
+                                )
+                            )
+                        if manual_speed:
+                            failed_manual_ids.append(state.servo_id)
+                        continue
                     with self._lock:
                         if self._states.get(state.servo_id) is not state:
                             continue
@@ -1410,6 +1858,15 @@ class ForceControlSession:
                             active=active,
                         )
                     )
+                if failed_manual_ids:
+                    with self._command_lock:
+                        with self._lock:
+                            servo = self._servo
+                            for servo_id in failed_manual_ids:
+                                self._manual_speed_commands[servo_id] = 0
+                        if servo is not None:
+                            for servo_id in failed_manual_ids:
+                                servo.send_speed_by_id(servo_id, 0)
                 if commands:
                     with self._command_lock:
                         with self._lock:
@@ -1480,6 +1937,8 @@ class ForceControlSession:
     def _handle_manual_feedback_error(self, exc: Exception) -> bool:
         """Keep a connected, non-running session alive while feedback recovers."""
 
+        warning_message = None
+        now = time.monotonic()
         with self._lock:
             force_control_active = self._running and self._armed
             manual_speed_active = any(self._manual_speed_commands.values())
@@ -1494,11 +1953,19 @@ class ForceControlSession:
 
         if manual_speed_active:
             self._send_zero_all()
-            self._emit(
+            warning_message = (
                 f"WARNING: manual speed stopped; waiting for feedback recovery: {exc}"
             )
         elif not recovering:
-            self._emit(f"WARNING: feedback unavailable; waiting for recovery: {exc}")
+            with self._lock:
+                if now - self._last_feedback_warning_at >= FEEDBACK_LOG_COOLDOWN_S:
+                    self._last_feedback_warning_at = now
+                    self._feedback_warning_logged = True
+                    warning_message = (
+                        f"WARNING: feedback unavailable; waiting for recovery: {exc}"
+                    )
+        if warning_message is not None:
+            self._emit(warning_message)
         return True
 
     def _send_zero_all(self) -> None:
@@ -1574,6 +2041,7 @@ class ForceControlSession:
                 servo_id: 0 for servo_id in SERVO_IDS
             }
             self._manual_feedback_recovering = False
+            self._feedback_errors = {}
             self._last_fault_message = None
             self._stop_event = threading.Event()
         if was_connected:
