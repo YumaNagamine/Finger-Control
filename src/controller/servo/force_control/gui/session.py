@@ -15,6 +15,7 @@ import queue
 import sys
 import threading
 import time
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -43,6 +44,8 @@ SERVO_IDS = (1, 2, 3, 4, 5, 6)
 SERVO_NAMES = ("ED", "DI", "FDS", "FDP", "LU", "PI")
 MANUAL_SPEED_PRESETS = (-500, -100, 0, 100, 500)
 FEEDBACK_SYNC_TOLERANCE_S = 0.030
+MONITORING_FEEDBACK_SYNC_TOLERANCE_S = 0.500
+MONITORING_FEEDBACK_TIMEOUT_S = 0.500
 FEEDBACK_LOG_COOLDOWN_S = 1.0
 CALIBRATION_SAMPLE_WAIT_S = 3.0
 COMMUNICATION_STATS_WINDOW_S = 5.0
@@ -50,6 +53,10 @@ COMMUNICATION_STATS_MAX_SAMPLES = 1024
 VALID_ENCODER_STATUSES = {"OK", "MULTITURN_UNCERTAIN"}
 FEEDBACK_HISTORY_DURATION_S = 0.5
 FEEDBACK_HISTORY_MAX_SAMPLES = 128
+MONITORING_FORCE_JUMP_THRESHOLD_N = 2.0
+MONITORING_ANGLE_JUMP_THRESHOLD_DEG = 10.0
+MONITORING_JUMP_CONFIRMATION_TIMEOUT_S = 1.0
+MONITORING_JUMP_LOG_COOLDOWN_S = 1.0
 DEFAULT_ZERO_OFFSET_FILE = DEFAULT_CALIBRATION_DIR / "as5048a_unloaded_zero_offsets.json"
 DEFAULT_INTERCEPT_CALIBRATION_FILE = (
     DEFAULT_CALIBRATION_DIR / "torque_intercept_calibration.json"
@@ -223,6 +230,15 @@ class ControlSample:
     active: bool
 
 
+@dataclass(frozen=True)
+class DiagnosticSample:
+    """One raw reader-callback value for low-latency GUI diagnostics."""
+
+    received_at: float
+    channel_id: int
+    value: float
+
+
 @dataclass
 class _ServoState:
     servo_id: int
@@ -241,6 +257,9 @@ class _ServoState:
     active: bool = False
     latest_force_n: Optional[float] = None
     latest_position: Optional[float] = None
+    pending_monitoring_jump: Optional[dict] = None
+    pending_monitoring_jump_received_at: Optional[float] = None
+    last_monitoring_jump_log_at: float = 0.0
 
 
 class _RecentStreamStats:
@@ -363,6 +382,8 @@ class ForceControlSession:
         self._calibration_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._sample_queue: queue.Queue = queue.Queue(maxsize=3000)
+        self._servo_diagnostic_queue: queue.Queue = queue.Queue(maxsize=3000)
+        self._encoder_diagnostic_queue: queue.Queue = queue.Queue(maxsize=3000)
         self._event_queue: queue.Queue = queue.Queue(maxsize=256)
         self._connected = False
         self._armed = False
@@ -440,6 +461,10 @@ class ForceControlSession:
     def feedback_errors_snapshot(self) -> Dict[int, str]:
         with self._lock:
             return dict(self._feedback_errors)
+
+    def manual_speed_snapshot(self) -> Dict[int, int]:
+        with self._lock:
+            return dict(self._manual_speed_commands)
 
     def calibration_readiness_snapshot(self) -> dict:
         """Return user-facing reasons why torque calibration is unavailable."""
@@ -526,6 +551,26 @@ class ForceControlSession:
         for _ in range(max(1, int(limit))):
             try:
                 samples.append(self._sample_queue.get_nowait())
+            except queue.Empty:
+                break
+        return samples
+
+    def drain_servo_diagnostic_samples(
+        self, limit: int = 300
+    ) -> List[DiagnosticSample]:
+        return self._drain_queue(self._servo_diagnostic_queue, limit)
+
+    def drain_encoder_diagnostic_samples(
+        self, limit: int = 300
+    ) -> List[DiagnosticSample]:
+        return self._drain_queue(self._encoder_diagnostic_queue, limit)
+
+    @staticmethod
+    def _drain_queue(sample_queue: queue.Queue, limit: int) -> list:
+        samples = []
+        for _ in range(max(1, int(limit))):
+            try:
+                samples.append(sample_queue.get_nowait())
             except queue.Empty:
                 break
         return samples
@@ -847,6 +892,8 @@ class ForceControlSession:
                 self._servo_feedback_history.clear()
                 for history in self._encoder_feedback_histories.values():
                     history.clear()
+            self._drain_queue(self._servo_diagnostic_queue, 3000)
+            self._drain_queue(self._encoder_diagnostic_queue, 3000)
             stop_event = threading.Event()
             servo_reader = ReaderTask(
                 servo.read_parsed_line,
@@ -983,6 +1030,7 @@ class ForceControlSession:
                 ):
                     self._servo_feedback_history.popleft()
             valid_values = parsed.get("valid", ())
+            positions = parsed.get("positions", ())
             for servo_id in SERVO_IDS:
                 servo_index = self._servo_index.get(servo_id)
                 valid = bool(
@@ -993,6 +1041,15 @@ class ForceControlSession:
                 self._servo_stream_stats.record(
                     servo_id, valid, received_at=received_at
                 )
+                if valid and servo_index < len(positions):
+                    self._publish_bounded(
+                        self._servo_diagnostic_queue,
+                        DiagnosticSample(
+                            received_at=received_at,
+                            channel_id=servo_id,
+                            value=float(positions[servo_index]),
+                        ),
+                    )
             return parsed
         return None
 
@@ -1013,6 +1070,15 @@ class ForceControlSession:
             status in VALID_ENCODER_STATUSES and has_multiturn,
             received_at=received_at,
         )
+        if status in VALID_ENCODER_STATUSES and has_multiturn:
+            self._publish_bounded(
+                self._encoder_diagnostic_queue,
+                DiagnosticSample(
+                    received_at=received_at,
+                    channel_id=int(sensor_id),
+                    value=float(sample["relative_multi_turn_deg"]),
+                ),
+            )
 
     def _synchronized_feedback_pair(
         self,
@@ -1020,14 +1086,26 @@ class ForceControlSession:
         sensor_id: int,
         servo_index: int,
         now: float,
+        *,
+        sync_tolerance_s: float = FEEDBACK_SYNC_TOLERANCE_S,
+        feedback_timeout_s: Optional[float] = None,
+        servo_history: Optional[Sequence[tuple]] = None,
+        encoder_history: Optional[Sequence[tuple]] = None,
     ) -> tuple:
         """Return the freshest valid servo/encoder pair inside the sync limit."""
 
-        with self._feedback_history_lock:
-            servo_history = list(self._servo_feedback_history)
-            encoder_history = list(
-                self._encoder_feedback_histories.get(sensor_id, ())
-            )
+        if feedback_timeout_s is None:
+            feedback_timeout_s = self.config.feedback_timeout_s
+
+        if servo_history is None or encoder_history is None:
+            with self._feedback_history_lock:
+                servo_history = list(self._servo_feedback_history)
+                encoder_history = list(
+                    self._encoder_feedback_histories.get(sensor_id, ())
+                )
+        else:
+            servo_history = list(servo_history)
+            encoder_history = list(encoder_history)
 
         if not servo_history:
             return None, f"ID {servo_id}: no servo telemetry history"
@@ -1054,7 +1132,7 @@ class ForceControlSession:
             age_s = max(0.0, now - received_at)
             valid = telemetry.get("valid", ())
             if (
-                age_s <= self.config.feedback_timeout_s
+                age_s <= feedback_timeout_s
                 and servo_index < len(valid)
                 and valid[servo_index]
             ):
@@ -1063,25 +1141,31 @@ class ForceControlSession:
         fresh_encoders = [
             (received_at, sample)
             for received_at, sample in encoder_history
-            if max(0.0, now - received_at) <= self.config.feedback_timeout_s
+            if max(0.0, now - received_at) <= feedback_timeout_s
             and str(sample.get("status", "")).strip().upper()
             in VALID_ENCODER_STATUSES
             and sample.get("relative_multi_turn_deg") is not None
         ]
 
+        servo_times = [entry[0] for entry in fresh_servos]
         closest_gap_s = None
         for encoder_entry in reversed(fresh_encoders):
             encoder_at = encoder_entry[0]
             if not fresh_servos:
                 break
+            insertion_index = bisect_left(servo_times, encoder_at)
+            candidate_indexes = {
+                max(0, insertion_index - 1),
+                min(len(fresh_servos) - 1, insertion_index),
+            }
             servo_entry = min(
-                fresh_servos,
+                (fresh_servos[index] for index in candidate_indexes),
                 key=lambda item: abs(item[0] - encoder_at),
             )
             gap_s = abs(servo_entry[0] - encoder_at)
             if closest_gap_s is None or gap_s < closest_gap_s:
                 closest_gap_s = gap_s
-            if gap_s <= FEEDBACK_SYNC_TOLERANCE_S:
+            if gap_s <= sync_tolerance_s:
                 return (servo_entry, encoder_entry, gap_s), None
 
         if not fresh_servos:
@@ -1090,7 +1174,7 @@ class ForceControlSession:
             else:
                 reason = (
                     f"servo sample is stale ({servo_age_s * 1000.0:.0f} ms > "
-                    f"{self.config.feedback_timeout_s * 1000.0:.0f} ms)"
+                    f"{feedback_timeout_s * 1000.0:.0f} ms)"
                 )
         elif not fresh_encoders:
             if (
@@ -1103,12 +1187,12 @@ class ForceControlSession:
             else:
                 reason = (
                     f"encoder sample is stale ({encoder_age_s * 1000.0:.0f} ms > "
-                    f"{self.config.feedback_timeout_s * 1000.0:.0f} ms)"
+                    f"{feedback_timeout_s * 1000.0:.0f} ms)"
                 )
         else:
             reason = (
                 f"closest timestamp gap {closest_gap_s * 1000.0:.0f} ms exceeds "
-                f"{FEEDBACK_SYNC_TOLERANCE_S * 1000.0:.0f} ms"
+                f"{sync_tolerance_s * 1000.0:.0f} ms"
             )
         return None, (
             f"ID {servo_id}: synchronized feedback unavailable: {reason}; "
@@ -1119,6 +1203,67 @@ class ForceControlSession:
     def _feedback(self) -> Dict[int, dict]:
         with self._feedback_lock:
             return self._feedback_unlocked()
+
+    def _filter_monitoring_jump(
+        self,
+        state: _ServoState,
+        snapshot: dict,
+        *,
+        now: float,
+        sample_received_at: float,
+    ) -> tuple:
+        """Hold one abrupt monitoring sample and accept a persistent change."""
+
+        previous = state.previous_snapshot
+        if previous is None:
+            state.pending_monitoring_jump = None
+            state.pending_monitoring_jump_received_at = None
+            return snapshot, None
+        previous_force = previous.get("force_n")
+        current_force = snapshot.get("force_n")
+        if previous_force is None or current_force is None:
+            state.pending_monitoring_jump = None
+            state.pending_monitoring_jump_received_at = None
+            return snapshot, None
+        force_jump_n = abs(float(current_force) - float(previous_force))
+        angle_jump_deg = abs(
+            float(snapshot.get("angle_delta_deg", 0.0))
+            - float(previous.get("angle_delta_deg", 0.0))
+        )
+        suspicious = (
+            force_jump_n >= MONITORING_FORCE_JUMP_THRESHOLD_N
+            or angle_jump_deg >= MONITORING_ANGLE_JUMP_THRESHOLD_DEG
+        )
+        if not suspicious:
+            state.pending_monitoring_jump = None
+            state.pending_monitoring_jump_received_at = None
+            return snapshot, None
+        if state.pending_monitoring_jump is not None:
+            pending_received_at = state.pending_monitoring_jump_received_at
+            if pending_received_at is None:
+                state.pending_monitoring_jump = None
+            elif sample_received_at <= pending_received_at:
+                return dict(previous), None
+            elif (
+                sample_received_at - pending_received_at
+                <= MONITORING_JUMP_CONFIRMATION_TIMEOUT_S
+            ):
+                state.pending_monitoring_jump = None
+                state.pending_monitoring_jump_received_at = None
+                return snapshot, None
+
+        state.pending_monitoring_jump = snapshot
+        state.pending_monitoring_jump_received_at = sample_received_at
+        message = None
+        if now - state.last_monitoring_jump_log_at >= MONITORING_JUMP_LOG_COOLDOWN_S:
+            state.last_monitoring_jump_log_at = now
+            message = (
+                f"WARNING: ID {state.servo_id} monitoring jump held for confirmation: "
+                f"force delta {force_jump_n:.2f} N, angle delta {angle_jump_deg:.2f} deg, "
+                f"servo raw {snapshot.get('servo_raw')}, "
+                f"encoder {snapshot.get('encoder_angle_deg')} deg"
+            )
+        return dict(previous), message
 
     def _feedback_unlocked(self) -> Dict[int, dict]:
         from drivers.as5048a.torque import compute_torque_snapshot  # pylint: disable=import-outside-toplevel
@@ -1142,13 +1287,39 @@ class ForceControlSession:
         now = time.monotonic()
         result: Dict[int, dict] = {}
         feedback_errors: Dict[int, str] = {}
+        with self._feedback_history_lock:
+            servo_history = list(self._servo_feedback_history)
+            encoder_histories = {
+                sensor_id: list(history)
+                for sensor_id, history in self._encoder_feedback_histories.items()
+            }
         for state in states:
+            with self._lock:
+                force_control_active = bool(
+                    self._running and self._armed and state.active
+                )
+                manual_speed = self._manual_speed_commands.get(state.servo_id, 0)
+            stationary_monitoring = not force_control_active and manual_speed == 0
+            sync_tolerance_s = (
+                MONITORING_FEEDBACK_SYNC_TOLERANCE_S
+                if stationary_monitoring
+                else FEEDBACK_SYNC_TOLERANCE_S
+            )
+            feedback_timeout_s = (
+                max(self.config.feedback_timeout_s, MONITORING_FEEDBACK_TIMEOUT_S)
+                if stationary_monitoring
+                else self.config.feedback_timeout_s
+            )
             servo_index = self._servo_index[state.servo_id]
             synchronized, sync_error = self._synchronized_feedback_pair(
                 state.servo_id,
                 state.sensor_id,
                 servo_index,
                 now,
+                sync_tolerance_s=sync_tolerance_s,
+                feedback_timeout_s=feedback_timeout_s,
+                servo_history=servo_history,
+                encoder_history=encoder_histories.get(state.sensor_id, ()),
             )
             if synchronized is None:
                 feedback_errors[state.servo_id] = sync_error
@@ -1177,8 +1348,11 @@ class ForceControlSession:
                     moment_arm_mm=state.model["moment_arm_mm"],
                     pull_angle_deg=state.model["pull_angle_deg"],
                     telemetry_age_s=telemetry_age_s,
-                    telemetry_stale_after_s=self.config.feedback_timeout_s,
-                    jump_filter_enabled=True,
+                    telemetry_stale_after_s=feedback_timeout_s,
+                    # A held force spike can hide a real overload indefinitely.
+                    # Monitoring has its own one-sample confirmation filter below;
+                    # active control must always receive the current measurement.
+                    jump_filter_enabled=False,
                     previous_snapshot=state.previous_snapshot,
                 )
             except (IndexError, KeyError, TypeError, ValueError, OverflowError) as exc:
@@ -1195,6 +1369,21 @@ class ForceControlSession:
                     f"encoder_age={encoder_age_s:.3f}s, sync={sync_age_s:.3f}s)"
                 )
                 continue
+            jump_message = None
+            if force_control_active:
+                with self._lock:
+                    state.pending_monitoring_jump = None
+                    state.pending_monitoring_jump_received_at = None
+            else:
+                with self._lock:
+                    snapshot, jump_message = self._filter_monitoring_jump(
+                        state,
+                        snapshot,
+                        now=now,
+                        sample_received_at=float(encoder_received_at),
+                    )
+            if jump_message is not None:
+                self._emit(jump_message)
             force_n = float(snapshot["force_n"])
             position = float(telemetry["positions"][servo_index])
             with self._lock:
@@ -1492,12 +1681,17 @@ class ForceControlSession:
             self._calibration_lock.release()
 
     def capture_baseline(self, duration_s: float = 0.5) -> Dict[int, float]:
-        if not self._baseline_lock.acquire(blocking=False):
-            raise RuntimeError("Baseline capture is already in progress")
+        if not self._calibration_lock.acquire(blocking=False):
+            raise RuntimeError("Torque calibration is already in progress")
         try:
-            return self._capture_baseline(duration_s)
+            if not self._baseline_lock.acquire(blocking=False):
+                raise RuntimeError("Baseline capture is already in progress")
+            try:
+                return self._capture_baseline(duration_s)
+            finally:
+                self._baseline_lock.release()
         finally:
-            self._baseline_lock.release()
+            self._calibration_lock.release()
 
     def _capture_baseline(self, duration_s: float = 0.5) -> Dict[int, float]:
         """Capture a median baseline without moving any servo."""
@@ -1505,8 +1699,12 @@ class ForceControlSession:
         if not self.connected:
             raise RuntimeError("Connect before capturing a baseline")
         with self._lock:
-            if self._running:
-                raise RuntimeError("Stop control before capturing a new baseline")
+            if self._running or self._armed:
+                raise RuntimeError(
+                    "Stop and disarm force control before capturing a new baseline"
+                )
+            if any(self._manual_speed_commands.values()):
+                raise RuntimeError("Stop manual speed control before capturing a baseline")
         values: Dict[int, List[float]] = {servo_id: [] for servo_id in SERVO_IDS}
         deadline = time.monotonic() + max(0.1, float(duration_s))
         last_error: Optional[Exception] = None
@@ -1520,21 +1718,30 @@ class ForceControlSession:
             for servo_id, item in feedback.items():
                 values[servo_id].append(item["force_n"])
             time.sleep(0.01)
-        baselines: Dict[int, float] = {}
+        missing = [servo_id for servo_id, samples in values.items() if not samples]
+        if missing:
+            servo_id = missing[0]
+            if last_error is not None:
+                raise RuntimeError(
+                    f"Unable to capture baseline for servo {servo_id}: {last_error}"
+                ) from last_error
+            raise RuntimeError(
+                "No baseline samples for servo "
+                + ", ".join(str(servo_id) for servo_id in missing)
+            )
+
+        baselines = {
+            servo_id: float(median(samples))
+            for servo_id, samples in values.items()
+        }
         with self._lock:
             if not self._connected:
                 raise RuntimeError("Session disconnected during baseline capture")
-            for servo_id, samples in values.items():
-                if not samples:
-                    if last_error is not None:
-                        raise RuntimeError(
-                            f"Unable to capture baseline for servo {servo_id}: {last_error}"
-                        ) from last_error
-                    raise RuntimeError(f"No baseline samples for servo {servo_id}")
-                baseline = float(median(samples))
-                baselines[servo_id] = baseline
+            for servo_id, baseline in baselines.items():
                 state = self._states[servo_id]
                 state.baseline_force_n = baseline
+                state.pending_monitoring_jump = None
+                state.pending_monitoring_jump_received_at = None
                 state.target_force_n = min(
                     self.config.max_target_force_n,
                     max(self.config.min_target_force_n, baseline),
@@ -1562,6 +1769,8 @@ class ForceControlSession:
         with self._lock:
             if self._faulted:
                 raise RuntimeError("Disconnect and reconnect after a fault")
+            if self._armed or self._running:
+                raise RuntimeError("Stop and disarm force control before arming")
             if max_speed <= 0.0:
                 raise ValueError("max_speed must be greater than zero")
             if hard_force_limits_n is None:
@@ -1642,6 +1851,8 @@ class ForceControlSession:
                 raise RuntimeError("Connect and arm before starting control")
             if self._faulted:
                 raise RuntimeError("Disconnect and reconnect after a fault")
+            if self._running:
+                raise RuntimeError("Force control is already running")
             self._running = True
         self._emit("Force control started.")
 
@@ -1713,12 +1924,6 @@ class ForceControlSession:
                     raise RuntimeError("Connect before using speed control")
                 if self._armed or self._running:
                     raise RuntimeError("Stop force control before using speed control")
-                if self._manual_feedback_recovering:
-                    raise RuntimeError("Wait for feedback recovery before using speed control")
-                if servo_id in self._feedback_errors and speed != 0:
-                    raise RuntimeError(
-                        f"Feedback unavailable for ID {servo_id}; wait for recovery"
-                    )
                 if servo_id not in self._states:
                     raise ValueError(f"Unknown servo ID: {servo_id}")
                 servo = self._servo
@@ -1752,15 +1957,19 @@ class ForceControlSession:
         ) * progress
 
     def _publish(self, sample: ControlSample) -> None:
+        self._publish_bounded(self._sample_queue, sample)
+
+    @staticmethod
+    def _publish_bounded(sample_queue: queue.Queue, sample: Any) -> None:
         try:
-            self._sample_queue.put_nowait(sample)
+            sample_queue.put_nowait(sample)
         except queue.Full:
             try:
-                self._sample_queue.get_nowait()
+                sample_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._sample_queue.put_nowait(sample)
+                sample_queue.put_nowait(sample)
             except queue.Full:
                 pass
 
@@ -1779,26 +1988,27 @@ class ForceControlSession:
                 with self._lock:
                     states = list(self._states.values())
                     feedback_errors = dict(self._feedback_errors)
+                    force_control_active = self._running and self._armed
                 if states and not feedback:
                     details = "; ".join(
                         feedback_errors[servo_id]
                         for servo_id in sorted(feedback_errors)
                     )
-                    raise RuntimeError(f"All force feedback unavailable: {details}")
+                    if force_control_active:
+                        raise RuntimeError(f"All force feedback unavailable: {details}")
+                    self._handle_manual_feedback_error(
+                        RuntimeError(f"All force feedback unavailable: {details}")
+                    )
                 with self._lock:
-                    self._manual_feedback_recovering = False
+                    self._manual_feedback_recovering = bool(feedback_errors)
                 now = time.monotonic()
                 commands: List[tuple] = []
-                failed_manual_ids: List[int] = []
                 for state in states:
                     item = feedback.get(state.servo_id)
                     if item is None:
                         with self._lock:
                             state_active = bool(
                                 self._running and self._armed and state.active
-                            )
-                            manual_speed = self._manual_speed_commands.get(
-                                state.servo_id, 0
                             )
                         if state_active:
                             raise RuntimeError(
@@ -1807,8 +2017,6 @@ class ForceControlSession:
                                     f"Feedback unavailable for ID {state.servo_id}",
                                 )
                             )
-                        if manual_speed:
-                            failed_manual_ids.append(state.servo_id)
                         continue
                     with self._lock:
                         if self._states.get(state.servo_id) is not state:
@@ -1858,15 +2066,6 @@ class ForceControlSession:
                             active=active,
                         )
                     )
-                if failed_manual_ids:
-                    with self._command_lock:
-                        with self._lock:
-                            servo = self._servo
-                            for servo_id in failed_manual_ids:
-                                self._manual_speed_commands[servo_id] = 0
-                        if servo is not None:
-                            for servo_id in failed_manual_ids:
-                                servo.send_speed_by_id(servo_id, 0)
                 if commands:
                     with self._command_lock:
                         with self._lock:
@@ -1945,17 +2144,17 @@ class ForceControlSession:
             recovering = self._manual_feedback_recovering
             if force_control_active or not self._connected:
                 return False
-            if manual_speed_active:
-                self._manual_speed_commands = {
-                    servo_id: 0 for servo_id in SERVO_IDS
-                }
             self._manual_feedback_recovering = True
 
         if manual_speed_active:
-            self._send_zero_all()
-            warning_message = (
-                f"WARNING: manual speed stopped; waiting for feedback recovery: {exc}"
-            )
+            with self._lock:
+                if now - self._last_feedback_warning_at >= FEEDBACK_LOG_COOLDOWN_S:
+                    self._last_feedback_warning_at = now
+                    self._feedback_warning_logged = True
+                    warning_message = (
+                        "WARNING: manual speed is continuing without force feedback; "
+                        f"use 0 or STOP ALL to stop: {exc}"
+                    )
         elif not recovering:
             with self._lock:
                 if now - self._last_feedback_warning_at >= FEEDBACK_LOG_COOLDOWN_S:

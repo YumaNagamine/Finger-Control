@@ -21,6 +21,7 @@ from controller.servo.force_control.gui.session import (
     SERVO_IDS,
     SERVO_NAMES,
     ControlSample,
+    DiagnosticSample,
     ForceControlSession,
     GuiForceConfig,
     load_gui_force_config,
@@ -30,7 +31,8 @@ from controller.servo.force_control.gui.session import (
 ACTUAL_PLOT_COLOR = "#1565c0"
 TARGET_PLOT_COLOR = "#d84315"
 POLL_INTERVAL_MS = 33
-PLOT_INTERVAL_MS = 200
+PLOT_INTERVAL_MS = 100
+PLOT_AXIS_REFRESH_INTERVAL_S = 1.0
 
 
 class SharedPlotPanel(ttk.LabelFrame):
@@ -52,7 +54,7 @@ class SharedPlotPanel(ttk.LabelFrame):
             style="Control.TButton",
         ).grid(row=0, column=1, sticky="e")
 
-        self.figure = Figure(figsize=(12, 5.4), dpi=100, constrained_layout=True)
+        self.figure = Figure(figsize=(12, 5.4), dpi=100)
         self.axes = self.figure.subplots(2, 3).flatten()
         self.plot_lines = {}
         self.value_texts = {}
@@ -96,16 +98,50 @@ class SharedPlotPanel(ttk.LabelFrame):
             )
             self.plot_lines[servo_id] = (actual_line, target_line)
             self.value_texts[servo_id] = value_text
+            actual_line.set_animated(True)
+            target_line.set_animated(True)
+            value_text.set_animated(True)
 
+        self.figure.tight_layout()
         self.canvas = FigureCanvasTkAgg(self.figure, master=self)
         self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        self._backgrounds = {}
+        self._last_full_draw_at = 0.0
+        self._full_redraw_needed = True
+        self.canvas.mpl_connect("draw_event", self._capture_backgrounds)
         self.canvas.draw()
+        self._blit_artists()
+
+    def _capture_backgrounds(self, _event=None) -> None:
+        self._backgrounds = {
+            servo_id: self.canvas.copy_from_bbox(axis.bbox)
+            for axis, servo_id in zip(self.axes, SERVO_IDS)
+        }
+        self._full_redraw_needed = False
+
+    def _blit_artists(self) -> None:
+        if len(self._backgrounds) != len(SERVO_IDS):
+            self._full_redraw_needed = True
+            return
+        for axis, servo_id in zip(self.axes, SERVO_IDS):
+            self.canvas.restore_region(self._backgrounds[servo_id])
+            actual_line, target_line = self.plot_lines[servo_id]
+            axis.draw_artist(actual_line)
+            axis.draw_artist(target_line)
+            axis.draw_artist(self.value_texts[servo_id])
+            self.canvas.blit(axis.bbox)
 
     def update(self, history: Dict[int, Deque[ControlSample]], start_time: float) -> None:
+        desired_limits = {}
+        urgent_rescale = False
         for axis, servo_id, tendon in zip(self.axes, SERVO_IDS, SERVO_NAMES):
             samples = list(history[servo_id])
             if not samples:
                 continue
+            visible_start = samples[-1].received_at - 10.0
+            samples = [
+                sample for sample in samples if sample.received_at >= visible_start
+            ]
             times = [sample.received_at - start_time for sample in samples]
             actual = [sample.force_n for sample in samples]
             target = [sample.target_force_n for sample in samples]
@@ -120,13 +156,42 @@ class SharedPlotPanel(ttk.LabelFrame):
             high = max(tendon_max * 1.1, max(actual + target + [0.0]) * 1.2)
             if high <= low:
                 high = low + 1.0
-            axis.set_ylim(low, high)
+            desired_limits[servo_id] = (
+                (max(0.0, end_time - 10.0), max(10.0, end_time)),
+                (low, high),
+            )
+            current_low, current_high = axis.get_ylim()
+            urgent_rescale = urgent_rescale or min(actual) < current_low or max(
+                actual + target
+            ) > current_high
             self.value_texts[servo_id].set_text(
                 f"A {actual[-1]:.2f} N  |  T {target[-1]:.2f} N"
             )
-        self.canvas.draw_idle()
+        now = time.monotonic()
+        axis_refresh_due = (
+            now - self._last_full_draw_at >= PLOT_AXIS_REFRESH_INTERVAL_S
+        )
+        limits_changed = any(
+            tuple(axis.get_xlim()) != desired_limits[servo_id][0]
+            or tuple(axis.get_ylim()) != desired_limits[servo_id][1]
+            for axis, servo_id in zip(self.axes, SERVO_IDS)
+            if servo_id in desired_limits
+        )
+        if (
+            self._full_redraw_needed
+            or urgent_rescale
+            or (axis_refresh_due and limits_changed)
+        ):
+            for axis, servo_id in zip(self.axes, SERVO_IDS):
+                limits = desired_limits.get(servo_id)
+                if limits is not None:
+                    axis.set_xlim(*limits[0])
+                    axis.set_ylim(*limits[1])
+            self.canvas.draw()
+            self._last_full_draw_at = now
+        self._blit_artists()
 
-    def clear(self) -> None:
+    def clear(self, *, redraw: bool = True) -> None:
         """Clear all plotted samples and restore the initial axis view."""
 
         for axis, servo_id, tendon in zip(self.axes, SERVO_IDS, SERVO_NAMES):
@@ -136,7 +201,136 @@ class SharedPlotPanel(ttk.LabelFrame):
             axis.set_xlim(0.0, 10.0)
             axis.set_ylim(0.0, max(2.2, self._tendon_max_by_servo[servo_id] * 1.2))
             self.value_texts[servo_id].set_text("A --  |  T --")
-        self.canvas.draw_idle()
+        if redraw:
+            self.canvas.draw()
+            self._last_full_draw_at = time.monotonic()
+            self._blit_artists()
+        else:
+            self._backgrounds = {}
+            self._full_redraw_needed = True
+
+
+class MultiSignalPlotPanel(ttk.LabelFrame):
+    """Lightweight shared-axis plot for six diagnostic signals."""
+
+    def __init__(self, parent, *, title: str, ylabel: str, sample_field: str, on_refresh):
+        super().__init__(parent, text=title, padding=(8, 6))
+        self.sample_field = sample_field
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(self)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        toolbar.columnconfigure(0, weight=1)
+        ttk.Button(
+            toolbar,
+            text="Refresh plot",
+            command=on_refresh,
+            style="Control.TButton",
+        ).grid(row=0, column=1, sticky="e")
+
+        self.figure = Figure(figsize=(12, 5.4), dpi=100)
+        self.axis = self.figure.subplots()
+        self.axis.set_xlabel("time (s)", fontsize=9)
+        self.axis.set_ylabel(ylabel, fontsize=9)
+        self.axis.tick_params(labelsize=8)
+        self.axis.grid(True, alpha=0.25, linewidth=0.7)
+        self.axis.set_xlim(0.0, 10.0)
+        self.lines = {}
+        for servo_id, tendon in zip(SERVO_IDS, SERVO_NAMES):
+            line, = self.axis.plot([], [], linewidth=1.5, label=f"ID{servo_id} {tendon}")
+            line.set_animated(True)
+            self.lines[servo_id] = line
+        self.axis.legend(loc="upper left", ncol=3, fontsize=8, framealpha=0.85)
+        self.figure.tight_layout()
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        self._background = None
+        self._last_full_draw_at = 0.0
+        self._full_redraw_needed = True
+        self.canvas.mpl_connect("draw_event", self._capture_background)
+        self.canvas.draw()
+        self._blit_lines()
+
+    def _capture_background(self, _event=None) -> None:
+        self._background = self.canvas.copy_from_bbox(self.axis.bbox)
+        self._full_redraw_needed = False
+
+    def _blit_lines(self) -> None:
+        if self._background is None:
+            self._full_redraw_needed = True
+            return
+        self.canvas.restore_region(self._background)
+        for line in self.lines.values():
+            self.axis.draw_artist(line)
+        self.canvas.blit(self.axis.bbox)
+
+    def update(self, history: Dict[int, Deque[DiagnosticSample]], start_time: float) -> None:
+        all_values = []
+        latest_received_at = max(
+            (samples[-1].received_at for samples in history.values() if samples),
+            default=None,
+        )
+        if latest_received_at is None:
+            return
+        visible_start = latest_received_at - 10.0
+        for servo_id in SERVO_IDS:
+            samples = [
+                sample
+                for sample in history[servo_id]
+                if sample.received_at >= visible_start
+            ]
+            if not samples:
+                self.lines[servo_id].set_data([], [])
+                continue
+            times = [sample.received_at - start_time for sample in samples]
+            values = [float(getattr(sample, self.sample_field)) for sample in samples]
+            self.lines[servo_id].set_data(times, values)
+            all_values.extend(values)
+
+        end_time = max(latest_received_at - start_time, 10.0)
+        desired_xlim = (max(0.0, end_time - 10.0), max(10.0, end_time))
+        desired_ylim = None
+        urgent_rescale = False
+        if all_values:
+            low = min(all_values)
+            high = max(all_values)
+            padding = max(1.0, (high - low) * 0.1)
+            desired_ylim = (low - padding, high + padding)
+            current_low, current_high = self.axis.get_ylim()
+            urgent_rescale = low < current_low or high > current_high
+        now = time.monotonic()
+        limits_changed = tuple(self.axis.get_xlim()) != desired_xlim or (
+            desired_ylim is not None
+            and tuple(self.axis.get_ylim()) != desired_ylim
+        )
+        if (
+            self._full_redraw_needed
+            or urgent_rescale
+            or (
+                limits_changed
+                and now - self._last_full_draw_at
+                >= PLOT_AXIS_REFRESH_INTERVAL_S
+            )
+        ):
+            self.axis.set_xlim(*desired_xlim)
+            if desired_ylim is not None:
+                self.axis.set_ylim(*desired_ylim)
+            self.canvas.draw()
+            self._last_full_draw_at = now
+        self._blit_lines()
+
+    def clear(self, *, redraw: bool = True) -> None:
+        for line in self.lines.values():
+            line.set_data([], [])
+        self.axis.set_xlim(0.0, 10.0)
+        if redraw:
+            self.canvas.draw()
+            self._last_full_draw_at = time.monotonic()
+            self._blit_lines()
+        else:
+            self._background = None
+            self._full_redraw_needed = True
 
 
 class ForceControlApp(tk.Tk):
@@ -153,8 +347,16 @@ class ForceControlApp(tk.Tk):
         self._history: Dict[int, Deque[ControlSample]] = {
             servo_id: deque(maxlen=800) for servo_id in SERVO_IDS
         }
+        self._servo_diagnostic_history: Dict[int, Deque[DiagnosticSample]] = {
+            servo_id: deque(maxlen=800) for servo_id in SERVO_IDS
+        }
+        self._encoder_diagnostic_history: Dict[int, Deque[DiagnosticSample]] = {
+            servo_id: deque(maxlen=800) for servo_id in SERVO_IDS
+        }
         self._plot_lines = {}
         self._plot_start_time = None
+        self._servo_plot_start_time = None
+        self._encoder_plot_start_time = None
         self._last_plot_update = 0.0
         self._last_logger_update = 0.0
         self._log_history = deque(maxlen=500)
@@ -223,6 +425,8 @@ class ForceControlApp(tk.Tk):
             self._speed_row_vars[servo_id] = {
                 "force": tk.StringVar(value="--"),
                 "position": tk.StringVar(value="--"),
+                "encoder": tk.StringVar(value="--"),
+                "delta": tk.StringVar(value="--"),
                 "speed": tk.StringVar(value="--"),
                 "state": tk.StringVar(value="disconnected"),
             }
@@ -322,7 +526,7 @@ class ForceControlApp(tk.Tk):
 
         main_area = ttk.Frame(self, padding=(12, 0, 12, 12))
         main_area.grid(row=2, column=0, sticky="nsew")
-        main_area.columnconfigure(0, weight=4)
+        main_area.columnconfigure(0, weight=3)
         main_area.columnconfigure(1, weight=1)
         main_area.rowconfigure(0, weight=2)
         main_area.rowconfigure(1, weight=3)
@@ -331,10 +535,10 @@ class ForceControlApp(tk.Tk):
         self.notebook.grid(
             row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 8)
         )
-        control_tab = ttk.Frame(self.notebook)
-        speed_tab = ttk.Frame(self.notebook)
-        calibration_tab = ttk.Frame(self.notebook)
-        logger_tab = ttk.Frame(self.notebook)
+        control_tab = self._control_tab = ttk.Frame(self.notebook)
+        speed_tab = self._speed_tab = ttk.Frame(self.notebook)
+        calibration_tab = self._calibration_tab = ttk.Frame(self.notebook)
+        logger_tab = self._logger_tab = ttk.Frame(self.notebook)
         self.notebook.add(control_tab, text="Force control")
         self.notebook.add(speed_tab, text="Speed control")
         self.notebook.add(calibration_tab, text="Torque calibration")
@@ -436,12 +640,46 @@ class ForceControlApp(tk.Tk):
         self._build_logger_widgets(logger_tab)
         self._build_live_log_widgets(main_area)
 
+        self.plot_notebook = ttk.Notebook(main_area)
+        self.plot_notebook.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        force_plot_tab = ttk.Frame(self.plot_notebook)
+        servo_plot_tab = ttk.Frame(self.plot_notebook)
+        encoder_plot_tab = ttk.Frame(self.plot_notebook)
+        for tab in (force_plot_tab, servo_plot_tab, encoder_plot_tab):
+            tab.columnconfigure(0, weight=1)
+            tab.rowconfigure(0, weight=1)
+        self.plot_notebook.add(force_plot_tab, text="Force")
+        self.plot_notebook.add(servo_plot_tab, text="Servo position")
+        self.plot_notebook.add(encoder_plot_tab, text="Encoder position")
+
         self.shared_plot_panel = SharedPlotPanel(
-            main_area,
+            force_plot_tab,
             self.config_model,
             self._refresh_plot,
         )
-        self.shared_plot_panel.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.shared_plot_panel.grid(row=0, column=0, sticky="nsew")
+        self.servo_plot_panel = MultiSignalPlotPanel(
+            servo_plot_tab,
+            title="Realtime servo position",
+            ylabel="servo position (counts)",
+            sample_field="value",
+            on_refresh=self._refresh_plot,
+        )
+        self.servo_plot_panel.grid(row=0, column=0, sticky="nsew")
+        self.encoder_plot_panel = MultiSignalPlotPanel(
+            encoder_plot_tab,
+            title="Realtime magnetic encoder position",
+            ylabel="encoder position (deg)",
+            sample_field="value",
+            on_refresh=self._refresh_plot,
+        )
+        self.encoder_plot_panel.grid(row=0, column=0, sticky="nsew")
+        self._plot_panels = (
+            self.shared_plot_panel,
+            self.servo_plot_panel,
+            self.encoder_plot_panel,
+        )
+        self.plot_notebook.bind("<<NotebookTabChanged>>", self._on_plot_tab_changed)
         self.figure = self.shared_plot_panel.figure
         self.axes = self.shared_plot_panel.axes
         self.canvas = self.shared_plot_panel.canvas
@@ -559,9 +797,12 @@ class ForceControlApp(tk.Tk):
             padding=(8, 6),
         )
         table.grid(row=2, column=0, sticky="nsew", padx=10, pady=(4, 8))
-        for column, width in enumerate((44, 74, 90, 100, 138, 116, 420)):
+        for column, width in enumerate((44, 68, 82, 86, 100, 100, 126, 110, 370)):
             table.columnconfigure(column, minsize=width)
-        headers = ["ID", "Tendon", "Force (N)", "Position", "Commanded speed", "State", "Speed"]
+        headers = [
+            "ID", "Tendon", "Force (N)", "Servo pos", "Encoder deg",
+            "Delta theta", "Commanded speed", "State", "Speed",
+        ]
         for column, header in enumerate(headers):
             ttk.Label(table, text=header, style="TableHeader.TLabel").grid(
                 row=0, column=column, padx=5, pady=4, sticky="w"
@@ -582,14 +823,20 @@ class ForceControlApp(tk.Tk):
             ttk.Label(table, textvariable=variables["position"], width=10).grid(
                 row=row, column=3, padx=5, pady=3, sticky="w"
             )
-            ttk.Label(table, textvariable=variables["speed"], width=16).grid(
+            ttk.Label(table, textvariable=variables["encoder"], width=12).grid(
                 row=row, column=4, padx=5, pady=3, sticky="w"
             )
-            ttk.Label(table, textvariable=variables["state"], width=14).grid(
+            ttk.Label(table, textvariable=variables["delta"], width=12).grid(
                 row=row, column=5, padx=5, pady=3, sticky="w"
             )
+            ttk.Label(table, textvariable=variables["speed"], width=16).grid(
+                row=row, column=6, padx=5, pady=3, sticky="w"
+            )
+            ttk.Label(table, textvariable=variables["state"], width=14).grid(
+                row=row, column=7, padx=5, pady=3, sticky="w"
+            )
             button_frame = ttk.Frame(table)
-            button_frame.grid(row=row, column=6, padx=5, pady=3, sticky="w")
+            button_frame.grid(row=row, column=8, padx=5, pady=3, sticky="w")
             self._speed_buttons[servo_id] = []
             for speed in MANUAL_SPEED_PRESETS:
                 button = ttk.Button(
@@ -789,7 +1036,7 @@ class ForceControlApp(tk.Tk):
         log_frame.rowconfigure(0, weight=1)
         self._live_log_text = tk.Text(
             log_frame,
-            width=42,
+            width=70,
             height=12,
             wrap="word",
             state="disabled",
@@ -845,6 +1092,7 @@ class ForceControlApp(tk.Tk):
         if self._closing or self._disconnect_pending:
             return
         self._connection_pending = True
+        self._plot_clear_pending = True
         self.connect_button.configure(state="disabled")
         self._set_status("Connecting; no motion command is sent...")
 
@@ -871,6 +1119,7 @@ class ForceControlApp(tk.Tk):
         if self._disconnect_pending or self._closing:
             return
         self._disconnect_pending = True
+        self._plot_clear_pending = True
         self._set_status("Disconnecting...")
 
         def worker():
@@ -894,6 +1143,7 @@ class ForceControlApp(tk.Tk):
         def worker():
             try:
                 self.session.capture_baseline()
+                self._plot_clear_pending = True
                 self.session._emit("Baseline refreshed.")
             except Exception as exc:
                 self.session._emit(f"ERROR: baseline capture failed: {exc}")
@@ -1178,9 +1428,11 @@ class ForceControlApp(tk.Tk):
                 if connected
                 and not feedback_recovering
                 and not faulted
+                and not self.session.armed
                 and not self._baseline_pending
                 and not self._disconnect_pending
                 and not self.session.running
+                and not self._calibration_pending
                 else "disabled"
             )
         )
@@ -1188,8 +1440,11 @@ class ForceControlApp(tk.Tk):
             state=(
                 "normal"
                 if connected
+                and not self.session.armed
+                and not self.session.running
                 and not feedback_recovering
                 and not faulted
+                and not self._baseline_pending
                 and not self._disconnect_pending
                 and not self._calibration_pending
                 else "disabled"
@@ -1199,9 +1454,12 @@ class ForceControlApp(tk.Tk):
             state=(
                 "normal"
                 if connected
+                and self.session.armed
+                and not self.session.running
                 and not feedback_recovering
                 and not faulted
                 and not self._disconnect_pending
+                and not self._calibration_pending
                 else "disabled"
             )
         )
@@ -1217,7 +1475,6 @@ class ForceControlApp(tk.Tk):
             and not self.session.armed
             and not self.session.running
             and not self.session.faulted
-            and not feedback_recovering
             and not self._command_pending
             and not self._stop_all_pending
             and not self._disconnect_pending
@@ -1229,19 +1486,16 @@ class ForceControlApp(tk.Tk):
             speed_reason = "faulted; disconnect and reconnect"
         elif self.session.armed or self.session.running:
             speed_reason = "stop force control or press STOP ALL"
-        elif self.session.manual_feedback_recovering:
-            speed_reason = "feedback recovering; motion commands blocked"
-        elif feedback_errors:
-            speed_reason = "feedback unavailable: " + ", ".join(
-                f"ID{servo_id}" for servo_id in sorted(feedback_errors)
+        elif feedback_recovering or feedback_errors:
+            speed_reason = (
+                "ready; force feedback unavailable, manual speed has no force protection"
             )
         else:
             speed_reason = "ready"
         self.speed_status_var.set(f"Speed control: {speed_reason}")
         for servo_id, buttons in self._speed_buttons.items():
-            row_enabled = speed_enabled and servo_id not in feedback_errors
             for button in buttons:
-                button.configure(state="normal" if row_enabled else "disabled")
+                button.configure(state="normal" if speed_enabled else "disabled")
         gui_calibration_reason = None
         if self._calibration_pending:
             gui_calibration_reason = "calibration in progress"
@@ -1304,9 +1558,18 @@ class ForceControlApp(tk.Tk):
                 else "disabled"
             )
         if not connected:
+            for variables in self._row_vars.values():
+                variables["actual"].set("--")
+                variables["target"].set("--")
+                variables["error"].set("--")
+                variables["speed"].set("--")
+                variables["state"].set("disconnected")
+                variables["baseline"].set("--")
             for variables in self._speed_row_vars.values():
                 variables["force"].set("--")
                 variables["position"].set("--")
+                variables["encoder"].set("--")
+                variables["delta"].set("--")
                 variables["speed"].set("--")
                 variables["state"].set("disconnected")
             for variables in self._calibration_row_vars.values():
@@ -1322,69 +1585,121 @@ class ForceControlApp(tk.Tk):
                 self._append_log(event)
                 self._set_status(event)
             samples = self.session.drain_samples()
+            servo_diagnostic_samples = self.session.drain_servo_diagnostic_samples()
+            encoder_diagnostic_samples = (
+                self.session.drain_encoder_diagnostic_samples()
+            )
             if self._plot_clear_pending:
                 self._clear_plot()
                 self._plot_clear_pending = False
                 samples = []
+                servo_diagnostic_samples = []
+                encoder_diagnostic_samples = []
+            latest_servo_diagnostics = {}
+            for sample in servo_diagnostic_samples:
+                self._servo_diagnostic_history[sample.channel_id].append(sample)
+                if self._servo_plot_start_time is None:
+                    self._servo_plot_start_time = sample.received_at
+                latest_servo_diagnostics[sample.channel_id] = sample
+            latest_encoder_diagnostics = {}
+            for sample in encoder_diagnostic_samples:
+                self._encoder_diagnostic_history[sample.channel_id].append(sample)
+                if self._encoder_plot_start_time is None:
+                    self._encoder_plot_start_time = sample.received_at
+                latest_encoder_diagnostics[sample.channel_id] = sample
             latest_samples = {}
             for sample in samples:
                 self._history[sample.servo_id].append(sample)
                 if self._plot_start_time is None:
                     self._plot_start_time = sample.received_at
                 latest_samples[sample.servo_id] = sample
+            selected_tab = self.notebook.select()
+            force_tab_visible = selected_tab == str(self._control_tab)
+            speed_tab_visible = selected_tab == str(self._speed_tab)
+            calibration_tab_visible = selected_tab == str(self._calibration_tab)
+            logger_tab_visible = selected_tab == str(self._logger_tab)
+            if speed_tab_visible:
+                for sample in latest_servo_diagnostics.values():
+                    self._speed_row_vars[sample.channel_id]["position"].set(
+                        f"{sample.value:.0f}"
+                    )
+                for sample in latest_encoder_diagnostics.values():
+                    self._speed_row_vars[sample.channel_id]["encoder"].set(
+                        f"{sample.value:.4f}"
+                    )
             for sample in latest_samples.values():
-                variables = self._row_vars[sample.servo_id]
-                variables["actual"].set(f"{sample.force_n:.3f}")
-                variables["target"].set(f"{sample.target_force_n:.3f}")
-                variables["error"].set(f"{sample.force_error_n:+.3f}")
-                variables["speed"].set(str(sample.speed_command))
-                variables["state"].set("running" if sample.active else "monitoring")
-                speed_variables = self._speed_row_vars[sample.servo_id]
-                speed_variables["force"].set(f"{sample.force_n:.3f}")
-                speed_variables["position"].set(f"{sample.position:.0f}")
-                speed_variables["speed"].set(str(sample.speed_command))
-                speed_variables["state"].set(
-                    "force PID" if sample.active
-                    else ("manual speed" if sample.speed_command else "monitoring")
-                )
-                calibration_variables = self._calibration_row_vars[sample.servo_id]
-                calibration_variables["servo_position"].set(f"{sample.position:.0f}")
-                calibration_variables["encoder_position"].set(
-                    f"{sample.encoder_position_deg:.4f}"
-                )
-                calibration_variables["delta"].set(f"{sample.angle_delta_deg:.4f}")
+                if force_tab_visible:
+                    variables = self._row_vars[sample.servo_id]
+                    variables["actual"].set(f"{sample.force_n:.3f}")
+                    variables["target"].set(f"{sample.target_force_n:.3f}")
+                    variables["error"].set(f"{sample.force_error_n:+.3f}")
+                    variables["speed"].set(str(sample.speed_command))
+                    variables["state"].set(
+                        "running" if sample.active else "monitoring"
+                    )
+                if speed_tab_visible:
+                    speed_variables = self._speed_row_vars[sample.servo_id]
+                    speed_variables["force"].set(f"{sample.force_n:.3f}")
+                    speed_variables["delta"].set(f"{sample.angle_delta_deg:.4f}")
+                    speed_variables["speed"].set(str(sample.speed_command))
+                    speed_variables["state"].set(
+                        "force PID" if sample.active
+                        else ("manual speed" if sample.speed_command else "monitoring")
+                    )
+                if calibration_tab_visible:
+                    calibration_variables = self._calibration_row_vars[sample.servo_id]
+                    calibration_variables["servo_position"].set(
+                        f"{sample.position:.0f}"
+                    )
+                    calibration_variables["encoder_position"].set(
+                        f"{sample.encoder_position_deg:.4f}"
+                    )
+                    calibration_variables["delta"].set(
+                        f"{sample.angle_delta_deg:.4f}"
+                    )
             feedback_errors = self.session.feedback_errors_snapshot()
+            manual_speeds = self.session.manual_speed_snapshot()
             for servo_id in feedback_errors:
-                row_variables = self._row_vars[servo_id]
-                row_variables["actual"].set("--")
-                row_variables["error"].set("--")
-                row_variables["speed"].set("--")
-                row_variables["state"].set(
-                    "sync unavailable"
-                    if "synchronized feedback unavailable" in feedback_errors[servo_id]
-                    else "feedback unavailable"
-                )
-                speed_variables = self._speed_row_vars[servo_id]
-                speed_variables["force"].set("--")
-                speed_variables["position"].set("--")
-                speed_variables["speed"].set("--")
-                speed_variables["state"].set(
-                    "sync unavailable"
-                    if "synchronized feedback unavailable" in feedback_errors[servo_id]
-                    else "feedback unavailable"
-                )
-            calibration_state = self.session.calibration_state_snapshot()
-            for servo_id, state in calibration_state.items():
-                variables = self._calibration_row_vars[servo_id]
-                variables["slope"].set(f"{state['slope_nmm_per_deg']:.8g}")
-                variables["intercept"].set(f"{state['intercept_nmm']:.8g}")
-                remembered = state["remembered_encoder_position_deg"]
-                variables["remembered"].set(
-                    "--" if remembered is None else f"{remembered:.4f}"
-                )
-            for servo_id, baseline in self.session.baseline_snapshot().items():
-                if baseline is not None:
-                    self._row_vars[servo_id]["baseline"].set(f"{baseline:.3f}")
+                if force_tab_visible:
+                    row_variables = self._row_vars[servo_id]
+                    row_variables["actual"].set("--")
+                    row_variables["error"].set("--")
+                    row_variables["speed"].set("--")
+                    row_variables["state"].set(
+                        "sync unavailable"
+                        if "synchronized feedback unavailable"
+                        in feedback_errors[servo_id]
+                        else "feedback unavailable"
+                    )
+                if speed_tab_visible:
+                    speed_variables = self._speed_row_vars[servo_id]
+                    speed_variables["force"].set("--")
+                    speed_variables["delta"].set("--")
+                    speed_variables["speed"].set(str(manual_speeds.get(servo_id, 0)))
+                    speed_variables["state"].set(
+                        "manual speed; force unavailable"
+                        if manual_speeds.get(servo_id, 0)
+                        else (
+                            "sync unavailable"
+                            if "synchronized feedback unavailable"
+                            in feedback_errors[servo_id]
+                            else "feedback unavailable"
+                        )
+                    )
+            if calibration_tab_visible:
+                calibration_state = self.session.calibration_state_snapshot()
+                for servo_id, state in calibration_state.items():
+                    variables = self._calibration_row_vars[servo_id]
+                    variables["slope"].set(f"{state['slope_nmm_per_deg']:.8g}")
+                    variables["intercept"].set(f"{state['intercept_nmm']:.8g}")
+                    remembered = state["remembered_encoder_position_deg"]
+                    variables["remembered"].set(
+                        "--" if remembered is None else f"{remembered:.4f}"
+                    )
+            if force_tab_visible:
+                for servo_id, baseline in self.session.baseline_snapshot().items():
+                    if baseline is not None:
+                        self._row_vars[servo_id]["baseline"].set(f"{baseline:.3f}")
             self._set_connection_states(self.session.connected)
             if self.session.faulted:
                 fault_message = self.session.fault_message
@@ -1400,12 +1715,26 @@ class ForceControlApp(tk.Tk):
                     self._set_status("FAULT: disconnect and reconnect")
             else:
                 self._shown_fault_message = None
-            if time.monotonic() - self._last_logger_update >= 0.5:
+            if (
+                logger_tab_visible
+                and time.monotonic() - self._last_logger_update >= 0.5
+            ):
                 self._update_logger()
                 self._last_logger_update = time.monotonic()
-            if samples and (
-                self._plot_start_time is not None
-                and time.monotonic() - self._last_plot_update
+            selected_plot_index = self.plot_notebook.index(
+                self.plot_notebook.select()
+            )
+            plot_samples_received = bool(
+                samples
+                if selected_plot_index == 0
+                else (
+                    servo_diagnostic_samples
+                    if selected_plot_index == 1
+                    else encoder_diagnostic_samples
+                )
+            )
+            if plot_samples_received and (
+                time.monotonic() - self._last_plot_update
                 >= PLOT_INTERVAL_MS / 1000.0
             ):
                 self._update_plot()
@@ -1419,18 +1748,52 @@ class ForceControlApp(tk.Tk):
     def _clear_plot(self) -> None:
         for history in self._history.values():
             history.clear()
+        for history in self._servo_diagnostic_history.values():
+            history.clear()
+        for history in self._encoder_diagnostic_history.values():
+            history.clear()
         self._plot_start_time = None
+        self._servo_plot_start_time = None
+        self._encoder_plot_start_time = None
         self._last_plot_update = 0.0
-        self.shared_plot_panel.clear()
+        selected_panel = self._selected_plot_panel()
+        for panel in self._plot_panels:
+            panel.clear(redraw=panel is selected_panel)
 
     def _refresh_plot(self) -> None:
         self._clear_plot()
         self._set_status("Plot refreshed. Waiting for the next sample from time 0.")
 
     def _update_plot(self) -> None:
-        if self._plot_start_time is None:
+        panel, history, start_time = self._selected_plot_data()
+        if start_time is None:
             return
-        self.shared_plot_panel.update(self._history, self._plot_start_time)
+        panel.update(history, start_time)
+
+    def _selected_plot_panel(self):
+        selected_index = self.plot_notebook.index(self.plot_notebook.select())
+        return self._plot_panels[selected_index]
+
+    def _selected_plot_data(self):
+        selected_index = self.plot_notebook.index(self.plot_notebook.select())
+        if selected_index == 0:
+            return self.shared_plot_panel, self._history, self._plot_start_time
+        if selected_index == 1:
+            return (
+                self.servo_plot_panel,
+                self._servo_diagnostic_history,
+                self._servo_plot_start_time,
+            )
+        return (
+            self.encoder_plot_panel,
+            self._encoder_diagnostic_history,
+            self._encoder_plot_start_time,
+        )
+
+    def _on_plot_tab_changed(self, _event=None) -> None:
+        if self._selected_plot_data()[2] is not None:
+            self._last_plot_update = 0.0
+            self._update_plot()
 
     def _on_close(self) -> None:
         self._closing = True

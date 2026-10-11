@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from controller.csv_player.gui_support import LatestEventMailbox
 from controller.csv_player.recorder import ControlTraceWriter
 from controller.csv_player.runner import PlaybackConfig, SpeedTrajectoryRunner
 from controller.csv_player.speed_controller import SpeedControlConfig, SpeedController
@@ -14,6 +15,18 @@ from controller.servo_mapping import SERVO_IDS_BY_TENDON, TENDONS
 
 
 class CsvPlayerRuntimeTest(unittest.TestCase):
+    def test_latest_event_mailbox_coalesces_each_live_kind(self):
+        mailbox = LatestEventMailbox()
+        mailbox.publish({"kind": "force", "sample": 1})
+        mailbox.publish({"kind": "angle", "frame": 10})
+        mailbox.publish({"kind": "force", "sample": 2})
+
+        events = {event["kind"]: event for event in mailbox.drain()}
+
+        self.assertEqual(events["force"]["sample"], 2)
+        self.assertEqual(events["angle"]["frame"], 10)
+        self.assertEqual(mailbox.drain(), [])
+
     def test_trajectory_interpolates_and_applies_signed_calibration(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trajectory.csv"
