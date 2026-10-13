@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from controller.servo.force_control.gui.session import (
     API_ROOT,
@@ -103,6 +104,66 @@ class ForceControlGuiConfigTest(unittest.TestCase):
             },
         )
         self.assertEqual(config.ramp_duration_s, 1.0)
+        self.assertAlmostEqual(config.feedback_timeout_s, 0.2)
+        self.assertAlmostEqual(config.feedback_recovery_grace_s, 0.3)
+
+    def test_active_control_zeros_a_missing_servo_until_feedback_recovers(self):
+        session = ForceControlSession(load_gui_force_config())
+        stop_event = threading.Event()
+        controller = Mock()
+        controller.config = SimpleNamespace(target_force_n=0.5)
+        controller.step.return_value = SimpleNamespace(
+            speed_command=125,
+            force_error_n=0.25,
+        )
+        state = SimpleNamespace(
+            servo_id=1,
+            tendon="ED",
+            target_force_n=0.5,
+            ramp_started_at=None,
+            controller=controller,
+            active=True,
+            feedback_missing_since=None,
+        )
+        feedback_item = {
+            "force_n": 0.75,
+            "position": 2048.0,
+            "encoder_position_deg": 10.0,
+            "angle_delta_deg": 1.0,
+            "servo_age_s": 0.0,
+            "encoder_age_s": 0.0,
+        }
+        feedback_calls = 0
+
+        def feedback_sequence():
+            nonlocal feedback_calls
+            feedback_calls += 1
+            if feedback_calls == 1:
+                return {}
+            stop_event.set()
+            return {1: feedback_item}
+
+        session._connected = True
+        session._armed = True
+        session._running = True
+        session._servo = Mock()
+        session._states = {1: state}
+        session._stop_event = stop_event
+        session._control_thread = threading.current_thread()
+        session._feedback = Mock(side_effect=feedback_sequence)
+
+        session._loop(stop_event)
+
+        self.assertEqual(
+            [call.args for call in session._servo.send_speed_by_id.call_args_list],
+            [(1, 0), (1, 125)],
+        )
+        self.assertIsNone(state.feedback_missing_since)
+        self.assertFalse(session.faulted)
+        self.assertIn(
+            "Feedback recovered for ID 1; resuming control.",
+            session.drain_events(),
+        )
 
     def test_diagnostics_reports_mapping_and_zero_metadata_before_connect(self):
         session = ForceControlSession(load_gui_force_config())

@@ -472,10 +472,7 @@ def _make_feedback_components(config: dict):
     safety_config = config["safety"]
 
     trajectory = FeedbackTrajectory.from_csv(
-        _project_path(paths["prediction_csv"], "paths.prediction_csv"),
-        direction_deadband_rad=math.radians(
-            float(feedback_config.get("direction_deadband_deg", 0.2))
-        ),
+        _project_path(paths["prediction_csv"], "paths.prediction_csv")
     )
     moment_arm = MomentArmRuntime.from_directory(
         _project_path(
@@ -718,7 +715,6 @@ def _run_loop(
             feedback = feedback_controller.compute(
                 reference.joint_angles_rad,
                 measurement.flexion_angles_rad,
-                reference.motion_directions,
             )
             previous_feedback = feedback
         command = command_builder.build(
@@ -843,16 +839,6 @@ def main() -> None:
     print("Opening camera and initializing DLC before servo control.")
     angle_source.open()
     try:
-        meta1_calibration = angle_source.calibrate_meta1()
-        if meta1_calibration is not None:
-            print(
-                "Static meta1 accepted: "
-                f"position=({meta1_calibration.position[0]:.1f}, "
-                f"{meta1_calibration.position[1]:.1f}), "
-                f"cluster={meta1_calibration.dominant_samples}/"
-                f"{meta1_calibration.valid_samples}, "
-                f"dispersion={meta1_calibration.dispersion_px:.1f}px"
-            )
         angle_source.warm_up(int(config["vision"]["warmup_frames"]))
 
         if not args.execute:

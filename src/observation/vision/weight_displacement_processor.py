@@ -22,7 +22,16 @@ class WeightDisplacementProcessor:
         self.mm_per_pixel_default = float(mm_per_pixel)
         self.num_weights = int(measurement_cfg.get("num_weights", 6))
         self.baseline_frames = max(1, int(measurement_cfg.get("baseline_frames", 3)))
+        self.measurement_axis = str(measurement_cfg.get("measurement_axis", "y")).strip().lower()
         self.positive_direction = str(measurement_cfg.get("positive_direction", "up")).strip().lower()
+        if self.measurement_axis not in {"x", "y"}:
+            raise ValueError("measurement.measurement_axis must be either 'x' or 'y'.")
+        valid_directions = {"left", "right"} if self.measurement_axis == "x" else {"up", "down"}
+        if self.positive_direction not in valid_directions:
+            raise ValueError(
+                f"measurement.positive_direction must be one of {sorted(valid_directions)} "
+                f"when measurement_axis is '{self.measurement_axis}'."
+            )
         self.marker_ids = [int(i) for i in measurement_cfg.get("marker_ids", list(range(self.num_weights)))]
         if len(self.marker_ids) != self.num_weights:
             raise ValueError("measurement.marker_ids length must match measurement.num_weights.")
@@ -97,14 +106,14 @@ class WeightDisplacementProcessor:
 
     def _update_state(self, marker_id: int, marker: ArucoMarker) -> dict:
         state = self._states[marker_id]
-        y_value = float(marker.y)
+        position_value = float(marker.x if self.measurement_axis == "x" else marker.y)
         mm_per_px = state["mm_per_px"]
 
         quality = "warming_up"
         if state["baseline_y"] is None:
             baseline_samples: list[float] = state["baseline_samples"]
             scale_samples: list[float] = state["scale_samples"]
-            baseline_samples.append(y_value)
+            baseline_samples.append(position_value)
             if marker.side_px > 0:
                 scale_samples.append(float(self.marker_length_mm / marker.side_px))
 
@@ -125,8 +134,8 @@ class WeightDisplacementProcessor:
         disp_mm: float | None = 0.0
 
         if baseline_y is not None and mm_per_px is not None:
-            delta = float(y_value - baseline_y)
-            if self.positive_direction == "up":
+            delta = float(position_value - baseline_y)
+            if self.positive_direction in {"up", "left"}:
                 delta = -delta
             disp_px = delta
             disp_mm = float(delta * mm_per_px)
@@ -139,7 +148,7 @@ class WeightDisplacementProcessor:
             "marker_id": marker_id,
             "detected": True,
             "x_px": float(marker.x),
-            "y_px": y_value,
+            "y_px": float(marker.y),
             "baseline_y_px": None if baseline_y is None else float(baseline_y),
             "disp_px": disp_px,
             "disp_mm": disp_mm,

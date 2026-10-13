@@ -15,7 +15,7 @@ from utils.path_utils import resolve_path
 
 
 PROJECT_ROOT = SRC_ROOT.parent
-DEFAULT_INPUT_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "processed_csv"
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "logs" / "dual_camera-finger1" / "processed_csv"
 
 
 def parse_args() -> argparse.Namespace:

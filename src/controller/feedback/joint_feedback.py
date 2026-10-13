@@ -52,7 +52,6 @@ class JointFeedbackController:
         self,
         reference_angles_rad: Sequence[float],
         measured_angles_rad: Sequence[float],
-        motion_directions: Sequence[str],
     ) -> FeedbackResult:
         reference = self._validated_vector(
             reference_angles_rad,
@@ -75,7 +74,6 @@ class JointFeedbackController:
         excursion_correction = self._moment_arm.correction_excursion(
             reference,
             joint_correction,
-            motion_directions,
         )
         excursion_correction = np.clip(
             excursion_correction,

@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import itertools
 import json
 import math
 from pathlib import Path
@@ -24,7 +23,7 @@ TARGET_INPUT_CSV = (
     / "processed_csv"
     / "momentarm_validation_20260626_193529.csv"
 )
-MOMENT_ARM_AVERAGE_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "moment_arm_average"
+MOMENT_ARM_AVERAGE_DIR = PROJECT_ROOT / "logs" / "dual_camera_motionBenchmark" / "moment_arm_average"
 OUTPUT_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "momentarm_validation"
 OUTPUT_FILE_PREFIX = TARGET_INPUT_CSV.stem
 OUTPUT_PLOT_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_joint_angles.png"
@@ -45,14 +44,11 @@ FLEXION_RAD_COLUMNS = {
 DISP_MM_RENAME_MAP = {
     "weight_0_disp_mm": "FDP",
     "weight_1_disp_mm": "FDS",
-    "weight_2_disp_mm": "EI",
+    "weight_2_disp_mm": "ED",
     "weight_3_disp_mm": "PI",
     "weight_4_disp_mm": "DI",
     "weight_5_disp_mm": "LUM",
 }
-MOTION_NAMES = ("flexion", "extension")
-DIRECTION_COMBINATIONS = list(itertools.product(MOTION_NAMES, repeat=len(JOINT_COLUMNS)))
-
 EXCURSION_SMOOTHING_WINDOW = 5
 ANGLE_SMOOTHING_WINDOW = 5
 EXCURSION_DEADBAND_MM = 0.02
@@ -81,30 +77,29 @@ def _validate_input_dataframe(df: pd.DataFrame) -> None:
         raise ValueError(f"Input CSV is missing required columns: {missing}")
 
 
-def _load_moment_arm_coefficients() -> dict[tuple[str, str], dict[str, np.ndarray]]:
-    coefficients: dict[tuple[str, str], dict[str, np.ndarray]] = {}
+def _load_moment_arm_coefficients() -> dict[str, dict[str, np.ndarray]]:
+    coefficients: dict[str, dict[str, np.ndarray]] = {}
 
     for joint in JOINT_COLUMNS:
-        for motion in MOTION_NAMES:
-            json_path = MOMENT_ARM_AVERAGE_DIR / f"moment_arm_{joint}_{motion}_average.json"
-            if not json_path.exists():
-                raise FileNotFoundError(f"Moment arm JSON not found: {json_path}")
+        json_path = MOMENT_ARM_AVERAGE_DIR / f"moment_arm_{joint}_average.json"
+        if not json_path.exists():
+            raise FileNotFoundError(f"Moment arm JSON not found: {json_path}")
 
-            payload = json.loads(json_path.read_text(encoding="utf-8"))
-            tendon_coefficients = payload.get("moment_arm_coefficients")
-            if not isinstance(tendon_coefficients, dict):
-                raise ValueError(f"Invalid moment arm JSON format: {json_path}")
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        tendon_coefficients = payload.get("moment_arm_coefficients")
+        if not isinstance(tendon_coefficients, dict):
+            raise ValueError(f"Invalid moment arm JSON format: {json_path}")
 
-            motion_coefficients: dict[str, np.ndarray] = {}
-            for tendon in TENDON_COLUMNS:
-                raw_coefficients = tendon_coefficients.get(tendon)
-                if not isinstance(raw_coefficients, list) or len(raw_coefficients) != 4:
-                    raise ValueError(
-                        f"Expected four moment arm coefficients for tendon={tendon!r} in {json_path}"
-                    )
-                motion_coefficients[tendon] = np.asarray(raw_coefficients, dtype=np.float64)
+        joint_coefficients: dict[str, np.ndarray] = {}
+        for tendon in TENDON_COLUMNS:
+            raw_coefficients = tendon_coefficients.get(tendon)
+            if not isinstance(raw_coefficients, list) or len(raw_coefficients) != 4:
+                raise ValueError(
+                    f"Expected four moment arm coefficients for tendon={tendon!r} in {json_path}"
+                )
+            joint_coefficients[tendon] = np.asarray(raw_coefficients, dtype=np.float64)
 
-            coefficients[(joint, motion)] = motion_coefficients
+        coefficients[joint] = joint_coefficients
 
     return coefficients
 
@@ -130,16 +125,14 @@ def _normalize_to_zero(values: np.ndarray) -> np.ndarray:
 
 def _build_moment_arm_matrix(
     theta_by_joint: dict[str, float],
-    motion_by_joint: dict[str, str],
-    moment_arm_coefficients: dict[tuple[str, str], dict[str, np.ndarray]],
+    moment_arm_coefficients: dict[str, dict[str, np.ndarray]],
 ) -> np.ndarray:
     matrix = np.zeros((len(TENDON_COLUMNS), len(JOINT_COLUMNS)), dtype=np.float64)
 
     for tendon_idx, tendon in enumerate(TENDON_COLUMNS):
         for joint_idx, joint in enumerate(JOINT_COLUMNS):
             theta = theta_by_joint[joint]
-            motion = motion_by_joint[joint]
-            coeffs = moment_arm_coefficients[(joint, motion)][tendon]
+            coeffs = moment_arm_coefficients[joint][tendon]
             matrix[tendon_idx, joint_idx] = float(np.polyval(coeffs, theta))
 
     return matrix
@@ -148,50 +141,36 @@ def _build_moment_arm_matrix(
 def _estimate_delta_theta(
     delta_excursion: np.ndarray,
     theta_by_joint: dict[str, float],
-    moment_arm_coefficients: dict[tuple[str, str], dict[str, np.ndarray]],
-) -> tuple[np.ndarray, tuple[str, str, str], float]:
+    moment_arm_coefficients: dict[str, dict[str, np.ndarray]],
+) -> tuple[np.ndarray, float]:
     finite_mask = np.isfinite(delta_excursion)
     if int(np.count_nonzero(finite_mask)) < len(JOINT_COLUMNS):
-        return np.zeros(len(JOINT_COLUMNS), dtype=np.float64), DIRECTION_COMBINATIONS[0], float("nan")
+        return np.zeros(len(JOINT_COLUMNS), dtype=np.float64), float("nan")
 
     if np.nanmax(np.abs(delta_excursion[finite_mask])) <= EXCURSION_DEADBAND_MM:
-        return np.zeros(len(JOINT_COLUMNS), dtype=np.float64), DIRECTION_COMBINATIONS[0], 0.0
+        return np.zeros(len(JOINT_COLUMNS), dtype=np.float64), 0.0
 
     delta_excursion_valid = delta_excursion[finite_mask]
-    best_delta_theta: np.ndarray | None = None
-    best_combination: tuple[str, str, str] | None = None
-    best_residual = float("inf")
-
-    for motion_combination in DIRECTION_COMBINATIONS:
-        motion_by_joint = {
-            joint: motion_combination[joint_idx] for joint_idx, joint in enumerate(JOINT_COLUMNS)
-        }
-        moment_arm_matrix = _build_moment_arm_matrix(
-            theta_by_joint=theta_by_joint,
-            motion_by_joint=motion_by_joint,
-            moment_arm_coefficients=moment_arm_coefficients,
-        )
-        moment_arm_matrix_valid = moment_arm_matrix[finite_mask, :]
-        delta_theta, _, _, _ = np.linalg.lstsq(moment_arm_matrix_valid, delta_excursion_valid, rcond=None)
-        delta_theta = np.asarray(delta_theta, dtype=np.float64)
-        delta_theta[np.abs(delta_theta) < THETA_UPDATE_DEADBAND_RAD] = 0.0
-
-        reconstructed = moment_arm_matrix_valid @ delta_theta
-        residual = float(np.linalg.norm(reconstructed - delta_excursion_valid))
-        if residual < best_residual:
-            best_delta_theta = delta_theta
-            best_combination = motion_combination
-            best_residual = residual
-
-    if best_delta_theta is None or best_combination is None:
-        raise RuntimeError("Failed to estimate delta theta from excursion")
-
-    return best_delta_theta, best_combination, best_residual
+    moment_arm_matrix = _build_moment_arm_matrix(
+        theta_by_joint=theta_by_joint,
+        moment_arm_coefficients=moment_arm_coefficients,
+    )
+    moment_arm_matrix_valid = moment_arm_matrix[finite_mask, :]
+    delta_theta, _, _, _ = np.linalg.lstsq(
+        moment_arm_matrix_valid,
+        delta_excursion_valid,
+        rcond=None,
+    )
+    delta_theta = np.asarray(delta_theta, dtype=np.float64)
+    delta_theta[np.abs(delta_theta) < THETA_UPDATE_DEADBAND_RAD] = 0.0
+    reconstructed = moment_arm_matrix_valid @ delta_theta
+    residual = float(np.linalg.norm(reconstructed - delta_excursion_valid))
+    return delta_theta, residual
 
 
 def build_joint_prediction_dataframe(
     df: pd.DataFrame,
-    moment_arm_coefficients: dict[tuple[str, str], dict[str, np.ndarray]],
+    moment_arm_coefficients: dict[str, dict[str, np.ndarray]],
 ) -> pd.DataFrame:
     comparison_df = pd.DataFrame(index=df.index)
     comparison_df["elapsed_s"] = pd.to_numeric(df["elapsed_s"], errors="coerce")
@@ -233,7 +212,6 @@ def build_joint_prediction_dataframe(
         predicted_angle_rad[joint][0] = actual_angle_rad[joint][initial_valid_idx[0]]
         predicted_delta_rad[joint][0] = 0.0
 
-    chosen_motion_by_joint: dict[str, list[str]] = {joint: [MOTION_NAMES[0]] * len(df) for joint in JOINT_COLUMNS}
     residual_norm = np.full(len(df), np.nan, dtype=np.float64)
 
     for frame_idx in range(1, len(df)):
@@ -247,7 +225,7 @@ def build_joint_prediction_dataframe(
             [delta_excursions_by_tendon[tendon][frame_idx] for tendon in TENDON_COLUMNS],
             dtype=np.float64,
         )
-        delta_theta, motion_combination, residual = _estimate_delta_theta(
+        delta_theta, residual = _estimate_delta_theta(
             delta_excursion=delta_excursion_vector,
             theta_by_joint=theta_state,
             moment_arm_coefficients=moment_arm_coefficients,
@@ -257,7 +235,6 @@ def build_joint_prediction_dataframe(
         for joint_idx, joint in enumerate(JOINT_COLUMNS):
             predicted_delta_rad[joint][frame_idx] = delta_theta[joint_idx]
             predicted_angle_rad[joint][frame_idx] = predicted_angle_rad[joint][frame_idx - 1] + delta_theta[joint_idx]
-            chosen_motion_by_joint[joint][frame_idx] = motion_combination[joint_idx]
 
     comparison_df["residual_norm"] = residual_norm
 
@@ -273,8 +250,6 @@ def build_joint_prediction_dataframe(
         comparison_df[f"{joint}_error_deg"] = (
             np.rad2deg(predicted_rad) - actual_angle_deg_smoothed[joint]
         )
-        comparison_df[f"{joint}_chosen_motion"] = chosen_motion_by_joint[joint]
-
     return comparison_df
 
 

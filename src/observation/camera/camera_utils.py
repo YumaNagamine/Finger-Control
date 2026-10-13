@@ -34,6 +34,14 @@ def apply_camera_settings(cap: cv2.VideoCapture, camera_cfg: dict) -> None:
     cap.set(cv2.CAP_PROP_FPS, float(camera_cfg.get("target_fps", 90)))
     cap.set(cv2.CAP_PROP_BUFFERSIZE, int(camera_cfg.get("buffersize", 0)))
     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(camera_cfg.get("auto_exposure", 1)))
+    if "auto_white_balance" in camera_cfg:
+        auto_white_balance = bool(camera_cfg["auto_white_balance"])
+        cap.set(cv2.CAP_PROP_AUTO_WB, 1.0 if auto_white_balance else 0.0)
+        if not auto_white_balance and "white_balance_temperature" in camera_cfg:
+            cap.set(
+                cv2.CAP_PROP_WB_TEMPERATURE,
+                float(camera_cfg["white_balance_temperature"]),
+            )
     cap.set(cv2.CAP_PROP_GAIN, float(camera_cfg.get("gain", 0)))
     cap.set(cv2.CAP_PROP_EXPOSURE, float(camera_cfg.get("exposure", -11)))
     capture_fourcc = fourcc_from_str(camera_cfg.get("capture_fourcc", "MJPG"))

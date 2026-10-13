@@ -22,6 +22,7 @@
     "ramp_duration_s": 1.0,
     "control_hz": 20.0,
     "encoder_rate_hz": 70.0,
-    "feedback_timeout_s": 0.2
+    "feedback_timeout_s": 0.2,
+    "feedback_recovery_grace_s": 0.3
   }
 }

@@ -27,6 +27,8 @@ from utils.path_utils import resolve_path
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config_dual_camera_process.json"
+FIXED_META1_POSITION = (1104.0, 728.0)
+FIXED_META1_LABEL = "meta1 fixed: (1104, 728)"
 
 
 def parse_args() -> argparse.Namespace:
@@ -143,6 +145,7 @@ def process_dual_recording_config(
     measurement_cfg["num_weights"] = expected_num_weights
 
     dlc_processor = DLCAngleProcessor(dlc_config, dlc_config_path.parent, enable_live=False)
+    dlc_processor.set_latched_keypoint("meta1", FIXED_META1_POSITION, 1.0)
     weight_processor = WeightDisplacementProcessor(
         processing_cfg=processing_cfg,
         measurement_cfg=measurement_cfg,
@@ -249,6 +252,16 @@ def process_dual_recording_config(
                         frame0_idx,
                         raw_keypoints,
                         inference_ms=None,
+                    )
+                    cv2.putText(
+                        dlc_overlay,
+                        FIXED_META1_LABEL,
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
                     )
                 else:
                     dlc_overlay = None

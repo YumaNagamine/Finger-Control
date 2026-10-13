@@ -22,7 +22,7 @@ dlc = [
   "tables>=3.8",
 ]
 rl = [
-  "d3rlpy>=2.8,<3",
+  "d3rlpy==2.8.1",
 ]
 
 [tool.setuptools]

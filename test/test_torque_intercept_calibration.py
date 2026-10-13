@@ -12,7 +12,9 @@ from controller.servo.torque_calibration.calibration import (
 )
 from controller.servo.torque_calibration.storage import (
     intercept_for_model,
+    load_encoder_calibration_positions,
     load_torque_intercept_calibration,
+    save_encoder_calibration_positions,
     save_torque_intercept_calibration,
 )
 
@@ -82,6 +84,46 @@ class TorqueInterceptCalibrationTest(unittest.TestCase):
             loaded = load_torque_intercept_calibration(path)
             with self.assertRaisesRegex(ValueError, "different slope"):
                 intercept_for_model(loaded, self.model)
+
+    def test_single_point_loose_zero_calibration_round_trips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "torque_intercept_calibration.json"
+            save_torque_intercept_calibration(
+                path,
+                {
+                    1: {
+                        "servo_id": 1,
+                        "encoder_sensor_id": 1,
+                        "slope_nmm_per_deg": 2.0,
+                        "intercept_nmm": -6.0,
+                        "point_count": 1,
+                        "method": "loose_position_zero",
+                    }
+                },
+            )
+
+            loaded = load_torque_intercept_calibration(path)
+
+            self.assertEqual(loaded[1]["method"], "loose_position_zero")
+            self.assertAlmostEqual(loaded[1]["intercept_nmm"], -6.0)
+
+    def test_encoder_calibration_position_round_trips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "encoder_positions.json"
+            save_encoder_calibration_positions(
+                path,
+                {
+                    2: {
+                        "servo_id": 2,
+                        "encoder_sensor_id": 2,
+                        "encoder_position_deg": 721.25,
+                    }
+                },
+            )
+
+            loaded = load_encoder_calibration_positions(path)
+
+            self.assertAlmostEqual(loaded[2]["encoder_position_deg"], 721.25)
 
     def test_force_estimator_prefers_saved_intercept_calibration(self):
         project_root = Path(__file__).resolve().parents[1]

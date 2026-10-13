@@ -56,6 +56,8 @@ DLC_INFERENCE_SETTINGS_PATH = (
 
 ANALYSIS_DIR_NAME = "dlc_analysis"
 WRITER_FOURCC = "mp4v"
+FIXED_META1_POSITION = (1104.0, 728.0)
+FIXED_META1_LABEL = "meta1 fixed: (1104, 728)"
 
 VIDEO_FILENAME = "recording.mp4"
 FRAME_TIMESTAMPS_FILENAME = "frame_timestamps.csv"
@@ -326,6 +328,7 @@ def process_excursion_recording(session_dir: Path) -> dict[str, Path | int]:
         DLC_ANGLE_CONFIG_PATH.parent,
         enable_live=False,
     )
+    dlc_processor.set_latched_keypoint("meta1", FIXED_META1_POSITION, 1.0)
 
     analysis_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     analysis_dir = inputs.session_dir / ANALYSIS_DIR_NAME / analysis_timestamp
@@ -383,6 +386,16 @@ def process_excursion_recording(session_dir: Path) -> dict[str, Path | int]:
                     timestamp.frame_idx,
                     raw_keypoints,
                     inference_ms=None,
+                )
+                cv2.putText(
+                    overlay,
+                    FIXED_META1_LABEL,
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
                 )
 
                 csv_writer.writerow(

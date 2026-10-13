@@ -7,7 +7,7 @@
   "buffersize": 0,
   "auto_exposure": 0.0,
   "gain": 36.0,
-  "exposure": -10.0,
+  "exposure": -8.0,
   "capture_fourcc": "MJPG",
   "writer_fourcc": "MJPG",
   "use_chessboard_calibration": true,

@@ -5,28 +5,13 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SOURCE_ROOT = PROJECT_ROOT / "logs" / "dual_camera" / "processed_data"
-DESTINATION_ROOT = PROJECT_ROOT / "logs" / "dual_camera" / "moment arm"
+SOURCE_ROOT = PROJECT_ROOT / "logs" / "dual_camera-finger1" / "processed_data"
+DESTINATION_ROOT = PROJECT_ROOT / "logs" / "dual_camera-finger1" / "moment_arm_plots"
 MOMENT_ARM_GLOB = "*_moment_arm.png"
 
 
 def iter_moment_arm_plots(source_root: Path) -> list[Path]:
     return sorted(source_root.rglob(MOMENT_ARM_GLOB), key=lambda path: str(path).lower())
-
-
-def make_unique_destination_path(destination_dir: Path, file_name: str) -> Path:
-    candidate = destination_dir / file_name
-    if not candidate.exists():
-        return candidate
-
-    stem = Path(file_name).stem
-    suffix = Path(file_name).suffix
-    index = 2
-    while True:
-        candidate = destination_dir / f"{stem}_{index}{suffix}"
-        if not candidate.exists():
-            return candidate
-        index += 1
 
 
 def copy_moment_arm_plots() -> int:
@@ -42,7 +27,7 @@ def copy_moment_arm_plots() -> int:
 
     copied_count = 0
     for plot_path in plot_paths:
-        destination_path = make_unique_destination_path(DESTINATION_ROOT, plot_path.name)
+        destination_path = DESTINATION_ROOT / f"{plot_path.parent.name}_{plot_path.name}"
         shutil.copy2(plot_path, destination_path)
         copied_count += 1
         print(f"Copied: {plot_path.name} -> {destination_path.name}")

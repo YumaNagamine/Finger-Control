@@ -408,7 +408,7 @@ class ForceControlApp(tk.Tk):
         self.kp_var = tk.StringVar(value="5.0")
         self.ki_var = tk.StringVar(value="0.0")
         self.kd_var = tk.StringVar(value="0.0")
-        self.max_speed_var = tk.StringVar(value="20.0")
+        self.max_speed_var = tk.StringVar(value="500.0")
         self.hard_limit_summary_var = tk.StringVar(
             value=self._format_hard_limits(self.config_model.hard_force_limits_n_by_tendon)
         )

@@ -26,14 +26,14 @@ from utils.path_utils import resolve_path
 
 
 PROJECT_ROOT = SRC_ROOT.parent
-MOMENT_ARM_AVERAGE_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "moment_arm_average"
+MOMENT_ARM_AVERAGE_DIR = PROJECT_ROOT / "logs" / "dual_camera_motionBenchmark" / "moment_arm_average"
 OUTPUT_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "excursion_predictions"
 TARGET_INPUT_CSV = (
     PROJECT_ROOT
     / "logs"
     / "dual_camera"
     / "processed_csv"
-    / "dual_processed_controlTest_20260708_132620.csv"
+    / "dual_processed_controlTestSimpleExtension_20260727_184321.csv"
 )
 
 TENDON_COLUMNS = ["FDP", "FDS", "ED", "DI", "PI", "LUM"]
@@ -56,17 +56,13 @@ FLEXION_DELTA_RAD_COLUMNS = {
 DISP_MM_RENAME_MAP = {
     "weight_0_disp_mm": "FDP",
     "weight_1_disp_mm": "FDS",
-    "weight_2_disp_mm": "EI",
+    "weight_2_disp_mm": "ED",
     "weight_3_disp_mm": "PI",
     "weight_4_disp_mm": "DI",
     "weight_5_disp_mm": "LUM",
 }
-MOTION_NAMES = ("flexion", "extension")
-
 ANGLE_SMOOTHING_WINDOW = 5
 EXCURSION_SMOOTHING_WINDOW = 5
-DIRECTION_DEADBAND_RAD = math.radians(0.2)
-DEFAULT_DIRECTION = "flexion"
 
 
 
@@ -121,30 +117,29 @@ def _prepare_input_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return prepared
 
 
-def _load_moment_arm_coefficients() -> dict[tuple[str, str], dict[str, np.ndarray]]:
-    coefficients: dict[tuple[str, str], dict[str, np.ndarray]] = {}
+def _load_moment_arm_coefficients() -> dict[str, dict[str, np.ndarray]]:
+    coefficients: dict[str, dict[str, np.ndarray]] = {}
 
     for joint in JOINT_COLUMNS:
-        for motion in MOTION_NAMES:
-            json_path = MOMENT_ARM_AVERAGE_DIR / f"moment_arm_{joint}_{motion}_average.json"
-            if not json_path.exists():
-                raise FileNotFoundError(f"Moment arm JSON not found: {json_path}")
+        json_path = MOMENT_ARM_AVERAGE_DIR / f"moment_arm_{joint}_average.json"
+        if not json_path.exists():
+            raise FileNotFoundError(f"Moment arm JSON not found: {json_path}")
 
-            payload = json.loads(json_path.read_text(encoding="utf-8"))
-            tendon_coefficients = payload.get("moment_arm_coefficients")
-            if not isinstance(tendon_coefficients, dict):
-                raise ValueError(f"Invalid moment arm JSON format: {json_path}")
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        tendon_coefficients = payload.get("moment_arm_coefficients")
+        if not isinstance(tendon_coefficients, dict):
+            raise ValueError(f"Invalid moment arm JSON format: {json_path}")
 
-            motion_coefficients: dict[str, np.ndarray] = {}
-            for tendon in TENDON_COLUMNS:
-                raw_coefficients = tendon_coefficients.get(tendon)
-                if not isinstance(raw_coefficients, list) or len(raw_coefficients) != 4:
-                    raise ValueError(
-                        f"Expected four moment arm coefficients for tendon={tendon!r} in {json_path}"
-                    )
-                motion_coefficients[tendon] = np.asarray(raw_coefficients, dtype=np.float64)
+        joint_coefficients: dict[str, np.ndarray] = {}
+        for tendon in TENDON_COLUMNS:
+            raw_coefficients = tendon_coefficients.get(tendon)
+            if not isinstance(raw_coefficients, list) or len(raw_coefficients) != 4:
+                raise ValueError(
+                    f"Expected four moment arm coefficients for tendon={tendon!r} in {json_path}"
+                )
+            joint_coefficients[tendon] = np.asarray(raw_coefficients, dtype=np.float64)
 
-            coefficients[(joint, motion)] = motion_coefficients
+        coefficients[joint] = joint_coefficients
 
     return coefficients
 
@@ -168,40 +163,29 @@ def _normalize_to_zero(values: np.ndarray) -> np.ndarray:
     return normalized
 
 
-def _infer_motion_direction(
+def _calculate_angle_changes(
     smoothed_angles: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
+) -> tuple[np.ndarray, np.ndarray]:
     frame_count = len(smoothed_angles)
     delta_angles = np.full(frame_count, np.nan, dtype=np.float64)
     midpoint_angles = np.full(frame_count, np.nan, dtype=np.float64)
-    directions = [DEFAULT_DIRECTION] * frame_count
 
     if frame_count == 0:
-        return delta_angles, midpoint_angles, directions
+        return delta_angles, midpoint_angles
 
     delta_angles[0] = 0.0
     midpoint_angles[0] = smoothed_angles[0]
-    current_direction = DEFAULT_DIRECTION
-
     for frame_idx in range(1, frame_count):
         previous_angle = smoothed_angles[frame_idx - 1]
         current_angle = smoothed_angles[frame_idx]
         if not np.isfinite(previous_angle) or not np.isfinite(current_angle):
-            directions[frame_idx] = current_direction
             continue
 
         delta_angle = current_angle - previous_angle
         delta_angles[frame_idx] = delta_angle
         midpoint_angles[frame_idx] = 0.5 * (previous_angle + current_angle)
 
-        if delta_angle > DIRECTION_DEADBAND_RAD:
-            current_direction = "flexion"
-        elif delta_angle < -DIRECTION_DEADBAND_RAD:
-            current_direction = "extension"
-
-        directions[frame_idx] = current_direction
-
-    return delta_angles, midpoint_angles, directions
+    return delta_angles, midpoint_angles
 
 
 def _build_joint_update_mask(prepared_df: pd.DataFrame) -> np.ndarray:
@@ -233,19 +217,18 @@ def _build_joint_update_mask(prepared_df: pd.DataFrame) -> np.ndarray:
 def _build_enriched_dataframe(
     original_df: pd.DataFrame,
     prepared_df: pd.DataFrame,
-    moment_arm_coefficients: dict[tuple[str, str], dict[str, np.ndarray]],
+    moment_arm_coefficients: dict[str, dict[str, np.ndarray]],
 ) -> pd.DataFrame:
     enriched_df = original_df.copy()
     joint_update_mask = _build_joint_update_mask(prepared_df)
 
     joint_delta_angles: dict[str, np.ndarray] = {}
     joint_midpoint_angles: dict[str, np.ndarray] = {}
-    joint_directions: dict[str, list[str]] = {}
 
     for joint in JOINT_COLUMNS:
         raw_angles = pd.to_numeric(prepared_df[FLEXION_RAD_COLUMNS[joint]], errors="coerce").to_numpy(dtype=np.float64)
         smoothed_angles = _smooth_series(raw_angles, ANGLE_SMOOTHING_WINDOW)
-        delta_angles, midpoint_angles, directions = _infer_motion_direction(smoothed_angles)
+        delta_angles, midpoint_angles = _calculate_angle_changes(smoothed_angles)
 
         delta_angles = delta_angles.copy()
         midpoint_angles = midpoint_angles.copy()
@@ -259,7 +242,6 @@ def _build_enriched_dataframe(
 
         joint_delta_angles[joint] = delta_angles
         joint_midpoint_angles[joint] = midpoint_angles
-        joint_directions[joint] = directions
 
     for tendon in TENDON_COLUMNS:
         actual_excursion = pd.to_numeric(prepared_df[tendon], errors="coerce").to_numpy(dtype=np.float64)
@@ -287,8 +269,7 @@ def _build_enriched_dataframe(
                     valid_frame = False
                     break
 
-                motion = joint_directions[joint][frame_idx]
-                coeffs = moment_arm_coefficients[(joint, motion)][tendon]
+                coeffs = moment_arm_coefficients[joint][tendon]
                 total_delta += float(np.polyval(coeffs, midpoint_angle)) * delta_angle
 
             if valid_frame:

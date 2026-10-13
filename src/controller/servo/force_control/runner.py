@@ -32,16 +32,26 @@ class LatestSampleStore:
         with self._condition:
             return self._sample
 
-    def wait_for_sample(self, timeout_s: float) -> LatestSample:
+    def wait_for_sample(
+        self,
+        timeout_s: float,
+        *,
+        stop_event: Optional[threading.Event] = None,
+    ) -> LatestSample:
         deadline = time.monotonic() + timeout_s
         with self._condition:
             while self._sample is None:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("Waiting for feedback was cancelled")
                 if self._error is not None:
                     raise RuntimeError("Feedback reader failed") from self._error
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     raise TimeoutError("No feedback sample was received")
-                self._condition.wait(timeout=remaining)
+                wait_timeout = remaining
+                if stop_event is not None:
+                    wait_timeout = min(wait_timeout, 0.05)
+                self._condition.wait(timeout=wait_timeout)
             return self._sample
 
     def set_error(self, error: Exception) -> None:

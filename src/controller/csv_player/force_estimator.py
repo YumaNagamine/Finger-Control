@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from controller.servo.hardware_session import API_ROOT, HardwareFeedback
+from controller.servo.torque_calibration.storage import (
+    intercept_for_model,
+    load_torque_intercept_calibration,
+)
 
 
 class CalibratedForceEstimator:
@@ -20,6 +24,7 @@ class CalibratedForceEstimator:
         servo_ids: tuple[int, ...],
         tendon_by_servo_id: dict[int, str],
         telemetry_stale_after_s: float = 0.2,
+        intercept_calibration_path: Path | None = None,
     ) -> None:
         api_python = str(API_ROOT / "python")
         if api_python not in sys.path:
@@ -34,6 +39,12 @@ class CalibratedForceEstimator:
         self._previous: dict[int, dict[str, Any] | None] = {}
         offsets = load_zero_offsets(str(zero_offset_path)) if Path(zero_offset_path).is_file() else {}
         calibration_root = Path(calibration_dir).expanduser().resolve()
+        intercept_path = (
+            Path(intercept_calibration_path).expanduser().resolve()
+            if intercept_calibration_path is not None
+            else calibration_root / "torque_intercept_calibration.json"
+        )
+        intercept_records = load_torque_intercept_calibration(intercept_path)
         for servo_id in self.servo_ids:
             path = calibration_root / f"spring_torque_calibration_servo_id_{servo_id}.csv"
             if not path.is_file():
@@ -44,8 +55,11 @@ class CalibratedForceEstimator:
             if int(model["servo_id"]) != int(servo_id):
                 raise ValueError(f"Calibration servo ID mismatch for {path}")
             intercept = float(model["intercept_nmm"])
+            calibrated_intercept = intercept_for_model(intercept_records, model)
             offset = offsets.get(int(model["sensor_id"]))
-            if offset is not None:
+            if calibrated_intercept is not None:
+                intercept = calibrated_intercept
+            elif offset is not None:
                 if int(offset["servo_id"]) != int(servo_id):
                     raise ValueError(
                         f"Zero-offset servo ID mismatch for sensor {model['sensor_id']}"

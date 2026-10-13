@@ -32,7 +32,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config_dual_camera_record_legacy.json"
 LEGACY_PARAM_DIR = ROOT / "observation" / "camera" / "paramsHighResolution"
 DEFAULT_DLC_CAMERA_CONFIG = LEGACY_PARAM_DIR / "camera_config_dlc_legacy.json"
-DEFAULT_WEIGHT_CAMERA_CONFIG = ROOT / "observation" / "camera" / "params" / "camera_config_weight.json"
+DEFAULT_WEIGHT_CAMERA_CONFIG = (
+    ROOT / "observation" / "camera" / "params" / "camera_config_weight_legacy.json"
+)
 PROJECT_ROOT = ROOT.parent
 PREVIEW_FRAME_SIZE = (800, 600)
 

@@ -113,6 +113,7 @@ class GuiForceConfig:
     control_hz: float
     encoder_rate_hz: float
     feedback_timeout_s: float
+    feedback_recovery_grace_s: float
 
 
 def _finite_number(value: Any, field_name: str) -> float:
@@ -197,10 +198,16 @@ def load_gui_force_config(path: Path = DEFAULT_FORCE_CONFIG_PATH) -> GuiForceCon
     feedback_timeout_s = _finite_number(
         default.get("feedback_timeout_s"), "feedback_timeout_s"
     )
+    feedback_recovery_grace_s = _finite_number(
+        default.get("feedback_recovery_grace_s", 0.3),
+        "feedback_recovery_grace_s",
+    )
     if ramp_duration <= 0.0 or control_hz <= 0.0 or encoder_rate_hz <= 0.0:
         raise ValueError("GUI timing settings must be greater than zero")
     if feedback_timeout_s <= 0.0:
         raise ValueError("feedback_timeout_s must be greater than zero")
+    if feedback_recovery_grace_s <= 0.0:
+        raise ValueError("feedback_recovery_grace_s must be greater than zero")
 
     return GuiForceConfig(
         min_target_force_n=minimum,
@@ -212,6 +219,7 @@ def load_gui_force_config(path: Path = DEFAULT_FORCE_CONFIG_PATH) -> GuiForceCon
         control_hz=control_hz,
         encoder_rate_hz=encoder_rate_hz,
         feedback_timeout_s=feedback_timeout_s,
+        feedback_recovery_grace_s=feedback_recovery_grace_s,
     )
 
 
@@ -260,6 +268,7 @@ class _ServoState:
     pending_monitoring_jump: Optional[dict] = None
     pending_monitoring_jump_received_at: Optional[float] = None
     last_monitoring_jump_log_at: float = 0.0
+    feedback_missing_since: Optional[float] = None
 
 
 class _RecentStreamStats:
@@ -1973,6 +1982,20 @@ class ForceControlSession:
             except queue.Full:
                 pass
 
+    def _mark_feedback_missing(self, state: _ServoState, now: float) -> float:
+        with self._lock:
+            missing_since = getattr(state, "feedback_missing_since", None)
+            if missing_since is None:
+                state.feedback_missing_since = float(now)
+                return 0.0
+            return max(0.0, float(now) - float(missing_since))
+
+    def _clear_feedback_missing(self, state: _ServoState) -> bool:
+        with self._lock:
+            was_missing = getattr(state, "feedback_missing_since", None) is not None
+            state.feedback_missing_since = None
+            return was_missing
+
     def _loop(self, stop_event: threading.Event) -> None:
         period_s = 1.0 / self.config.control_hz
         next_tick = time.monotonic()
@@ -1989,13 +2012,11 @@ class ForceControlSession:
                     states = list(self._states.values())
                     feedback_errors = dict(self._feedback_errors)
                     force_control_active = self._running and self._armed
-                if states and not feedback:
+                if states and not feedback and not force_control_active:
                     details = "; ".join(
                         feedback_errors[servo_id]
                         for servo_id in sorted(feedback_errors)
                     )
-                    if force_control_active:
-                        raise RuntimeError(f"All force feedback unavailable: {details}")
                     self._handle_manual_feedback_error(
                         RuntimeError(f"All force feedback unavailable: {details}")
                     )
@@ -2011,13 +2032,35 @@ class ForceControlSession:
                                 self._running and self._armed and state.active
                             )
                         if state_active:
-                            raise RuntimeError(
-                                feedback_errors.get(
+                            now_missing = time.monotonic()
+                            missing_duration = self._mark_feedback_missing(
+                                state, now_missing
+                            )
+                            if (
+                                missing_duration
+                                >= self.config.feedback_recovery_grace_s
+                            ):
+                                error = feedback_errors.get(
                                     state.servo_id,
                                     f"Feedback unavailable for ID {state.servo_id}",
                                 )
-                            )
+                                raise RuntimeError(
+                                    f"Feedback unavailable for ID {state.servo_id} "
+                                    f"for {missing_duration * 1000.0:.0f} ms "
+                                    f"(recovery grace "
+                                    f"{self.config.feedback_recovery_grace_s * 1000.0:.0f} ms): "
+                                    f"{error}"
+                                )
+                            commands.append((state.servo_id, 0))
+                        else:
+                            self._clear_feedback_missing(state)
                         continue
+                    was_feedback_missing = self._clear_feedback_missing(state)
+                    if was_feedback_missing:
+                        self._emit(
+                            f"Feedback recovered for ID {state.servo_id}; "
+                            "resuming control."
+                        )
                     with self._lock:
                         if self._states.get(state.servo_id) is not state:
                             continue

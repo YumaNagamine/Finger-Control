@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import argparse
 import json
 import math
 from pathlib import Path
@@ -17,19 +18,8 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Edit these paths in code when you want to change the input/output target.
-TARGET_INPUT_CSV = (
-    PROJECT_ROOT
-    / "logs"
-    / "dual_camera"
-    / "processed_csv"
-    / "dual_processed_momentarmValidation (6)_20260702_175638.csv" ### INPUT TARGET CSV FILENAME LOCATED IN processed_csv directory
-)
-MOMENT_ARM_AVERAGE_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "moment_arm_average"
-OUTPUT_DIR = PROJECT_ROOT / "logs" / "dual_camera" / "momentarm_validation"
-OUTPUT_FILE_PREFIX = TARGET_INPUT_CSV.stem
-OUTPUT_PLOT_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_excursion.png"
-OUTPUT_CSV_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_predicted_vs_actual_excursion.csv"
-OUTPUT_TIME_ANGLE_PLOT_PATH = OUTPUT_DIR / f"{OUTPUT_FILE_PREFIX}_time_vs_joint_angle.png"
+MOMENT_ARM_AVERAGE_DIR = PROJECT_ROOT / "logs" / "dual_camera_motionBenchmark" / "moment_arm_average"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "logs" / "dual_camera_motionBenchmark" / "excursion_predictions"
 
 TENDON_COLUMNS = ["FDP", "FDS", "ED", "DI", "PI", "LUM"]
 JOINT_COLUMNS = ["DIP", "PIP", "MCP"]
@@ -46,12 +36,17 @@ DISP_MM_RENAME_MAP = {
     "weight_4_disp_mm": "DI",
     "weight_5_disp_mm": "LUM",
 }
-MOTION_NAMES = ("flexion", "extension")
-
 ANGLE_SMOOTHING_WINDOW = 5
 EXCURSION_SMOOTHING_WINDOW = 5
-DIRECTION_DEADBAND_RAD = math.radians(0.2)
-DEFAULT_DIRECTION = "flexion"
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Predict tendon excursion from one processed dual-camera CSV."
+    )
+    parser.add_argument("--input-csv", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    return parser.parse_args()
 
 
 def _validate_processed_dataframe(df: pd.DataFrame) -> None:
@@ -78,30 +73,29 @@ def _prepare_input_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return prepared
 
 
-def _load_moment_arm_coefficients() -> dict[tuple[str, str], dict[str, np.ndarray]]:
-    coefficients: dict[tuple[str, str], dict[str, np.ndarray]] = {}
+def _load_moment_arm_coefficients() -> dict[str, dict[str, np.ndarray]]:
+    coefficients: dict[str, dict[str, np.ndarray]] = {}
 
     for joint in JOINT_COLUMNS:
-        for motion in MOTION_NAMES:
-            json_path = MOMENT_ARM_AVERAGE_DIR / f"moment_arm_{joint}_{motion}_average.json"
-            if not json_path.exists():
-                raise FileNotFoundError(f"Moment arm JSON not found: {json_path}")
+        json_path = MOMENT_ARM_AVERAGE_DIR / f"moment_arm_{joint}_average.json"
+        if not json_path.exists():
+            raise FileNotFoundError(f"Moment arm JSON not found: {json_path}")
 
-            payload = json.loads(json_path.read_text(encoding="utf-8"))
-            tendon_coefficients = payload.get("moment_arm_coefficients")
-            if not isinstance(tendon_coefficients, dict):
-                raise ValueError(f"Invalid moment arm JSON format: {json_path}")
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        tendon_coefficients = payload.get("moment_arm_coefficients")
+        if not isinstance(tendon_coefficients, dict):
+            raise ValueError(f"Invalid moment arm JSON format: {json_path}")
 
-            motion_coefficients: dict[str, np.ndarray] = {}
-            for tendon in TENDON_COLUMNS:
-                raw_coefficients = tendon_coefficients.get(tendon)
-                if not isinstance(raw_coefficients, list) or len(raw_coefficients) != 4:
-                    raise ValueError(
-                        f"Expected four moment arm coefficients for tendon={tendon!r} in {json_path}"
-                    )
-                motion_coefficients[tendon] = np.asarray(raw_coefficients, dtype=np.float64)
+        joint_coefficients: dict[str, np.ndarray] = {}
+        for tendon in TENDON_COLUMNS:
+            raw_coefficients = tendon_coefficients.get(tendon)
+            if not isinstance(raw_coefficients, list) or len(raw_coefficients) != 4:
+                raise ValueError(
+                    f"Expected four moment arm coefficients for tendon={tendon!r} in {json_path}"
+                )
+            joint_coefficients[tendon] = np.asarray(raw_coefficients, dtype=np.float64)
 
-            coefficients[(joint, motion)] = motion_coefficients
+        coefficients[joint] = joint_coefficients
 
     return coefficients
 
@@ -126,40 +120,29 @@ def _smooth_excursion_values(values: np.ndarray) -> np.ndarray:
     return smoothed.to_numpy(dtype=np.float64)
 
 
-def _infer_motion_direction(
+def _calculate_angle_changes(
     smoothed_angles: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
+) -> tuple[np.ndarray, np.ndarray]:
     frame_count = len(smoothed_angles)
     delta_angles = np.full(frame_count, np.nan, dtype=np.float64)
     midpoint_angles = np.full(frame_count, np.nan, dtype=np.float64)
-    directions = [DEFAULT_DIRECTION] * frame_count
 
     if frame_count == 0:
-        return delta_angles, midpoint_angles, directions
+        return delta_angles, midpoint_angles
 
     delta_angles[0] = 0.0
     midpoint_angles[0] = smoothed_angles[0]
-    current_direction = DEFAULT_DIRECTION
-
     for frame_idx in range(1, frame_count):
         previous_angle = smoothed_angles[frame_idx - 1]
         current_angle = smoothed_angles[frame_idx]
         if not np.isfinite(previous_angle) or not np.isfinite(current_angle):
-            directions[frame_idx] = current_direction
             continue
 
         delta_angle = current_angle - previous_angle
         delta_angles[frame_idx] = delta_angle
         midpoint_angles[frame_idx] = 0.5 * (previous_angle + current_angle)
 
-        if delta_angle > DIRECTION_DEADBAND_RAD:
-            current_direction = "flexion"
-        elif delta_angle < -DIRECTION_DEADBAND_RAD:
-            current_direction = "extension"
-
-        directions[frame_idx] = current_direction
-
-    return delta_angles, midpoint_angles, directions
+    return delta_angles, midpoint_angles
 
 
 def _normalize_to_zero(values: np.ndarray) -> np.ndarray:
@@ -173,29 +156,25 @@ def _normalize_to_zero(values: np.ndarray) -> np.ndarray:
 
 def _build_prediction_dataframe(
     df: pd.DataFrame,
-    moment_arm_coefficients: dict[tuple[str, str], dict[str, np.ndarray]],
+    moment_arm_coefficients: dict[str, dict[str, np.ndarray]],
 ) -> pd.DataFrame:
     comparison_df = pd.DataFrame(index=df.index)
     comparison_df["elapsed_s"] = pd.to_numeric(df["elapsed_s"], errors="coerce")
 
     joint_delta_angles: dict[str, np.ndarray] = {}
     joint_midpoint_angles: dict[str, np.ndarray] = {}
-    joint_directions: dict[str, list[str]] = {}
 
     for joint in JOINT_COLUMNS:
         smoothed_angles = _smooth_angle_series(df[FLEXION_RAD_COLUMNS[joint]])
-        delta_angles, midpoint_angles, directions = _infer_motion_direction(smoothed_angles)
+        delta_angles, midpoint_angles = _calculate_angle_changes(smoothed_angles)
 
         comparison_df[f"{joint}_actual_angle_rad"] = pd.to_numeric(df[FLEXION_RAD_COLUMNS[joint]], errors="coerce")
         comparison_df[f"{joint}_actual_angle_deg"] = np.rad2deg(comparison_df[f"{joint}_actual_angle_rad"])
         comparison_df[f"{joint}_smoothed_angle_rad"] = smoothed_angles
         comparison_df[f"{joint}_smoothed_angle_deg"] = np.rad2deg(smoothed_angles)
         comparison_df[f"{joint}_delta_angle_rad"] = delta_angles
-        comparison_df[f"{joint}_direction"] = directions
-
         joint_delta_angles[joint] = delta_angles
         joint_midpoint_angles[joint] = midpoint_angles
-        joint_directions[joint] = directions
 
     for tendon in TENDON_COLUMNS:
         actual_excursion = pd.to_numeric(df[tendon], errors="coerce").to_numpy(dtype=np.float64)
@@ -215,8 +194,7 @@ def _build_prediction_dataframe(
                 if not np.isfinite(delta_angle) or not np.isfinite(midpoint_angle):
                     continue
 
-                motion = joint_directions[joint][frame_idx]
-                coeffs = moment_arm_coefficients[(joint, motion)][tendon]
+                coeffs = moment_arm_coefficients[joint][tendon]
                 moment_arm = float(np.polyval(coeffs, midpoint_angle))
                 total_delta += moment_arm * delta_angle
                 any_valid_joint = True
@@ -343,25 +321,41 @@ def _plot_time_vs_joint_angle(comparison_df: pd.DataFrame, output_path: Path) ->
     plt.close(fig)
 
 
-def main() -> None:
-    if not TARGET_INPUT_CSV.exists():
-        raise FileNotFoundError(f"Target input CSV not found: {TARGET_INPUT_CSV}")
+def run_prediction(target_input_csv: Path, output_dir: Path) -> dict[str, Path]:
+    target_input_csv = target_input_csv.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    if not target_input_csv.exists():
+        raise FileNotFoundError(f"Target input CSV not found: {target_input_csv}")
 
-    processed_df = pd.read_csv(TARGET_INPUT_CSV)
+    processed_df = pd.read_csv(target_input_csv)
     processed_df = _prepare_input_dataframe(processed_df)
     _validate_processed_dataframe(processed_df)
     moment_arm_coefficients = _load_moment_arm_coefficients()
     comparison_df = _build_prediction_dataframe(processed_df, moment_arm_coefficients)
 
-    OUTPUT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    comparison_df.to_csv(OUTPUT_CSV_PATH, index=False)
-    _plot_excursion_comparison(comparison_df, OUTPUT_PLOT_PATH)
-    _plot_time_vs_joint_angle(comparison_df, OUTPUT_TIME_ANGLE_PLOT_PATH)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file_prefix = target_input_csv.stem
+    output_csv_path = output_dir / f"{output_file_prefix}_prediction.csv"
+    output_plot_path = output_dir / f"{output_file_prefix}_predicted_vs_actual_excursion.png"
+    output_time_angle_plot_path = output_dir / f"{output_file_prefix}_time_vs_joint_angle.png"
+    comparison_df.to_csv(output_csv_path, index=False)
+    _plot_excursion_comparison(comparison_df, output_plot_path)
+    _plot_time_vs_joint_angle(comparison_df, output_time_angle_plot_path)
 
-    print(f"Loaded input CSV: {TARGET_INPUT_CSV}")
-    print(f"Saved comparison CSV: {OUTPUT_CSV_PATH}")
-    print(f"Saved comparison plot: {OUTPUT_PLOT_PATH}")
-    print(f"Saved time-angle plot: {OUTPUT_TIME_ANGLE_PLOT_PATH}")
+    print(f"Loaded input CSV: {target_input_csv}")
+    print(f"Saved comparison CSV: {output_csv_path}")
+    print(f"Saved comparison plot: {output_plot_path}")
+    print(f"Saved time-angle plot: {output_time_angle_plot_path}")
+    return {
+        "csv": output_csv_path,
+        "plot": output_plot_path,
+        "time_angle_plot": output_time_angle_plot_path,
+    }
+
+
+def main() -> None:
+    args = _parse_args()
+    run_prediction(args.input_csv, args.output_dir)
 
 
 if __name__ == "__main__":

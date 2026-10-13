@@ -1,8 +1,8 @@
 {
   "input": {
-    "cam0_video_path": "logs/dual_camera/recordings/controlTest/cam0.mp4",
-    "cam1_video_path": "logs/dual_camera/recordings/controlTest/cam1.mp4",
-    "pair_timestamps_csv": "logs/dual_camera/recordings/controlTest/pair_timestamps.csv"
+    "cam0_video_path": "logs/dual_camera/recordings/dual_record_20260904_195114/cam0.mp4",
+    "cam1_video_path": "logs/dual_camera/recordings/dual_record_20260904_195114/cam1.mp4",
+    "pair_timestamps_csv": "logs/dual_camera/recordings/dual_record_20260904_195114/pair_timestamps.csv"
   },
   "processors": {
     "dlc_config_path": "src/observation/vision/config_deeplabcut_angle.json",

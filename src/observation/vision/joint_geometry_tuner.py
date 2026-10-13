@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +36,7 @@ DEFAULT_CAMERA_CONFIG = resolve_param_path("camera_config_dlc.json")
 WINDOW_TITLE = "Joint Geometry Tuner"
 PREVIEW_MAX_WIDTH = 1050
 PREVIEW_MAX_HEIGHT = 760
+DISPLAY_INTERVAL_MS = 33
 
 SLIDER_FIELDS: tuple[dict[str, Any], ...] = (
     {
@@ -167,6 +170,13 @@ class JointGeometryTunerApp:
         self.frame_index = 0
         self._after_id: str | None = None
         self._closing = False
+        self._worker_stop = threading.Event()
+        self._worker_lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+        self._latest_frame: tuple[int, Any] | None = None
+        self._latest_error: str | None = None
+        self._pending_adjustments: dict[str, float | list[float]] | None = None
+        self._displayed_frame_index = -1
         self.status_var = tk.StringVar(value=f"Loaded: {self.config_path}")
         self.slider_vars: dict[str, tk.DoubleVar] = {}
 
@@ -175,6 +185,7 @@ class JointGeometryTunerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build_ui()
         self._open_camera()
+        self._start_worker()
         self._schedule_next_frame()
 
     def _build_ui(self) -> None:
@@ -285,7 +296,9 @@ class JointGeometryTunerApp:
         if len(self.slider_vars) != len(SLIDER_FIELDS):
             return
         try:
-            self.processor.update_adjustments(self._adjustments_from_controls())
+            adjustments = self._adjustments_from_controls()
+            with self._worker_lock:
+                self._pending_adjustments = adjustments
             self.status_var.set("Adjusted values are active in the live preview.")
         except (ValueError, tk.TclError) as exc:
             self.status_var.set(f"Invalid adjustment value: {exc}")
@@ -294,13 +307,15 @@ class JointGeometryTunerApp:
         flat_values = self._flatten_adjustments(self.initial_adjustments)
         for key, value in flat_values.items():
             self.slider_vars[key].set(value)
-        self.processor.update_adjustments(self.initial_adjustments)
+        with self._worker_lock:
+            self._pending_adjustments = self.initial_adjustments
         self.status_var.set("Reset to the values loaded from the source configuration.")
 
     def save_parameters(self) -> None:
         try:
             adjustments = self._adjustments_from_controls()
-            self.processor.update_adjustments(adjustments)
+            with self._worker_lock:
+                self._pending_adjustments = adjustments
             saved_path = save_adjustments_snapshot(self.config_path, adjustments)
         except (OSError, ValueError, tk.TclError) as exc:
             messagebox.showerror("Save Parameters Error", str(exc))
@@ -328,30 +343,66 @@ class JointGeometryTunerApp:
         self.cap = cap
         self.calibration = setup_undistortion_from_config(self.camera_config, log_prefix="[joint-tuner]")
 
-    def _schedule_next_frame(self, delay_ms: int = 1) -> None:
+    def _start_worker(self) -> None:
+        self._worker = threading.Thread(target=self._capture_loop, name="joint-geometry-tuner", daemon=True)
+        self._worker.start()
+
+    def _capture_loop(self) -> None:
+        cap = self.cap
+        if cap is None:
+            return
+        try:
+            while not self._worker_stop.is_set():
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    with self._worker_lock:
+                        self._latest_error = "Failed to read a camera frame. Retrying..."
+                    time.sleep(0.1)
+                    continue
+
+                try:
+                    with self._worker_lock:
+                        adjustments = self._pending_adjustments
+                        self._pending_adjustments = None
+                    if adjustments is not None:
+                        self.processor.update_adjustments(adjustments)
+
+                    frame = undistort_frame(frame, self.calibration)
+                    _, overlay = self.processor.process_frame(frame, self.frame_index)
+                    display_frame = _resize_preview(overlay, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
+                    with self._worker_lock:
+                        self._latest_frame = (self.frame_index, display_frame)
+                        self._latest_error = None
+                    self.frame_index += 1
+                except Exception as exc:
+                    with self._worker_lock:
+                        self._latest_error = f"Frame processing failed: {exc}"
+                    time.sleep(0.25)
+        finally:
+            cap.release()
+            self.cap = None
+
+    def _schedule_next_frame(self, delay_ms: int = DISPLAY_INTERVAL_MS) -> None:
         if not self._closing:
             self._after_id = self.root.after(delay_ms, self._update_frame)
 
     def _update_frame(self) -> None:
-        if self._closing or self.cap is None:
-            return
-        ok, frame = self.cap.read()
-        if not ok or frame is None:
-            self.status_var.set("Failed to read a camera frame. Retrying...")
-            self._schedule_next_frame(100)
+        if self._closing:
             return
 
         try:
-            frame = undistort_frame(frame, self.calibration)
-            _, overlay = self.processor.process_frame(frame, self.frame_index)
-            display_frame = _resize_preview(overlay, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
-            self.photo = _to_photo_image_bgr(display_frame)
-            self.preview_label.configure(image=self.photo, text="")
-            self.frame_index += 1
+            with self._worker_lock:
+                latest_frame = self._latest_frame
+                latest_error = self._latest_error
+            if latest_error is not None:
+                self.status_var.set(latest_error)
+            if latest_frame is not None and latest_frame[0] > self._displayed_frame_index:
+                frame_index, display_frame = latest_frame
+                self.photo = _to_photo_image_bgr(display_frame)
+                self.preview_label.configure(image=self.photo, text="")
+                self._displayed_frame_index = frame_index
         except Exception as exc:
-            self.status_var.set(f"Frame processing failed: {exc}")
-            self._schedule_next_frame(250)
-            return
+            self.status_var.set(f"Preview update failed: {exc}")
 
         self._schedule_next_frame()
 
@@ -365,9 +416,9 @@ class JointGeometryTunerApp:
             except tk.TclError:
                 pass
             self._after_id = None
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        self._worker_stop.set()
+        if self._worker is not None:
+            self._worker.join(timeout=1.0)
         self.root.destroy()
 
 

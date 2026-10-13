@@ -22,7 +22,6 @@ class TrajectorySample:
     elapsed_s: float
     joint_angles_rad: tuple[float, float, float]
     nominal_excursions_mm: tuple[float, float, float, float, float, float]
-    motion_directions: tuple[str, str, str]
 
 
 class FeedbackTrajectory:
@@ -31,8 +30,6 @@ class FeedbackTrajectory:
         elapsed_s: np.ndarray,
         joint_angles_rad: np.ndarray,
         excursions_mm: np.ndarray,
-        *,
-        direction_deadband_rad: float = math.radians(0.2),
     ) -> None:
         if elapsed_s.ndim != 1 or elapsed_s.size < 2:
             raise ValueError("Trajectory requires at least two elapsed-time samples")
@@ -48,20 +45,14 @@ class FeedbackTrajectory:
             raise ValueError("excursion trajectory contains a non-finite value")
         if np.any(np.diff(elapsed_s) <= 0.0):
             raise ValueError("elapsed_s must be strictly increasing")
-        if not math.isfinite(direction_deadband_rad) or direction_deadband_rad < 0.0:
-            raise ValueError("direction_deadband_rad must be finite and non-negative")
-
         self._elapsed_s = np.asarray(elapsed_s, dtype=np.float64)
         self._joint_angles_rad = np.asarray(joint_angles_rad, dtype=np.float64)
         self._excursions_mm = np.asarray(excursions_mm, dtype=np.float64)
-        self._directions = self._build_directions(direction_deadband_rad)
 
     @classmethod
     def from_csv(
         cls,
         csv_path: Path,
-        *,
-        direction_deadband_rad: float = math.radians(0.2),
     ) -> "FeedbackTrajectory":
         path = csv_path.expanduser().resolve()
         if not path.is_file():
@@ -97,7 +88,6 @@ class FeedbackTrajectory:
             elapsed,
             np.asarray(joint_rows, dtype=np.float64),
             np.asarray(excursion_rows, dtype=np.float64),
-            direction_deadband_rad=direction_deadband_rad,
         )
 
     @property
@@ -116,27 +106,8 @@ class FeedbackTrajectory:
             float(np.interp(sample_time, self._elapsed_s, self._excursions_mm[:, index]))
             for index in range(len(TENDONS))
         )
-        row_index = int(np.searchsorted(self._elapsed_s, sample_time, side="right") - 1)
-        row_index = min(max(row_index, 0), len(self._directions) - 1)
         return TrajectorySample(
             elapsed_s=sample_time,
             joint_angles_rad=joint_angles,
             nominal_excursions_mm=excursions,
-            motion_directions=self._directions[row_index],
         )
-
-    def _build_directions(
-        self,
-        deadband_rad: float,
-    ) -> tuple[tuple[str, str, str], ...]:
-        current = ["flexion"] * len(JOINTS)
-        result: list[tuple[str, str, str]] = [tuple(current)]
-        for row_index in range(1, self._joint_angles_rad.shape[0]):
-            deltas = self._joint_angles_rad[row_index] - self._joint_angles_rad[row_index - 1]
-            for joint_index, delta in enumerate(deltas):
-                if delta > deadband_rad:
-                    current[joint_index] = "flexion"
-                elif delta < -deadband_rad:
-                    current[joint_index] = "extension"
-            result.append(tuple(current))
-        return tuple(result)

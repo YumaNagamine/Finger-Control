@@ -78,6 +78,24 @@ def parse_args() -> argparse.Namespace:
         "--jump-return-frames", type=int, default=JUMP_RETURN_MAX_FRAMES
     )
     parser.add_argument("--jump-sigma", type=float, default=JUMP_SIGMA)
+    parser.add_argument(
+        "--excursion-jump-sigma",
+        type=float,
+        default=None,
+        help=(
+            "Jump-return sigma for the selected excursion only. "
+            "Defaults to --jump-sigma."
+        ),
+    )
+    parser.add_argument(
+        "--excursion-min-jump-mm",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum excursion jump magnitude in millimetres used by the "
+            "jump-return detector."
+        ),
+    )
     parser.add_argument("--no-outlier-filter", action="store_true")
     parser.add_argument("--no-raw-overlay", action="store_true")
     return parser.parse_args()
@@ -109,9 +127,17 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--jump-return-frames must be 1 or greater.")
     if args.jump_sigma <= 0:
         raise ValueError("--jump-sigma must be greater than 0.")
+    if args.excursion_jump_sigma is not None and args.excursion_jump_sigma <= 0:
+        raise ValueError("--excursion-jump-sigma must be greater than 0.")
+    if args.excursion_min_jump_mm < 0:
+        raise ValueError("--excursion-min-jump-mm must be 0 or greater.")
 
 
-def _robust_step_threshold(series: pd.Series, sigma: float) -> float:
+def _robust_step_threshold(
+    series: pd.Series,
+    sigma: float,
+    minimum_threshold: float = 0.0,
+) -> float:
     steps = series.diff().dropna()
     if steps.empty:
         return np.inf
@@ -119,18 +145,28 @@ def _robust_step_threshold(series: pd.Series, sigma: float) -> float:
     center = float(steps.median())
     mad = float((steps - center).abs().median())
     median_abs_step = float(steps.abs().median())
-    return max(sigma * 1.4826 * mad, 4.0 * median_abs_step, 1e-9)
+    return max(
+        sigma * 1.4826 * mad,
+        4.0 * median_abs_step,
+        minimum_threshold,
+        1e-9,
+    )
 
 
 def _jump_return_outliers(
     series: pd.Series,
     max_frames: int,
     sigma: float,
+    minimum_threshold: float = 0.0,
 ) -> pd.Series:
     """Find short plateaus created by a large jump followed by a return jump."""
     numeric = pd.to_numeric(series, errors="coerce")
     steps = numeric.diff()
-    threshold = _robust_step_threshold(numeric, sigma)
+    threshold = _robust_step_threshold(
+        numeric,
+        sigma,
+        minimum_threshold=minimum_threshold,
+    )
     large_positions = np.flatnonzero((steps.abs() > threshold).to_numpy())
     outliers = pd.Series(False, index=numeric.index)
 
@@ -198,14 +234,25 @@ def _filter_outliers(
     jump_return_frames: int,
     jump_sigma: float,
     enabled: bool,
+    minimum_jump_threshold: float = 0.0,
 ) -> tuple[pd.Series, pd.Series]:
     numeric = pd.to_numeric(series, errors="coerce")
     if not enabled:
         return numeric, pd.Series(False, index=numeric.index)
 
-    jump_outliers = _jump_return_outliers(
-        numeric, max_frames=jump_return_frames, sigma=jump_sigma
+    # Bridge short missing gaps for jump detection only.  The original NaN
+    # frames are never converted into outlier flags or measured values.
+    detection_numeric = numeric.interpolate(
+        limit=MAX_INTERPOLATION_GAP,
+        limit_area="inside",
     )
+    jump_outliers = _jump_return_outliers(
+        detection_numeric,
+        max_frames=jump_return_frames,
+        sigma=jump_sigma,
+        minimum_threshold=minimum_jump_threshold,
+    )
+    jump_outliers = jump_outliers & numeric.notna()
     without_jumps = numeric.mask(jump_outliers)
     hampel_outliers = _hampel_outliers(without_jumps, window=window, sigma=sigma)
     combined = jump_outliers | hampel_outliers
@@ -249,6 +296,8 @@ def build_cleaned_dataframe(
     jump_return_frames: int,
     jump_sigma: float,
     filter_outliers: bool,
+    excursion_jump_sigma: float | None = None,
+    excursion_min_jump_mm: float = 0.0,
 ) -> pd.DataFrame:
     required = [excursion_column, *JOINT_COLORS]
     missing = [column for column in required if column not in dataframe.columns]
@@ -268,8 +317,11 @@ def build_cleaned_dataframe(
         window=outlier_window,
         sigma=outlier_sigma,
         jump_return_frames=jump_return_frames,
-        jump_sigma=jump_sigma,
+        jump_sigma=(
+            jump_sigma if excursion_jump_sigma is None else excursion_jump_sigma
+        ),
         enabled=filter_outliers,
+        minimum_jump_threshold=excursion_min_jump_mm,
     )
     # A quality flag is part of the measurement protocol.  Keep non-ok frames
     # in the diagnostic CSV, but do not let them define motion or ROM.
@@ -290,6 +342,10 @@ def build_cleaned_dataframe(
     cleaned["analysis_outlier_sigma"] = outlier_sigma
     cleaned["analysis_jump_return_max_frames"] = jump_return_frames
     cleaned["analysis_jump_sigma"] = jump_sigma
+    cleaned["analysis_excursion_jump_sigma"] = (
+        jump_sigma if excursion_jump_sigma is None else excursion_jump_sigma
+    )
+    cleaned["analysis_excursion_min_jump_mm"] = excursion_min_jump_mm
     cleaned["analysis_outlier_filter_enabled"] = filter_outliers
     cleaned["analysis_quality_column"] = quality_column
     cleaned["tendon_quality_ok"] = tendon_quality_ok
@@ -312,6 +368,7 @@ def build_cleaned_dataframe(
             jump_return_frames=jump_return_frames,
             jump_sigma=jump_sigma,
             enabled=filter_outliers,
+            minimum_jump_threshold=0.0,
         )
         baseline = filtered_flexion.where(tendon_quality_ok).iloc[:baseline_frames].median(
             skipna=True
@@ -471,6 +528,8 @@ def main() -> None:
         jump_return_frames=args.jump_return_frames,
         jump_sigma=args.jump_sigma,
         filter_outliers=not args.no_outlier_filter,
+        excursion_jump_sigma=args.excursion_jump_sigma,
+        excursion_min_jump_mm=args.excursion_min_jump_mm,
     )
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

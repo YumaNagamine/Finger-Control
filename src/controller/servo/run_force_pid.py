@@ -34,6 +34,10 @@ from controller.servo.force_control import (  # noqa: E402
     PIDConfig,
     ReaderTask,
 )
+from controller.servo.torque_calibration.storage import (  # noqa: E402
+    intercept_for_model,
+    load_torque_intercept_calibration,
+)
 
 
 SERVO_NAMES = ["ED", "DI", "FDS", "FDP", "LU", "PI"]
@@ -49,6 +53,12 @@ def _parse_args() -> argparse.Namespace:
         "--zero-offset-file",
         type=Path,
         default=API_ROOT / "calibration" / "current" / "as5048a_unloaded_zero_offsets.json",
+    )
+    parser.add_argument(
+        "--intercept-calibration-file",
+        type=Path,
+        default=API_ROOT / "calibration" / "current" / "torque_intercept_calibration.json",
+        help="Fixed-slope force-gauge torque-intercept calibration JSON.",
     )
     parser.add_argument("--no-zero-offset", action="store_true")
     parser.add_argument("--target-force-n", required=True, type=float)
@@ -124,8 +134,19 @@ def _load_calibration(
         )
 
     intercept_nmm = model["intercept_nmm"]
+    intercept_path = _path_from_project(
+        getattr(
+            args,
+            "intercept_calibration_file",
+            API_ROOT / "calibration" / "current" / "torque_intercept_calibration.json",
+        )
+    )
+    intercept_records = load_torque_intercept_calibration(intercept_path)
+    calibrated_intercept = intercept_for_model(intercept_records, model)
     zero_path = _path_from_project(args.zero_offset_file)
-    if not args.no_zero_offset and zero_path.exists():
+    if calibrated_intercept is not None:
+        intercept_nmm = calibrated_intercept
+    elif not args.no_zero_offset and zero_path.exists():
         offsets = load_zero_offsets(zero_path)
         offset = offsets.get(model["sensor_id"])
         if offset is None or offset["servo_id"] != args.servo_id:

@@ -1,34 +1,13 @@
-# Torque intercept calibration GUI
+# Torque zero calibration
 
-This GUI recalibrates only the torque-intercept `b` while keeping the existing
-per-servo slope `k` fixed.
+Torque zero calibration is part of the Force Control GUI. Use its Speed control
+tab to place a tendon at the repeatable loose position, stop every servo, then
+use the Torque calibration tab.
 
-Start it from the project root after activating the `FingerControl` Conda
-environment:
+`Calibrate (set current force as zero)` averages the current angle difference
+for one second and saves `b = -k * mean(delta theta)`. The fitted slope `k` in
+the raw spring-torque CSV is never changed.
 
-```cmd
-set PYTHONPATH=src
-python -m controller.servo.torque_calibration
-```
-
-The calibration workflow does not send movement commands. It reads synchronized Servo and
-AS5048A telemetry, while the force-gauge value is entered manually in newtons.
-The `Motor speed` tab can send raw speed commands of `-500`, `-300`, `-100`,
-`0` (stop), `+100`, `+300`, and `+500` to an individual motor, or stop all
-motors at once. Stop all motors before capturing a calibration point.
-For each selected Servo ID:
-
-1. Hold the measured force steadily.
-2. Enter the force-gauge reading and torque direction.
-3. Click `Capture point`.
-4. Repeat for several force points and click `Calculate b`.
-
-After all six Servo IDs have a calculated value, click
-`Update calibrated intercepts for all six servos`.
-
-The result is saved to
-`third_party/ServoHardwareAPI/calibration/current/torque_intercept_calibration.json`.
-The raw spring-torque CSV files, their slopes, and
-`as5048a_unloaded_zero_offsets.json` are not changed. Existing force-control
-paths prefer this file, then fall back to the unloaded-zero correction, then
-to the intercept fitted from the original CSV points.
+`Remember encoder position for calibration` stores the current AS5048A
+multi-turn position for future automatic return-to-calibration support. It does
+not move the servo automatically.

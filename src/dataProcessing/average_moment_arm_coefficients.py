@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 from pathlib import Path
@@ -14,25 +15,22 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PROCESSED_DATA_ROOT = PROJECT_ROOT / "logs" / "dual_camera" / "processed_data"
-OUTPUT_ROOT = PROJECT_ROOT / "logs" / "dual_camera" / "moment_arm_average"
+PROCESSED_DATA_ROOT = PROJECT_ROOT / "logs" / "dual_camera-finger1" / "processed_data"
+OUTPUT_ROOT = PROJECT_ROOT / "logs" / "dual_camera-finger1" / "moment_arm_average"
 TENDON_COLUMNS = ["FDP", "FDS", "ED", "DI", "PI", "LUM"]
 MOMENT_ARM_COEFFICIENT_COLUMNS = ["moment_arm_c3", "moment_arm_c2", "moment_arm_c1", "moment_arm_c0"]
 PLOT_DEGREE_LIMITS = {
     "DIP": (0.0, 90.0),
     "PIP": (0.0, 90.0),
-    "MCP": (-20.0, 100.0),
+    "MCP": (-30.0, 100.0),
 }
 MOMENT_ARM_Y_LIMITS = (-20.0, 25.0)
 MOMENT_ARM_BOX_ASPECT = 0.45
 
-# Edit these specifications in code when you want to generate a new average plot/json pair.
+MOTIONS = ("flexion", "extension")
 AVERAGE_SPECS = [
-    {
-        "output_name": "moment_arm_PIP_flexion_average",
-        "joint": "PIP",
-        "motion": "flexion",
-    },
+    {"output_name": f"moment_arm_{joint}_average", "joint": joint}
+    for joint in ("DIP", "PIP", "MCP")
 ]
 
 
@@ -67,6 +65,120 @@ def _load_polynomial_coefficients(csv_path: Path, joint: str) -> pd.DataFrame:
     return joint_df
 
 
+def _curve_coefficients_for_joint(
+    source_curves_path: Path,
+    joint: str,
+    source_id: str,
+) -> tuple[dict[str, object], dict[str, list[float]]]:
+    """Convert the paper-selected curve into coefficients used for both directions."""
+    curves = pd.read_csv(source_curves_path)
+    required_columns = {
+        "source",
+        "trial",
+        "joint",
+        "tendon",
+        "direction",
+        "angle_deg",
+        "moment_arm_mm_per_rad",
+    }
+    missing = sorted(required_columns.difference(curves.columns))
+    if missing:
+        raise ValueError(f"Missing columns in {source_curves_path}: {missing}")
+
+    robot = curves[
+        (curves["source"] == source_id)
+        & (curves["trial"] == "mean_of_3")
+        & (curves["joint"] == joint)
+    ].copy()
+    if robot.empty:
+        raise ValueError(
+            f"No source rows found for source={source_id!r}, joint={joint!r} "
+            f"in {source_curves_path}"
+        )
+
+    robot["angle_deg"] = pd.to_numeric(robot["angle_deg"], errors="coerce")
+    robot["moment_arm_mm_per_rad"] = pd.to_numeric(
+        robot["moment_arm_mm_per_rad"], errors="coerce"
+    )
+    robot = robot.dropna(subset=["angle_deg", "moment_arm_mm_per_rad"])
+
+    coefficients: dict[str, list[float]] = {}
+    source_directions: dict[str, str] = {}
+    source_tendon_labels: dict[str, str] = {}
+    fit_metrics: dict[str, dict[str, object]] = {}
+
+    for tendon in TENDON_COLUMNS:
+        source_tendon = tendon
+        if tendon == "ED" and not (robot["tendon"] == "ED").any():
+            source_tendon = "EI"
+        tendon_df = robot[robot["tendon"] == source_tendon].copy()
+        if tendon_df.empty:
+            raise ValueError(f"No curve rows found for tendon={tendon!r}")
+
+        tendon_df = tendon_df.groupby("angle_deg", as_index=False).agg(
+            moment_arm_mm_per_rad=("moment_arm_mm_per_rad", "mean"),
+            direction=("direction", "first"),
+        ).sort_values("angle_deg")
+        if len(tendon_df) < 4:
+            raise ValueError(
+                f"At least four curve points are required for {joint}-{tendon}; "
+                f"found {len(tendon_df)}"
+            )
+
+        angle_rad = np.deg2rad(tendon_df["angle_deg"].to_numpy(dtype=float))
+        moment_arm = tendon_df["moment_arm_mm_per_rad"].to_numpy(dtype=float)
+        fitted_coefficients = np.polyfit(angle_rad, moment_arm, deg=3)
+        fitted_values = np.polyval(fitted_coefficients, angle_rad)
+        residuals = moment_arm - fitted_values
+
+        coefficients[tendon] = [float(value) for value in fitted_coefficients]
+        source_directions[tendon] = str(tendon_df["direction"].iloc[0])
+        source_tendon_labels[tendon] = source_tendon
+        fit_metrics[tendon] = {
+            "num_curve_points": int(len(tendon_df)),
+            "angle_min_deg": float(tendon_df["angle_deg"].min()),
+            "angle_max_deg": float(tendon_df["angle_deg"].max()),
+            "fit_rmse_mm_per_rad": float(np.sqrt(np.mean(residuals**2))),
+            "fit_max_abs_error_mm_per_rad": float(np.max(np.abs(residuals))),
+        }
+
+    payload = {
+        "output_name": f"moment_arm_{joint}_average",
+        "joint": joint,
+        "source_curves": str(source_curves_path),
+        "source_id": source_id,
+        "source_trial": "mean_of_3",
+        "source_direction_by_tendon": source_directions,
+        "source_tendon_labels": source_tendon_labels,
+        "direction_policy": (
+            "Use the selected source direction as the ground truth for both "
+            "flexion and extension prediction."
+        ),
+        "prediction_direction_dependent": False,
+        "angle_unit": "rad",
+        "moment_arm_unit": "mm/rad",
+        "fit_degree": 3,
+        "coefficient_order": MOMENT_ARM_COEFFICIENT_COLUMNS,
+        "moment_arm_coefficients": coefficients,
+        "moment_arm_polynomials": {
+            tendon: _format_polynomial(coeffs, "x")
+            for tendon, coeffs in coefficients.items()
+        },
+        "fit_metrics": fit_metrics,
+    }
+    return payload, coefficients
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate averaged moment-arm coefficient JSON files."
+    )
+    parser.add_argument("--source-curves", type=Path)
+    parser.add_argument("--source-id", default="robot_2608A")
+    parser.add_argument("--output-root", type=Path)
+    return parser.parse_args()
+
+
 def _find_source_dirs(joint: str, motion: str) -> list[Path]:
     valid_joints = {"DIP", "PIP", "MCP"}
     valid_motions = {"flexion", "extension"}
@@ -89,38 +201,42 @@ def _find_source_dirs(joint: str, motion: str) -> list[Path]:
 def _average_coefficients_for_spec(spec: dict[str, object]) -> tuple[dict[str, object], dict[str, list[float]]]:
     output_name = str(spec["output_name"])
     joint = str(spec["joint"])
-    motion = str(spec["motion"])
-    source_dirs = _find_source_dirs(joint, motion)
-
-    joint_to_tendon_rows: dict[str, list[list[float]]] = {tendon: [] for tendon in TENDON_COLUMNS}
+    motion_to_tendon_rows: dict[str, dict[str, list[list[float]]]] = {
+        motion: {tendon: [] for tendon in TENDON_COLUMNS}
+        for motion in MOTIONS
+    }
     used_sources: list[str] = []
 
-    for source_dir in source_dirs:
-        coefficient_csv_path = source_dir / "polynomial_coefficients.csv"
-        joint_df = _load_polynomial_coefficients(coefficient_csv_path, joint)
-        used_sources.append(str(source_dir))
+    for motion in MOTIONS:
+        for source_dir in _find_source_dirs(joint, motion):
+            coefficient_csv_path = source_dir / "polynomial_coefficients.csv"
+            joint_df = _load_polynomial_coefficients(coefficient_csv_path, joint)
+            used_sources.append(str(source_dir))
 
-        for tendon in TENDON_COLUMNS:
-            tendon_df = joint_df[joint_df["tendon"] == tendon]
-            if tendon_df.empty:
-                raise ValueError(f"No coefficient row for tendon={tendon!r} in {coefficient_csv_path}")
-            row = tendon_df.iloc[0]
-            coeffs = [float(row[column]) for column in MOMENT_ARM_COEFFICIENT_COLUMNS]
-            if not np.all(np.isfinite(coeffs)):
-                raise ValueError(f"Non-finite coefficients for tendon={tendon!r} in {coefficient_csv_path}")
-            joint_to_tendon_rows[tendon].append(coeffs)
+            for tendon in TENDON_COLUMNS:
+                tendon_df = joint_df[joint_df["tendon"] == tendon]
+                if tendon_df.empty:
+                    raise ValueError(f"No coefficient row for tendon={tendon!r} in {coefficient_csv_path}")
+                row = tendon_df.iloc[0]
+                coeffs = [float(row[column]) for column in MOMENT_ARM_COEFFICIENT_COLUMNS]
+                if not np.all(np.isfinite(coeffs)):
+                    raise ValueError(f"Non-finite coefficients for tendon={tendon!r} in {coefficient_csv_path}")
+                motion_to_tendon_rows[motion][tendon].append(coeffs)
 
     averaged_coefficients: dict[str, list[float]] = {}
-    for tendon, coeff_rows in joint_to_tendon_rows.items():
-        if not coeff_rows:
-            raise ValueError(f"No coefficient rows collected for tendon={tendon!r}")
-        averaged = np.mean(np.asarray(coeff_rows, dtype=np.float64), axis=0)
+    for tendon in TENDON_COLUMNS:
+        motion_means = [
+            np.mean(np.asarray(motion_to_tendon_rows[motion][tendon], dtype=np.float64), axis=0)
+            for motion in MOTIONS
+        ]
+        averaged = np.mean(np.asarray(motion_means, dtype=np.float64), axis=0)
         averaged_coefficients[tendon] = [float(value) for value in averaged]
 
     json_payload = {
         "output_name": output_name,
         "joint": joint,
-        "motion": motion,
+        "source_motions": list(MOTIONS),
+        "aggregation": "equal_weight_per_motion",
         "source_dirs": used_sources,
         "coefficient_order": MOMENT_ARM_COEFFICIENT_COLUMNS,
         "moment_arm_coefficients": averaged_coefficients,
@@ -174,10 +290,9 @@ def _save_average_json(output_name: str, payload: dict[str, object]) -> Path:
 def process_average_spec(spec: dict[str, object]) -> dict[str, Path]:
     output_name = str(spec["output_name"])
     joint = str(spec["joint"])
-    motion = str(spec["motion"])
     if joint not in PLOT_DEGREE_LIMITS:
         raise ValueError(f"Unsupported joint value: {joint!r}")
-    print(f"Searching processed_data directories for joint={joint}, motion={motion}")
+    print(f"Searching processed_data directories for joint={joint}, motions={MOTIONS}")
 
     payload, averaged_coefficients = _average_coefficients_for_spec(spec)
     for source_dir in payload["source_dirs"]:
@@ -188,6 +303,31 @@ def process_average_spec(spec: dict[str, object]) -> dict[str, Path]:
 
 
 def main() -> None:
+    args = _parse_args()
+    global OUTPUT_ROOT
+    if args.output_root is not None:
+        OUTPUT_ROOT = args.output_root.expanduser().resolve()
+
+    if args.source_curves is not None:
+        source_curves_path = args.source_curves.expanduser().resolve()
+        if not source_curves_path.is_file():
+            raise FileNotFoundError(f"Source curve CSV not found: {source_curves_path}")
+
+        print(f"Source curve CSV: {source_curves_path}")
+        print(f"Output root: {OUTPUT_ROOT}")
+        for joint in ("DIP", "PIP", "MCP"):
+            payload, coefficients = _curve_coefficients_for_joint(
+                source_curves_path=source_curves_path,
+                joint=joint,
+                source_id=args.source_id,
+            )
+            output_name = f"moment_arm_{joint}_average"
+            json_path = _save_average_json(output_name, payload)
+            plot_path = _plot_average_moment_arm(output_name, joint, coefficients)
+            print(f"Saved JSON: {json_path}")
+            print(f"Saved plot: {plot_path}")
+        return
+
     print(f"Processed data root: {PROCESSED_DATA_ROOT}")
     print(f"Output root: {OUTPUT_ROOT}")
     print(f"Number of average specs: {len(AVERAGE_SPECS)}")

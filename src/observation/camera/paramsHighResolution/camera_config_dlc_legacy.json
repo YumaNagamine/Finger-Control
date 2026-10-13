@@ -6,6 +6,8 @@
   "target_fps": 90.0,
   "buffersize": 0,
   "auto_exposure": 0.0,
+  "auto_white_balance": false,
+  "white_balance_temperature": 6000,
   "gain": 0.0,
   "exposure": -7.0,
   "capture_fourcc": "MJPG",
