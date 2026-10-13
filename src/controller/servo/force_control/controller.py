@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-from controller.servo.force_control.pid import PID
+from controller.servo.control_common.pid import PID
 
 
 class ForceControlError(RuntimeError):
