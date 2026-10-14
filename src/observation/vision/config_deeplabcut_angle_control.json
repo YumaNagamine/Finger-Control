@@ -1,7 +1,7 @@
 {
   "profile": {
     "name": "realtime_control",
-    "description": "Control-specific DLC geometry. Tune processing.adjustments for the control camera distance without changing the measurement profile."
+    "description": "Control-specific DLC geometry. Pixel-valued adjustments are scaled from adjustment_reference_resolution to the input frame size."
   },
   "input": {
     "mode": "camera",
@@ -65,6 +65,7 @@
     "confidence_threshold": 0.3,
     "ema_alpha": 0.0,
     "hold_last_frames": 0,
+    "adjustment_reference_resolution": [1600, 1200],
     "adjustments": {
       "theta_rad": 0.45,
       "distance_shift": -20.0,

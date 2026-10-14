@@ -20,21 +20,41 @@ def _format(value: object) -> object:
 class ControlTraceWriter:
     """Write one wide control/force row per control tick."""
 
-    def __init__(self, path: Path, servo_ids_by_tendon: Sequence[int]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        servo_ids_by_tendon: Sequence[int],
+        *,
+        position_label: str = "position",
+        run_id: str = "",
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("w", encoding="utf-8", newline="")
         self._writer = csv.writer(self._file)
         self.servo_ids_by_tendon = tuple(int(value) for value in servo_ids_by_tendon)
-        header = ["phase", "elapsed_s", "dt_s", "servo_telemetry_age_s"]
+        self.position_label = str(position_label)
+        self.run_id = str(run_id)
+        header = [
+            "run_id",
+            "phase",
+            "elapsed_s",
+            "control_tick_monotonic_s",
+            "command_submitted_monotonic_s",
+            "command_sequence",
+            "servo_feedback_received_monotonic_s",
+            "dt_s",
+            "servo_telemetry_age_s",
+        ]
         for tendon, servo_id in zip(TENDONS, self.servo_ids_by_tendon):
             header.extend(
                 [
                     f"{tendon}_servo_id",
+                    f"{tendon}_encoder_received_monotonic_s",
                     f"{tendon}_target_excursion_mm",
-                    f"{tendon}_target_position",
-                    f"{tendon}_actual_position",
-                    f"{tendon}_position_error",
+                    f"{tendon}_target_{self.position_label}",
+                    f"{tendon}_actual_{self.position_label}",
+                    f"{tendon}_error_{self.position_label}",
                     f"{tendon}_speed_command",
                     f"{tendon}_force_n",
                     f"{tendon}_torque_nmm",
@@ -60,9 +80,25 @@ class ControlTraceWriter:
         actual_positions: Mapping[int, float],
         speeds: Mapping[int, int],
         force_readings: Mapping[int, Mapping[str, object]] | None = None,
+        control_tick_monotonic_s: float | None = None,
+        command_submitted_monotonic_s: float | None = None,
+        command_sequence: int | None = None,
+        servo_feedback_received_monotonic_s: float | None = None,
+        encoder_received_at_by_servo_id: Mapping[int, float | None] | None = None,
     ) -> None:
         force_readings = force_readings or {}
-        row: list[object] = [phase, _format(elapsed_s), _format(dt_s), _format(servo_telemetry_age_s)]
+        encoder_received_at_by_servo_id = encoder_received_at_by_servo_id or {}
+        row: list[object] = [
+            self.run_id,
+            phase,
+            _format(elapsed_s),
+            _format(control_tick_monotonic_s),
+            _format(command_submitted_monotonic_s),
+            _format(command_sequence),
+            _format(servo_feedback_received_monotonic_s),
+            _format(dt_s),
+            _format(servo_telemetry_age_s),
+        ]
         for tendon_index, (tendon, servo_id) in enumerate(
             zip(TENDONS, self.servo_ids_by_tendon)
         ):
@@ -72,6 +108,7 @@ class ControlTraceWriter:
             row.extend(
                 [
                     servo_id,
+                    _format(encoder_received_at_by_servo_id.get(servo_id)),
                     _format(target_excursions_mm[tendon_index]),
                     _format(target),
                     _format(actual),

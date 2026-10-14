@@ -29,7 +29,7 @@ class ExcursionTrajectory:
 
     elapsed_times_s: tuple[float, ...]
     excursions_mm: tuple[tuple[float, ...], ...]
-    position_units_per_mm: tuple[float, ...]
+    position_units_per_mm: tuple[float, ...] | None = None
     time_scale: float = 1.0
 
     def __post_init__(self) -> None:
@@ -40,12 +40,13 @@ class ExcursionTrajectory:
             for previous, current in zip(self.elapsed_times_s, self.elapsed_times_s[1:])
         ):
             raise ValueError("Trajectory elapsed times must be monotonic")
-        _six_values(self.position_units_per_mm, "position_units_per_mm")
-        if any(
-            not math.isfinite(value) or value == 0.0
-            for value in self.position_units_per_mm
-        ):
-            raise ValueError("position_units_per_mm must be finite and non-zero")
+        if self.position_units_per_mm is not None:
+            _six_values(self.position_units_per_mm, "position_units_per_mm")
+            if any(
+                not math.isfinite(value) or value == 0.0
+                for value in self.position_units_per_mm
+            ):
+                raise ValueError("position_units_per_mm must be finite and non-zero")
         if self.time_scale <= 0.0 or not math.isfinite(self.time_scale):
             raise ValueError("time_scale must be finite and greater than zero")
         for row_index, row in enumerate(self.excursions_mm):
@@ -57,7 +58,7 @@ class ExcursionTrajectory:
     def from_csv(
         cls,
         csv_path: Path,
-        position_units_per_mm: Sequence[float],
+        position_units_per_mm: Sequence[float] | None = None,
         *,
         time_scale: float = 1.0,
     ) -> "ExcursionTrajectory":
@@ -90,7 +91,12 @@ class ExcursionTrajectory:
         first_time = rows[0][0]
         elapsed = tuple(float(row[0] - first_time) for row in rows)
         excursions = tuple(tuple(row[1:]) for row in rows)
-        return cls(elapsed, excursions, tuple(position_units_per_mm), time_scale)
+        scales = (
+            None
+            if position_units_per_mm is None
+            else tuple(float(value) for value in position_units_per_mm)
+        )
+        return cls(elapsed, excursions, scales, time_scale)
 
     @property
     def duration_s(self) -> float:
@@ -129,6 +135,11 @@ class ExcursionTrajectory:
         elapsed_s: float,
         start_positions: Sequence[float | int],
     ) -> tuple[float, ...]:
+        if self.position_units_per_mm is None:
+            raise ValueError(
+                "Servo positions require position_units_per_mm; use excursions_at "
+                "for encoder-position playback"
+            )
         _six_values(start_positions, "start_positions")
         excursions = self.excursions_at(elapsed_s)
         initial = self.initial_excursion_mm

@@ -17,6 +17,7 @@ import threading
 import time
 import tkinter as tk
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -32,17 +33,20 @@ except ImportError:  # pragma: no cover - Pillow is normally installed with matp
     Image = None
     ImageTk = None
 
-from controller.csv_player.force_estimator import CalibratedForceEstimator
+from controller.csv_player.encoder_calibration import (
+    EncoderExcursionCalibration,
+    load_encoder_excursion_calibration,
+)
 from controller.csv_player.gui_support import LatestEventMailbox
-from controller.csv_player.recorder import ControlTraceWriter
+from controller.csv_player.playback_service import (
+    EncoderPlaybackService,
+    build_encoder_playback_config,
+)
 from controller.csv_player.runner import (
     ForceTelemetryUnavailable,
     HardForceLimitError,
-    PlaybackConfig,
     PlaybackStopped,
-    SpeedTrajectoryRunner,
 )
-from controller.csv_player.speed_controller import SpeedControlConfig, SpeedController
 from controller.csv_player.trajectory import ExcursionTrajectory
 from controller.servo.hardware_session import API_ROOT, ServoHardwareSession
 from controller.servo_mapping import (
@@ -52,20 +56,33 @@ from controller.servo_mapping import (
     SERVO_NAMES_BY_ID,
     TENDONS,
 )
+from observation.camera.camera_utils import (
+    apply_camera_settings,
+    resolve_backend,
+    setup_undistortion_from_config,
+    undistort_frame,
+)
 from observation.camera.camera_param_resolver import resolve_param_path
 from observation.vision.realtime_joint_angle_source import (
     JOINTS,
     RealtimeJointAngleSource,
 )
 from utils.path_utils import resolve_path
+from utils.config_loader import load_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = PROJECT_ROOT / "src"
 CONTROLLER_ROOT = SRC_ROOT / "controller"
-DEFAULT_CSV_DIRECTORY = PROJECT_ROOT / "logs" / "dual_camera" / "excursion_predictions"
+DEFAULT_CSV_DIRECTORY = (
+    PROJECT_ROOT
+    / "logs"
+    / "dual_camera_motionBenchmark"
+    / "excursion_predictions"
+    / "csv_player"
+)
 DEFAULT_OUTPUT_DIRECTORY = PROJECT_ROOT / "logs" / "csv_player_gui"
-DEFAULT_CALIBRATION_PATH = CONTROLLER_ROOT / "excursion_servo_calibration.json"
+DEFAULT_ENCODER_CALIBRATION_PATH = CONTROLLER_ROOT / "excursion_encoder_calibration.json"
 DEFAULT_FORCE_CONFIG_PATH = CONTROLLER_ROOT / "config_force_control.json"
 DEFAULT_DLC_CONFIG_PATH = SRC_ROOT / "observation" / "vision" / "config_deeplabcut_angle_control.json"
 DEFAULT_CAMERA_CONFIG_PATH = resolve_param_path("camera_config_dlc.json")
@@ -114,14 +131,16 @@ class VisionWorker:
         emit: Callable[[dict[str, Any]], None],
         stop_event: threading.Event,
         output_csv: Path,
-        run_started_at: float,
+        playback_started_at: list[float | None],
+        run_id: str = "",
         interval_s: float = 1.0 / DEFAULT_VISION_HZ,
     ) -> None:
         self.source = source
         self.emit = emit
         self.stop_event = stop_event
         self.output_csv = output_csv
-        self.run_started_at = run_started_at
+        self.playback_started_at = playback_started_at
+        self.run_id = str(run_id)
         self.interval_s = max(0.02, float(interval_s))
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -130,56 +149,76 @@ class VisionWorker:
     def run(self) -> None:
         frame_index = 0
         try:
-            with self.output_csv.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(
-                    [
-                        "frame_idx",
-                        "elapsed_s",
-                        "captured_at_monotonic",
-                        "inference_ms",
-                        "min_likelihood",
-                        "valid",
-                        "held_last",
-                        "reason",
-                        *[f"{joint}_deg" for joint in JOINTS],
-                    ]
-                )
+            with ExitStack() as stack:
+                handle = None
+                writer = None
+                playback_started = False
                 while not self.stop_event.is_set():
                     started_at = time.monotonic()
+                    run_started_at = self.playback_started_at[0]
+                    if run_started_at is not None and not playback_started:
+                        self.source.reset_temporal_history()
+                        playback_started = True
                     measurement = self.source.read(frame_index)
-                    angles_deg = tuple(
-                        math.degrees(value)
-                        for value in measurement.flexion_angles_rad
-                    )
-                    writer.writerow(
-                        [
-                            measurement.frame_index,
-                            f"{measurement.captured_at - self.run_started_at:.6f}",
-                            f"{measurement.captured_at:.6f}",
-                            f"{measurement.inference_ms:.6f}",
-                            f"{measurement.min_likelihood:.6f}",
-                            int(measurement.valid),
-                            int(measurement.held_last),
-                            measurement.reason or "",
-                            *[f"{value:.6f}" for value in angles_deg],
-                        ]
-                    )
-                    handle.flush()
-                    self._emit(
-                        {
-                            "kind": "angle",
-                            "frame_idx": measurement.frame_index,
-                            "captured_at": measurement.captured_at,
-                            "elapsed_s": measurement.captured_at - self.run_started_at,
-                            "angles_deg": angles_deg,
-                            "valid": measurement.valid,
-                            "held_last": measurement.held_last,
-                            "min_likelihood": measurement.min_likelihood,
-                            "inference_ms": measurement.inference_ms,
-                            "reason": measurement.reason,
-                        }
-                    )
+                    if (
+                        run_started_at is not None
+                        and measurement.captured_at >= run_started_at
+                    ):
+                        if writer is None:
+                            handle = stack.enter_context(
+                                self.output_csv.open("w", encoding="utf-8", newline="")
+                            )
+                            writer = csv.writer(handle)
+                            writer.writerow(
+                                [
+                                    "run_id",
+                                    "frame_idx",
+                                    "elapsed_s",
+                                    "captured_at_monotonic",
+                                    "inference_finished_at_monotonic",
+                                    "inference_ms",
+                                    "min_likelihood",
+                                    "valid",
+                                    "held_last",
+                                    "reason",
+                                    *[f"{joint}_deg" for joint in JOINTS],
+                                ]
+                            )
+                        angles_deg = tuple(
+                            math.degrees(value)
+                            for value in measurement.flexion_angles_rad
+                        )
+                        elapsed_s = measurement.captured_at - run_started_at
+                        writer.writerow(
+                            [
+                                self.run_id,
+                                measurement.frame_index,
+                                f"{elapsed_s:.6f}",
+                                f"{measurement.captured_at:.6f}",
+                                f"{measurement.inference_finished_at:.6f}",
+                                f"{measurement.inference_ms:.6f}",
+                                f"{measurement.min_likelihood:.6f}",
+                                int(measurement.valid),
+                                int(measurement.held_last),
+                                measurement.reason or "",
+                                *[f"{value:.6f}" for value in angles_deg],
+                            ]
+                        )
+                        handle.flush()
+                        self._emit(
+                            {
+                                "kind": "angle",
+                                "frame_idx": measurement.frame_index,
+                                "captured_at": measurement.captured_at,
+                                "elapsed_s": elapsed_s,
+                                "angles_deg": angles_deg,
+                                "valid": measurement.valid,
+                                "held_last": measurement.held_last,
+                                "min_likelihood": measurement.min_likelihood,
+                                "inference_ms": measurement.inference_ms,
+                                "reason": measurement.reason,
+                            }
+                        )
                     frame_index += 1
                     self.stop_event.wait(
                         max(0.0, self.interval_s - (time.monotonic() - started_at))
@@ -193,6 +232,144 @@ class VisionWorker:
                 }
             )
             self.stop_event.set()
+
+
+class DLCMeasurementWorker:
+    """Measure joint angles from the camera without connecting servos."""
+
+    def __init__(
+        self,
+        source: RealtimeJointAngleSource,
+        emit: Callable[[dict[str, Any]], None],
+        *,
+        interval_s: float = 1.0 / DEFAULT_VISION_HZ,
+    ) -> None:
+        self.source = source
+        self.emit = emit
+        self.interval_s = max(0.02, float(interval_s))
+        self.stop_event = threading.Event()
+        self.finished_event = threading.Event()
+        self.error: str | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name="csv-player-dlc-measurement",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self, timeout_s: float = 2.0) -> bool:
+        self.stop_event.set()
+        self.thread.join(timeout=max(0.0, timeout_s))
+        return not self.thread.is_alive()
+
+    def _run(self) -> None:
+        frame_index = 0
+        started_at = time.monotonic()
+        try:
+            self.source.open()
+            self.emit({"kind": "dlc_ready", "worker": self})
+            while not self.stop_event.is_set():
+                loop_started_at = time.monotonic()
+                measurement = self.source.read(frame_index)
+                self.emit(
+                    {
+                        "kind": "angle",
+                        "frame_idx": measurement.frame_index,
+                        "captured_at": measurement.captured_at,
+                        "elapsed_s": measurement.captured_at - started_at,
+                        "angles_deg": tuple(
+                            math.degrees(value)
+                            for value in measurement.flexion_angles_rad
+                        ),
+                        "valid": measurement.valid,
+                        "held_last": measurement.held_last,
+                        "min_likelihood": measurement.min_likelihood,
+                        "inference_ms": measurement.inference_ms,
+                        "reason": measurement.reason,
+                    }
+                )
+                frame_index += 1
+                self.stop_event.wait(
+                    max(0.0, self.interval_s - (time.monotonic() - loop_started_at))
+                )
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.emit({"kind": "dlc_error", "worker": self, "error": self.error})
+        finally:
+            try:
+                self.source.close()
+            finally:
+                self.finished_event.set()
+                self.emit({"kind": "dlc_stopped", "worker": self})
+
+
+class CameraPreviewWorker:
+    """Capture raw camera frames for preview without initializing DLC or servos."""
+
+    def __init__(self, camera_config_path: Path) -> None:
+        self.camera_config_path = Path(camera_config_path).expanduser()
+        self.stop_event = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Any | None = None
+        self._frame_index = -1
+        self.error: str | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name="csv-player-camera-preview",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self, timeout_s: float = 2.0) -> bool:
+        self.stop_event.set()
+        self.thread.join(timeout=max(0.0, timeout_s))
+        return not self.thread.is_alive()
+
+    @property
+    def latest_preview(self) -> tuple[int, bool, Any] | None:
+        with self._frame_lock:
+            if self._latest_frame is None:
+                return None
+            return self._frame_index, False, self._latest_frame.copy()
+
+    def _run(self) -> None:
+        capture: cv2.VideoCapture | None = None
+        try:
+            camera_config = load_config(self.camera_config_path)
+            camera_index = int(camera_config.get("index", 0))
+            backend = resolve_backend(camera_config.get("backend"))
+            capture = (
+                cv2.VideoCapture(camera_index, backend)
+                if backend is not None
+                else cv2.VideoCapture(camera_index)
+            )
+            if not capture.isOpened():
+                raise RuntimeError(f"Camera not available: index={camera_index}")
+            apply_camera_settings(capture, camera_config)
+            calibration = setup_undistortion_from_config(
+                camera_config,
+                log_prefix="[csv-player-preview]",
+            )
+            frame_index = 0
+            while not self.stop_event.is_set():
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    raise RuntimeError("Failed to read a frame from the camera")
+                frame = undistort_frame(frame, calibration)
+                with self._frame_lock:
+                    self._latest_frame = frame.copy()
+                    self._frame_index = frame_index
+                frame_index += 1
+                self.stop_event.wait(0.01)
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if capture is not None:
+                capture.release()
 
 
 class CsvPlayerApp(tk.Tk):
@@ -228,6 +405,8 @@ class CsvPlayerApp(tk.Tk):
         self._resource_lock = threading.Lock()
         self._hardware: ServoHardwareSession | None = None
         self._angle_source: RealtimeJointAngleSource | None = None
+        self._camera_preview_worker: CameraPreviewWorker | None = None
+        self._standalone_dlc_worker: DLCMeasurementWorker | None = None
         self._session_dir: Path | None = None
         self._closing_requested = False
         self._start_in_progress = False
@@ -237,7 +416,7 @@ class CsvPlayerApp(tk.Tk):
         self._input_widgets: list[Any] = []
         self._csv_widgets: list[Any] = []
         self._pending_playback_config: tuple[
-            Path, ExcursionTrajectory, dict[str, float]
+            Path, ExcursionTrajectory, dict[str, float], EncoderExcursionCalibration
         ] | None = None
         self._active_duration_s: float | None = None
         self._last_angle_frame = -1
@@ -250,10 +429,13 @@ class CsvPlayerApp(tk.Tk):
         self._force_last_full_draw_at = 0.0
         self._angle_last_full_draw_at = 0.0
         self._last_preview_frame = -1
+        self._last_preview_is_overlay: bool | None = None
         self._last_preview_size = (0, 0)
         self._poll_after_id: str | None = None
         self._plot_resize_after_id: str | None = None
         self._photo = None
+        self._preview_enabled = False
+        self._dlc_enabled = False
         self._selected_csv_path: Path | None = None
         self._selected_csv_valid = False
         self._settings_expanded = False
@@ -513,7 +695,23 @@ class CsvPlayerApp(tk.Tk):
         monitor.add(force_frame, weight=4)
         monitor.add(angle_frame, weight=3)
         preview_frame.columnconfigure(0, weight=1)
-        preview_frame.rowconfigure(0, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
+        preview_controls = ttk.Frame(preview_frame)
+        preview_controls.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        self.preview_toggle_button = ttk.Button(
+            preview_controls,
+            text="プレビューON",
+            command=self._toggle_preview,
+            style="Small.TButton",
+        )
+        self.preview_toggle_button.pack(side="right")
+        self.dlc_toggle_button = ttk.Button(
+            preview_controls,
+            text="DLC ON",
+            command=self._toggle_dlc,
+            style="Small.TButton",
+        )
+        self.dlc_toggle_button.pack(side="right", padx=(0, 6))
         self.preview_label = tk.Label(
             preview_frame,
             text="カメラ未接続",
@@ -522,7 +720,7 @@ class CsvPlayerApp(tk.Tk):
             fg="#475569",
             font=("Yu Gothic UI", 12),
         )
-        self.preview_label.grid(row=0, column=0, sticky="nsew")
+        self.preview_label.grid(row=1, column=0, sticky="nsew")
         self._build_force_plot(force_frame)
         self._build_angle_plot(angle_frame)
 
@@ -778,12 +976,11 @@ class CsvPlayerApp(tk.Tk):
         path = self.csv_paths[selection[0]]
         try:
             limits = self._parse_limits()
-            trajectory = ExcursionTrajectory.from_csv(
-                path, self._load_position_calibration()
-            )
+            calibration = self._load_encoder_calibration()
+            trajectory = ExcursionTrajectory.from_csv(path)
             required_files = (
                 ("CSV", path),
-                ("位置キャリブレーション", DEFAULT_CALIBRATION_PATH),
+                ("encoder位置キャリブレーション", DEFAULT_ENCODER_CALIBRATION_PATH),
                 ("DLC設定", Path(self.dlc_config_var.get()).expanduser()),
                 ("カメラ設定", Path(self.camera_config_var.get()).expanduser()),
             )
@@ -807,6 +1004,7 @@ class CsvPlayerApp(tk.Tk):
             f"ファイル: {path.name}\n"
             f"行数: {len(trajectory.elapsed_times_s)}\n"
             f"再生時間: {trajectory.duration_s:.3f} s\n"
+            f"encoder換算: {calibration.calibration_status}\n"
             f"Force上限: {', '.join(f'{tendon}={limits[tendon]:g} N' for tendon in TENDONS)}\n"
             "状態: 事前確認OK（camera / serial接続は未確認）"
         )
@@ -873,12 +1071,18 @@ class CsvPlayerApp(tk.Tk):
         self.selected_var.set(f"CSV: {path.name}")
         self.selected_path_button.configure(state="normal")
         try:
-            calibration = self._load_position_calibration()
-            trajectory = ExcursionTrajectory.from_csv(path, calibration)
+            calibration = self._load_encoder_calibration()
+            trajectory = ExcursionTrajectory.from_csv(path)
+            scale_note = (
+                "公称値（張力下で要校正）"
+                if calibration.calibration_status.lower() == "nominal"
+                else "tendon別校正値"
+            )
             self.detail_var.set(
                 f"ファイル: {path.name}\n"
                 f"行数: {len(trajectory.elapsed_times_s)}\n"
                 f"再生時間: {trajectory.duration_s:.3f} s\n"
+                f"encoder換算: {scale_note}\n"
                 f"状態: 実行可能"
             )
             self.connect_button.configure(
@@ -900,10 +1104,9 @@ class CsvPlayerApp(tk.Tk):
             )
             self.start_button.configure(state="disabled")
 
-    def _load_position_calibration(self) -> tuple[float, ...]:
-        from controller.csv_player.excursion_player import load_position_calibration
-
-        return load_position_calibration(DEFAULT_CALIBRATION_PATH)
+    @staticmethod
+    def _load_encoder_calibration() -> EncoderExcursionCalibration:
+        return load_encoder_excursion_calibration(DEFAULT_ENCODER_CALIBRATION_PATH)
 
     def _parse_limits(self) -> dict[str, float]:
         limits: dict[str, float] = {}
@@ -944,20 +1147,24 @@ class CsvPlayerApp(tk.Tk):
         path = self.csv_paths[selection[0]]
         try:
             limits = self._parse_limits()
-            trajectory = ExcursionTrajectory.from_csv(
-                path, self._load_position_calibration()
-            )
+            calibration = self._load_encoder_calibration()
+            trajectory = ExcursionTrajectory.from_csv(path)
         except Exception as exc:
             messagebox.showerror("再生設定エラー", str(exc))
             return
+        calibration_warning = (
+            "\nencoder換算は半径20 mmからの公称値です。張力下の換算係数と引く方向の符号を確認してください。"
+            if calibration.calibration_status.lower() == "nominal"
+            else ""
+        )
         if not messagebox.askyesno(
             "再生開始",
             f"{path.name}\n再生時間: {trajectory.duration_s:.3f} s\n"
-            "接続済みです。CSV再生を開始しますか？",
+            f"接続済みです。CSV再生を開始しますか？{calibration_warning}",
         ):
             return
         with self._resource_lock:
-            self._pending_playback_config = (path, trajectory, limits)
+            self._pending_playback_config = (path, trajectory, limits, calibration)
         self._playback_started = True
         self._active_duration_s = trajectory.duration_s
         self.progress_bar.configure(value=0.0)
@@ -983,6 +1190,24 @@ class CsvPlayerApp(tk.Tk):
             self.connect_button.configure(state="normal")
             return
 
+        if not self._stop_dlc_measurement_worker():
+            self._start_in_progress = False
+            self.connect_button.configure(state="normal")
+            messagebox.showwarning(
+                "DLC停止待ち",
+                "DLC計測中のカメラを解放できませんでした。少し待ってから再度Connectを押してください。",
+            )
+            return
+
+        if not self._stop_camera_preview_worker():
+            self._start_in_progress = False
+            self.connect_button.configure(state="normal")
+            messagebox.showwarning(
+                "カメラ切替待ち",
+                "プレビュー用カメラを解放できませんでした。少し待ってから再度Connectを押してください。",
+            )
+            return
+
         # Tk variables belong to the main thread.  Snapshot all run settings
         # before starting the worker instead of reading widgets from it.
         dlc_config_path = Path(self.dlc_config_var.get())
@@ -996,6 +1221,8 @@ class CsvPlayerApp(tk.Tk):
             messagebox.showerror("セッション作成エラー", str(exc))
             self._start_in_progress = False
             self.connect_button.configure(state="normal")
+            if self._preview_enabled:
+                self._start_camera_preview_worker()
             return
         self._session_dir = session_dir
         stop_event = threading.Event()
@@ -1016,6 +1243,7 @@ class CsvPlayerApp(tk.Tk):
         self._set_widgets_enabled(self._csv_widgets, True)
         self._last_angle_frame = -1
         self._last_preview_frame = -1
+        self._last_preview_is_overlay = None
         self._min_likelihood_seen = 1.0
         self._latest_events.clear()
         for history in self.force_history.values():
@@ -1033,6 +1261,7 @@ class CsvPlayerApp(tk.Tk):
         self._set_status_badge("servo", "接続待ち", "busy")
         self._set_status_badge("encoder", "接続待ち", "busy")
         self.connect_button.configure(state="disabled")
+        self.dlc_toggle_button.configure(state="disabled", text="DLC（session）")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.force_quit_button.configure(state="normal")
@@ -1067,6 +1296,7 @@ class CsvPlayerApp(tk.Tk):
             self._playback_started = False
             self._start_in_progress = False
             self._set_input_widgets_enabled(True)
+            self.dlc_toggle_button.configure(state="normal", text="DLC ON")
             self.stop_button.configure(state="disabled")
             self.force_quit_button.configure(state="disabled")
             messagebox.showerror("実行開始エラー", str(exc))
@@ -1089,9 +1319,10 @@ class CsvPlayerApp(tk.Tk):
     ) -> None:
         hardware: ServoHardwareSession | None = None
         source: RealtimeJointAngleSource | None = None
-        trace: ControlTraceWriter | None = None
+        playback_service: EncoderPlaybackService | None = None
         vision_worker: VisionWorker | None = None
         vision_thread: threading.Thread | None = None
+        playback_started_at: list[float | None] = [None]
         run_started_at: float | None = None
         completed = False
         termination_reason = "error"
@@ -1109,6 +1340,22 @@ class CsvPlayerApp(tk.Tk):
             source.open()
             with self._resource_lock:
                 self._angle_source = source
+            if stop_event.is_set():
+                raise PlaybackStopped("Playback was stopped during camera setup")
+            vision_worker = VisionWorker(
+                source,
+                self._emit,
+                stop_event,
+                session_dir / "angle_trace.csv",
+                playback_started_at,
+                run_id=session_dir.name,
+            )
+            vision_thread = threading.Thread(
+                target=vision_worker.run,
+                name="csv-player-gui-dlc",
+                daemon=True,
+            )
+            vision_thread.start()
             if stop_event.is_set():
                 raise PlaybackStopped("Playback was stopped during camera setup")
             self._emit({"kind": "status", "text": "サーボとエンコーダを接続中", "phase": "接続"})
@@ -1134,7 +1381,6 @@ class CsvPlayerApp(tk.Tk):
             feedback = hardware.wait_for_feedback(3.0, require_encoder=True)
             if stop_event.is_set():
                 raise PlaybackStopped("Playback was stopped while waiting for telemetry")
-            start_positions = hardware.position_by_servo_id(feedback)
             self._emit(
                 {
                     "kind": "connected",
@@ -1151,63 +1397,38 @@ class CsvPlayerApp(tk.Tk):
                 playback_config = self._pending_playback_config
             if playback_config is None:
                 raise RuntimeError("Playback configuration was not selected")
-            csv_path, trajectory, limits = playback_config
-            trace = ControlTraceWriter(session_dir / "control_trace.csv", SERVO_IDS_BY_TENDON)
-            force_estimator = CalibratedForceEstimator(
-                calibration_dir=DEFAULT_FORCE_CALIBRATION_DIR,
+            csv_path, trajectory, limits, calibration = playback_config
+            playback_config = build_encoder_playback_config(
+                calibration,
+                control_hz=DEFAULT_CONTROL_HZ,
+                telemetry_stale_s=0.2,
+                telemetry_wait_s=3.0,
+                display_interval_s=0.25,
+                return_to_start=True,
+                return_timeout_s=5.0,
+                return_stable_frames=3,
+                hard_force_limits_n_by_tendon=limits,
+            )
+            playback_service = EncoderPlaybackService(
+                trajectory=trajectory,
+                calibration=calibration,
+                trace_path=session_dir / "control_trace.csv",
+                run_id=session_dir.name,
+                force_calibration_dir=DEFAULT_FORCE_CALIBRATION_DIR,
                 zero_offset_path=DEFAULT_ZERO_OFFSET_PATH,
-                servo_ids=SERVO_IDS_BY_TENDON,
-                tendon_by_servo_id=dict(zip(SERVO_IDS_BY_TENDON, TENDONS)),
-                telemetry_stale_after_s=0.2,
+                config=playback_config,
+                record_force=True,
+                on_sample=lambda sample: self._emit({"kind": "force", "sample": sample}),
+                stop_event=stop_event,
             )
 
             run_started_at = time.monotonic()
             video_path = session_dir / "dlc_overlay.mp4"
             source.start_overlay_recording(video_path, fps=DEFAULT_VISION_HZ, codec="mp4v", queue_size=10)
-            vision_worker = VisionWorker(
-                source,
-                self._emit,
-                stop_event,
-                session_dir / "angle_trace.csv",
-                run_started_at,
-            )
-            vision_thread = threading.Thread(
-                target=vision_worker.run,
-                name="csv-player-gui-dlc",
-                daemon=True,
-            )
-            vision_thread.start()
+            playback_started_at[0] = run_started_at
             self._emit({"kind": "status", "text": "実行中", "phase": "実行中"})
 
-            runner = SpeedTrajectoryRunner(
-                trajectory=trajectory,
-                servo_ids_by_tendon=SERVO_IDS_BY_TENDON,
-                hardware=hardware,
-                speed_controller=SpeedController(
-                    SpeedControlConfig(
-                        kp=0.5,
-                        max_speed=500,
-                        max_acceleration=3000.0,
-                        position_deadband=3.0,
-                    )
-                ),
-                config=PlaybackConfig(
-                    control_hz=DEFAULT_CONTROL_HZ,
-                    telemetry_stale_s=0.2,
-                    telemetry_wait_s=3.0,
-                    display_interval_s=0.25,
-                    return_to_start=True,
-                    return_tolerance=10.0,
-                    return_timeout_s=5.0,
-                    return_stable_frames=3,
-                    hard_force_limits_n_by_tendon=limits,
-                ),
-                recorder=trace,
-                force_estimator=force_estimator,
-                on_sample=lambda sample: self._emit({"kind": "force", "sample": sample}),
-                stop_event=stop_event,
-            )
-            runner.run(start_positions)
+            playback_service.run(hardware)
             completed = True
             termination_reason = "completed"
             self._emit({"kind": "status", "text": "完了", "phase": "完了"})
@@ -1278,11 +1499,13 @@ class CsvPlayerApp(tk.Tk):
                     source.close()
                 except Exception as exc:
                     cleanup_errors.append(f"camera close: {type(exc).__name__}: {exc}")
-            if trace is not None:
+            if playback_service is not None:
                 try:
-                    trace.close()
+                    playback_service.close()
                 except Exception as exc:
-                    cleanup_errors.append(f"trace close: {type(exc).__name__}: {exc}")
+                    cleanup_errors.append(
+                        f"playback service close: {type(exc).__name__}: {exc}"
+                    )
             if hardware is not None:
                 try:
                     hardware.close()
@@ -1305,6 +1528,8 @@ class CsvPlayerApp(tk.Tk):
                     }
                 )
             manifest = {
+                "run_id": session_dir.name,
+                "timestamp_timebase": "time.monotonic seconds; shared by control and vision logs within this run",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "input_csv_path": (
                     str(csv_path.resolve()) if csv_path is not None else None
@@ -1448,6 +1673,16 @@ class CsvPlayerApp(tk.Tk):
                     self._set_status_badge("camera", "接続済み", "ok")
                     self._set_status_badge("dlc", "準備完了", "ok")
                     self._set_status_badge("experiment", "接続完了", "ok")
+                    if not self._preview_enabled:
+                        self.preview_label.configure(image="", text="プレビューOFF")
+                        self._photo = None
+                    else:
+                        with self._resource_lock:
+                            source = self._angle_source
+                        if source is None or source.latest_overlay is None:
+                            self.preview_label.configure(
+                                image="", text="カメラ映像を取得中"
+                            )
                     self.connect_button.configure(state="disabled")
                     self.start_button.configure(
                         state="normal"
@@ -1458,6 +1693,33 @@ class CsvPlayerApp(tk.Tk):
                     self._consume_force_sample(event["sample"])
                 elif kind == "angle":
                     self._consume_angle_sample(event)
+                elif kind == "dlc_ready":
+                    if event.get("worker") is self._standalone_dlc_worker:
+                        self.status_var.set("DLC角度測定中（サーボ未接続）")
+                        self.phase_var.set("DLC測定")
+                        self._set_status_badge("camera", "接続済み", "ok")
+                        self._set_status_badge("dlc", "測定中", "ok")
+                elif kind == "dlc_error":
+                    if event.get("worker") is self._standalone_dlc_worker:
+                        self.status_var.set(f"DLC計測エラー: {event.get('error')}")
+                        self._set_status_badge("camera", "エラー", "error")
+                        self._set_status_badge("dlc", "エラー", "error")
+                elif kind == "dlc_stopped":
+                    worker = event.get("worker")
+                    if worker is self._standalone_dlc_worker:
+                        with self._resource_lock:
+                            self._standalone_dlc_worker = None
+                        self._dlc_enabled = False
+                        self.dlc_toggle_button.configure(
+                            state="disabled" if self._running else "normal",
+                            text="DLC（session）" if self._running else "DLC ON",
+                        )
+                        if worker.error is None and not self._running:
+                            self._set_status_badge("dlc", "未接続", "idle")
+                            if not self._preview_enabled:
+                                self._set_status_badge("camera", "未接続", "idle")
+                        if self._preview_enabled and not self._running:
+                            self._start_camera_preview_worker()
                 elif kind == "worker_error":
                     self.status_var.set(f"エラー: {event.get('source')}: {event.get('error')}")
                     self.phase_var.set("異常終了")
@@ -1555,20 +1817,44 @@ class CsvPlayerApp(tk.Tk):
         )
 
     def _update_preview(self) -> None:
+        if not self._preview_enabled:
+            return
         with self._resource_lock:
             source = self._angle_source
-        if source is None or Image is None or ImageTk is None:
+            camera_preview_worker = self._camera_preview_worker
+            standalone_dlc_worker = self._standalone_dlc_worker
+        if Image is None or ImageTk is None:
             return
-        measurement = source.latest_measurement
-        frame = source.latest_overlay
-        if frame is None:
+        standalone_source = (
+            standalone_dlc_worker.source
+            if standalone_dlc_worker is not None
+            and not standalone_dlc_worker.finished_event.is_set()
+            else None
+        )
+        preview = (
+            source.latest_preview
+            if source is not None
+            else standalone_source.latest_preview
+            if standalone_source is not None
+            else camera_preview_worker.latest_preview
+            if camera_preview_worker is not None
+            else None
+        )
+        if preview is None:
+            if camera_preview_worker is not None and camera_preview_worker.error:
+                self.preview_label.configure(
+                    image="",
+                    text=f"カメラ接続エラー\n{camera_preview_worker.error}",
+                )
+                self._set_status_badge("camera", "エラー", "error")
             return
+        frame_index, is_overlay, frame = preview
         available_width = max(160, self.preview_label.winfo_width() - 12)
         available_height = max(120, self.preview_label.winfo_height() - 12)
         preview_size = (available_width, available_height)
         if (
-            measurement is not None
-            and measurement.frame_index == self._last_preview_frame
+            frame_index == self._last_preview_frame
+            and is_overlay == self._last_preview_is_overlay
             and preview_size == self._last_preview_size
         ):
             return
@@ -1587,11 +1873,164 @@ class CsvPlayerApp(tk.Tk):
             self._photo = ImageTk.PhotoImage(image=image)
             self.preview_label.configure(image=self._photo, text="")
             self._last_preview_size = preview_size
-            if measurement is not None:
-                self._last_preview_frame = measurement.frame_index
+            self._last_preview_frame = frame_index
+            self._last_preview_is_overlay = is_overlay
+            if source is None and standalone_source is None:
+                self._set_status_badge("camera", "プレビュー中", "ok")
         except Exception as exc:
             self.status_var.set(f"Preview更新エラー: {type(exc).__name__}: {exc}")
             self.preview_label.configure(image="", text="カメラ表示エラー")
+
+    def _start_camera_preview_worker(self) -> None:
+        with self._resource_lock:
+            if self._angle_source is not None or self._running:
+                return
+            standalone_dlc_worker = self._standalone_dlc_worker
+            if (
+                standalone_dlc_worker is not None
+                and not standalone_dlc_worker.finished_event.is_set()
+            ):
+                return
+            current_worker = self._camera_preview_worker
+            if current_worker is not None and current_worker.thread.is_alive():
+                return
+            worker = CameraPreviewWorker(Path(self.camera_config_var.get()))
+            self._camera_preview_worker = worker
+        worker.start()
+
+    def _stop_camera_preview_worker(self, timeout_s: float = 2.0) -> bool:
+        with self._resource_lock:
+            worker = self._camera_preview_worker
+        if worker is None:
+            return True
+        if not worker.stop(timeout_s):
+            return False
+        with self._resource_lock:
+            if self._camera_preview_worker is worker:
+                self._camera_preview_worker = None
+        return True
+
+    def _start_dlc_measurement_worker(self) -> bool:
+        if self._running or self._angle_source is not None:
+            return False
+        if not self._stop_camera_preview_worker():
+            messagebox.showwarning(
+                "カメラ切替待ち",
+                "プレビュー用カメラを解放できませんでした。少し待ってからDLC ONを押してください。",
+            )
+            return False
+        with self._resource_lock:
+            current_worker = self._standalone_dlc_worker
+            if current_worker is not None and not current_worker.finished_event.is_set():
+                return False
+            source = RealtimeJointAngleSource(
+                dlc_config_path=Path(self.dlc_config_var.get()),
+                camera_config_path=Path(self.camera_config_var.get()),
+                min_likelihood=0.3,
+                temporal_outlier_enabled=True,
+                temporal_jump_threshold_deg=30.0,
+                temporal_max_hold_frames=5,
+            )
+            worker = DLCMeasurementWorker(source, self._emit)
+            self._standalone_dlc_worker = worker
+        self._last_angle_frame = -1
+        self._min_likelihood_seen = 1.0
+        for history in self.angle_history.values():
+            history.clear()
+        self._angle_plot_dirty = True
+        self._last_preview_frame = -1
+        self._last_preview_is_overlay = None
+        self._last_preview_size = (0, 0)
+        self._set_status_badge("camera", "接続中", "busy")
+        self._set_status_badge("dlc", "準備中", "busy")
+        if self._preview_enabled:
+            self.preview_label.configure(image="", text="DLC計測を開始しています")
+            self._photo = None
+        try:
+            worker.start()
+        except Exception as exc:
+            with self._resource_lock:
+                if self._standalone_dlc_worker is worker:
+                    self._standalone_dlc_worker = None
+            self._set_status_badge("camera", "エラー", "error")
+            self._set_status_badge("dlc", "エラー", "error")
+            messagebox.showerror("DLC起動エラー", f"{type(exc).__name__}: {exc}")
+            return False
+        return True
+
+    def _stop_dlc_measurement_worker(self, timeout_s: float = 2.0) -> bool:
+        with self._resource_lock:
+            worker = self._standalone_dlc_worker
+        if worker is None:
+            self._dlc_enabled = False
+            return True
+        if not worker.stop(timeout_s):
+            return False
+        self._dlc_enabled = False
+        return True
+
+    def _toggle_dlc(self) -> None:
+        if self._running:
+            return
+        if self._dlc_enabled:
+            self._dlc_enabled = False
+            self.dlc_toggle_button.configure(text="DLC停止中", state="disabled")
+            if not self._stop_dlc_measurement_worker():
+                self.status_var.set("DLC停止待ち: 推論処理の終了を待っています")
+            return
+        if self._start_dlc_measurement_worker():
+            self._dlc_enabled = True
+            self.dlc_toggle_button.configure(text="DLC OFF", state="normal")
+
+    def _toggle_preview(self) -> None:
+        self._preview_enabled = not self._preview_enabled
+        self._last_preview_frame = -1
+        self._last_preview_is_overlay = None
+        self._last_preview_size = (0, 0)
+        if self._preview_enabled:
+            self.preview_toggle_button.configure(text="プレビューOFF")
+            with self._resource_lock:
+                source = self._angle_source
+                camera_preview_worker = self._camera_preview_worker
+                standalone_dlc_worker = self._standalone_dlc_worker
+            if (
+                source is None
+                and camera_preview_worker is None
+                and standalone_dlc_worker is None
+                and not self._running
+            ):
+                self._start_camera_preview_worker()
+                with self._resource_lock:
+                    camera_preview_worker = self._camera_preview_worker
+            self.preview_label.configure(
+                image="",
+                text=(
+                    "カメラ映像を待機中"
+                    if (
+                        source is not None
+                        or camera_preview_worker is not None
+                        or standalone_dlc_worker is not None
+                        or self._running
+                    )
+                    else "カメラを開いています"
+                ),
+            )
+            self._photo = None
+            self._update_preview()
+        else:
+            self.preview_toggle_button.configure(text="プレビューON")
+            self.preview_label.configure(image="", text="プレビューOFF")
+            self._photo = None
+            with self._resource_lock:
+                source = self._angle_source
+                standalone_dlc_worker = self._standalone_dlc_worker
+            if (
+                source is None
+                and standalone_dlc_worker is None
+                and not self._running
+            ):
+                self._stop_camera_preview_worker()
+                self._set_status_badge("camera", "未接続", "idle")
 
     def _mark_force_plot_dirty(self, *_args) -> None:
         self._force_plot_dirty = True
@@ -1760,10 +2199,17 @@ class CsvPlayerApp(tk.Tk):
         self._set_status_badge("encoder", "未接続", "idle")
         self._set_status_badge("camera", "未接続", "idle")
         self._set_status_badge("dlc", "未接続", "idle")
-        self.preview_label.configure(image="", text="カメラ未接続")
+        self.dlc_toggle_button.configure(state="normal", text="DLC ON")
+        self.preview_label.configure(
+            image="",
+            text="カメラ映像を待機中" if self._preview_enabled else "カメラ未接続",
+        )
         self._photo = None
         self._last_preview_frame = -1
+        self._last_preview_is_overlay = None
         self._last_preview_size = (0, 0)
+        if self._preview_enabled:
+            self._start_camera_preview_worker()
         status = str(event.get("status", "error"))
         session_dir = Path(str(event["session_dir"]))
         self._session_dir = session_dir
@@ -1842,6 +2288,8 @@ class CsvPlayerApp(tk.Tk):
             self.after_idle(self._destroy_after_cleanup)
 
     def _destroy_after_cleanup(self) -> None:
+        self._stop_dlc_measurement_worker()
+        self._stop_camera_preview_worker()
         if self._poll_after_id is not None:
             try:
                 self.after_cancel(self._poll_after_id)

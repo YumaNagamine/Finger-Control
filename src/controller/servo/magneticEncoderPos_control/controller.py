@@ -131,10 +131,18 @@ class MagneticEncoderPositionPIDController:
         self,
         feedback: MagneticEncoderPositionFeedback,
         *,
+        target_position_deg: Optional[float] = None,
         now: Optional[float] = None,
     ) -> MagneticEncoderPositionControlOutput:
         self._validate_feedback(feedback)
-        position_error = self.config.target_position_deg - feedback.position_deg
+        target = (
+            self.config.target_position_deg
+            if target_position_deg is None
+            else float(target_position_deg)
+        )
+        if not math.isfinite(target):
+            raise ValueError("Position target must be finite")
+        position_error = target - feedback.position_deg
         if abs(position_error) >= self.config.hard_position_error_deg:
             raise MagneticEncoderPositionSafetyError(
                 "Magnetic encoder position error reached the hard limit: "
@@ -142,7 +150,7 @@ class MagneticEncoderPositionPIDController:
             )
 
         raw_speed = self.config.control_sign * self.pid.update(
-            self.config.target_position_deg,
+            target,
             feedback.position_deg,
             now=now,
         )

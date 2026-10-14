@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "encoder_degrees_per_mm": {
+    "FDP": 2.8648,
+    "FDS": 2.8648,
+    "ED": 2.8648,
+    "DI": 2.8648,
+    "PI": 2.8648,
+    "LUM": 2.8648
+  },
+  "encoder_direction": {
+    "FDP": 1,
+    "FDS": 1,
+    "ED": 1,
+    "DI": 1,
+    "PI": 1,
+    "LUM": 1
+  },
+  "pid": {
+    "kp": 5.69,
+    "ki": 0.0,
+    "kd": 0.0,
+    "max_speed": 500,
+    "max_acceleration": 3000,
+    "hard_error_margin_deg": 10,
+    "minimum_hard_error_deg": 15,
+    "return_tolerance_deg": 1.0
+  },
+  "metadata": {
+    "encoder_counts_per_revolution": 16384,
+    "spool_radius_mm": 20,
+    "calculation": "360 degrees / (2 * pi * 20 mm) = approximately 2.8648 degrees/mm",
+    "calibration_status": "nominal",
+    "notes": "Replace encoder_degrees_per_mm per tendon with measurements under representative tendon tension. encoder_direction values are normalized so pulling increases position. Current direction values match the third-party torque calibration files and should be confirmed with a controlled pull."
+  }
+}

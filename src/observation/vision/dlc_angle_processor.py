@@ -51,6 +51,10 @@ class _DLCLivePredictor:
                     "Point dlc.model_path to a single .pt file instead."
                 )
 
+        # Initialize setuptools' distutils shim before dlclive imports
+        # torchvision/Triton, which may otherwise import setuptools too late.
+        import setuptools  # noqa: F401
+
         try:
             from dlclive import DLCLive
         except Exception as exc:  # pragma: no cover
@@ -144,11 +148,33 @@ class DLCAngleProcessor:
         self._confidence_threshold = float(processing_cfg.get("confidence_threshold", 0.6))
         self._ema_alpha = float(processing_cfg.get("ema_alpha", 0.4))
         self._hold_last_frames = max(0, int(processing_cfg.get("hold_last_frames", 4)))
+        reference_resolution = processing_cfg.get("adjustment_reference_resolution")
+        if reference_resolution is None:
+            self._adjustment_reference_resolution = None
+        else:
+            if not isinstance(reference_resolution, (list, tuple)) or len(reference_resolution) != 2:
+                raise ValueError(
+                    "processing.adjustment_reference_resolution must contain width and height."
+                )
+            parsed_resolution = tuple(float(value) for value in reference_resolution)
+            if not all(np.isfinite(value) and value > 0.0 for value in parsed_resolution):
+                raise ValueError(
+                    "processing.adjustment_reference_resolution values must be finite and positive."
+                )
+            self._adjustment_reference_resolution = parsed_resolution
+        self._frame_resolution: tuple[int, int] | None = None
         self._theta_rad = 0.45
         self._distance_shift = -20.0
         self._palm_horizontal_offset_px = 100.0
         self._joint_shifters = (15.0, 95.0)
         self._mcp_offset = (-110.0, 0.0)
+        self._base_adjustments = {
+            "theta_rad": self._theta_rad,
+            "distance_shift": self._distance_shift,
+            "palm_horizontal_offset_px": self._palm_horizontal_offset_px,
+            "joint_shifters": self._joint_shifters,
+            "mcp_offset": self._mcp_offset,
+        }
         self.update_adjustments(adjustments_cfg)
 
         self._show_keypoint_labels = bool(draw_cfg.get("show_keypoint_labels", True))
@@ -164,16 +190,21 @@ class DLCAngleProcessor:
 
     def update_adjustments(self, adjustments: Mapping[str, Any]) -> None:
         """Update geometry corrections without reloading the DLC predictor."""
-        theta_rad = float(adjustments.get("theta_rad", self._theta_rad))
-        distance_shift = float(adjustments.get("distance_shift", self._distance_shift))
-        palm_horizontal_offset_px = float(
-            adjustments.get("palm_horizontal_offset_px", self._palm_horizontal_offset_px)
+        theta_rad = float(adjustments.get("theta_rad", self._base_adjustments["theta_rad"]))
+        distance_shift = float(
+            adjustments.get("distance_shift", self._base_adjustments["distance_shift"])
         )
-        joint_shifters = adjustments.get("joint_shifters", self._joint_shifters)
+        palm_horizontal_offset_px = float(
+            adjustments.get(
+                "palm_horizontal_offset_px",
+                self._base_adjustments["palm_horizontal_offset_px"],
+            )
+        )
+        joint_shifters = adjustments.get("joint_shifters", self._base_adjustments["joint_shifters"])
         if not isinstance(joint_shifters, (list, tuple)) or len(joint_shifters) != 2:
             raise ValueError("processing.adjustments.joint_shifters must be a list with 2 numbers.")
         parsed_joint_shifters = (float(joint_shifters[0]), float(joint_shifters[1]))
-        mcp_offset = adjustments.get("mcp_offset", self._mcp_offset)
+        mcp_offset = adjustments.get("mcp_offset", self._base_adjustments["mcp_offset"])
         if not isinstance(mcp_offset, (list, tuple)) or len(mcp_offset) != 2:
             raise ValueError("processing.adjustments.mcp_offset must be a list with 2 numbers.")
         parsed_mcp_offset = (float(mcp_offset[0]), float(mcp_offset[1]))
@@ -190,21 +221,60 @@ class DLCAngleProcessor:
         if palm_horizontal_offset_px == 0.0:
             raise ValueError("processing.adjustments.palm_horizontal_offset_px must not be zero.")
 
-        self._theta_rad = theta_rad
-        self._distance_shift = distance_shift
-        self._palm_horizontal_offset_px = palm_horizontal_offset_px
-        self._joint_shifters = parsed_joint_shifters
-        self._mcp_offset = parsed_mcp_offset
+        self._base_adjustments = {
+            "theta_rad": theta_rad,
+            "distance_shift": distance_shift,
+            "palm_horizontal_offset_px": palm_horizontal_offset_px,
+            "joint_shifters": parsed_joint_shifters,
+            "mcp_offset": parsed_mcp_offset,
+        }
+        self._apply_resolution_adjustments()
 
     def get_adjustments(self) -> dict[str, float | list[float]]:
-        """Return a JSON-serializable snapshot of the active geometry corrections."""
+        """Return configured corrections in their reference coordinate space."""
+        adjustments = self._base_adjustments
         return {
-            "theta_rad": self._theta_rad,
-            "distance_shift": self._distance_shift,
-            "joint_shifters": list(self._joint_shifters),
-            "mcp_offset": list(self._mcp_offset),
-            "palm_horizontal_offset_px": self._palm_horizontal_offset_px,
+            "theta_rad": adjustments["theta_rad"],
+            "distance_shift": adjustments["distance_shift"],
+            "joint_shifters": list(adjustments["joint_shifters"]),
+            "mcp_offset": list(adjustments["mcp_offset"]),
+            "palm_horizontal_offset_px": adjustments["palm_horizontal_offset_px"],
         }
+
+    def _apply_resolution_adjustments(self) -> None:
+        scale_x = 1.0
+        scale_y = 1.0
+        if self._adjustment_reference_resolution is not None and self._frame_resolution is not None:
+            reference_width, reference_height = self._adjustment_reference_resolution
+            frame_width, frame_height = self._frame_resolution
+            scale_x = frame_width / reference_width
+            scale_y = frame_height / reference_height
+
+        scale_length = (scale_x + scale_y) / 2.0
+        base = self._base_adjustments
+        self._theta_rad = float(base["theta_rad"])
+        self._distance_shift = float(base["distance_shift"]) * scale_length
+        self._joint_shifters = tuple(
+            float(value) * scale_length for value in base["joint_shifters"]
+        )
+        self._mcp_offset = (
+            float(base["mcp_offset"][0]) * scale_x,
+            float(base["mcp_offset"][1]) * scale_y,
+        )
+        self._palm_horizontal_offset_px = (
+            float(base["palm_horizontal_offset_px"]) * scale_x
+        )
+
+    def _set_frame_resolution(self, frame_bgr: np.ndarray) -> None:
+        if self._adjustment_reference_resolution is None:
+            return
+        if frame_bgr.ndim < 2:
+            raise ValueError("Input frame must include height and width dimensions.")
+        height, width = frame_bgr.shape[:2]
+        frame_resolution = (int(width), int(height))
+        if frame_resolution != self._frame_resolution:
+            self._frame_resolution = frame_resolution
+            self._apply_resolution_adjustments()
 
     @staticmethod
     def _parse_segments(raw_segments: dict[str, Any]) -> dict[str, tuple[str, str]]:
@@ -593,6 +663,7 @@ class DLCAngleProcessor:
         raw_keypoints: dict[str, tuple[float, float, float]],
         inference_ms: float | None = None,
     ) -> tuple[dict[str, Any], np.ndarray]:
+        self._set_frame_resolution(frame_bgr)
         tracked_keypoints = self._track_keypoints(raw_keypoints)
         segments = self._segments_from_keypoints(tracked_keypoints)
         angles = self._compute_angles(segments)

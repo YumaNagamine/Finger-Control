@@ -212,6 +212,9 @@ class RealtimeJointAngleSource:
         self._runtime_config: dict | None = None
         self._overlay_recorder: OverlayVideoRecorder | None = None
         self._latest_lock = threading.Lock()
+        self._latest_preview: np.ndarray | None = None
+        self._latest_preview_frame_index = -1
+        self._latest_preview_is_overlay = False
         self._latest_overlay: np.ndarray | None = None
         self._latest_measurement: JointAngleMeasurement | None = None
 
@@ -256,6 +259,19 @@ class RealtimeJointAngleSource:
             if self._latest_overlay is None:
                 return None
             return self._latest_overlay.copy()
+
+    @property
+    def latest_preview(self) -> tuple[int, bool, np.ndarray] | None:
+        """Return the newest camera frame and whether DLC has rendered it."""
+
+        with self._latest_lock:
+            if self._latest_preview is None:
+                return None
+            return (
+                self._latest_preview_frame_index,
+                self._latest_preview_is_overlay,
+                self._latest_preview.copy(),
+            )
 
     @property
     def latest_measurement(self) -> JointAngleMeasurement | None:
@@ -577,6 +593,9 @@ class RealtimeJointAngleSource:
             held_last=held_last,
         )
         with self._latest_lock:
+            self._latest_preview = overlay.copy()
+            self._latest_preview_frame_index = int(frame_index)
+            self._latest_preview_is_overlay = True
             self._latest_overlay = overlay.copy()
             self._latest_measurement = measurement
         return measurement
@@ -592,6 +611,9 @@ class RealtimeJointAngleSource:
             self._calibration = None
             self.reset_temporal_history()
             with self._latest_lock:
+                self._latest_preview = None
+                self._latest_preview_frame_index = -1
+                self._latest_preview_is_overlay = False
                 self._latest_overlay = None
                 self._latest_measurement = None
             if capture is not None:
