@@ -1,0 +1,14 @@
+{
+  "dataset_path": "artifacts/awac_offline_trial_v3_20261028/dataset/legacy_awac_transitions.npz",
+  "metadata_path": "artifacts/awac_offline_trial_v3_20261028/dataset/legacy_awac_transition_metadata.jsonl",
+  "c3_checkpoint": "artifacts/bc_pretraining_v2_20261028/runs/output_tanh_wide_standard_C3_real_621/seed_7/checkpoint.pt",
+  "c4_checkpoint": "artifacts/bc_pretraining_v2_20261028/runs/output_tanh_wide_standard_C4_ABC_real_621/seed_7/checkpoint.pt",
+  "unseen_evaluation_path": "artifacts/bc_pretraining_v2_20261028/evaluation_datasets/eval_A_independent_passive_reachable.npz",
+  "output_dir": "artifacts/awac_advantage_diagnostic_v1_20261028",
+  "n_steps": 1000,
+  "steps_per_epoch": 100,
+  "batch_size": 64,
+  "seed": 20261028,
+  "reward_shuffle_seed": 20261029,
+  "diagnostic_policy_samples": 32
+}

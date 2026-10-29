@@ -1,0 +1,11 @@
+{
+  "dataset_path": "artifacts/awac_offline_trial_v3_20261028/dataset/legacy_awac_transitions.npz",
+  "c3_checkpoint": "artifacts/bc_pretraining_v2_20261028/runs/output_tanh_wide_standard_C3_real_621/seed_7/checkpoint.pt",
+  "c4_checkpoint": "artifacts/bc_pretraining_v2_20261028/runs/output_tanh_wide_standard_C4_ABC_real_621/seed_7/checkpoint.pt",
+  "output_dir": "artifacts/awac_offline_trial_v3_20261028/training",
+  "minimum_real_transitions": 200,
+  "n_steps": 1000,
+  "steps_per_epoch": 100,
+  "batch_size": 64,
+  "seed": 20261028
+}

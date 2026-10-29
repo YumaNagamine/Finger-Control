@@ -1,0 +1,51 @@
+{
+  "schema_version": 2,
+  "experiment_version": "bc_c3_c4_v2_20261028",
+  "model": {
+    "observation_dim": 6,
+    "hidden_units": [128, 128],
+    "action_dim": 6,
+    "hidden_activation": "relu",
+    "primary_output_mode": "linear_standard",
+    "wide_tanh_std_multiplier": 6.0,
+    "safety_action_limits_embedded": false
+  },
+  "training": {
+    "seeds": [7, 17, 29],
+    "learning_rate": 0.0003,
+    "batch_size": 128,
+    "gradient_updates": 1500,
+    "evaluation_interval": 100,
+    "physics_batch_fraction": 0.5,
+    "optimizer": "adam"
+  },
+  "real_data_curve": {
+    "pair_counts": [50, 100, 200, 400, 621],
+    "selection": "nested_family_session_round_robin_with_temporal_farthest_order"
+  },
+  "teacher": {
+    "pairs_per_method": 400,
+    "methods": ["A_trajectory_near", "B_model_domain", "C_passive_reachable"],
+    "training_seed": 20261028,
+    "minimum_method_a_novelty_deg": 0.02,
+    "passive_neighbor_count": 12,
+    "passive_training_families": [
+      "FDSFlexion", "FullFlexion", "MCPFlexion", "MIddleFlexion", "ShallowFlexion"
+    ]
+  },
+  "evaluation": {
+    "independent_model_domain_pairs": 512,
+    "independent_passive_reachable_pairs": 512,
+    "trajectory_near_pairs": 256,
+    "seed_model_domain": 20261101,
+    "seed_passive_reachable": 20261102,
+    "seed_trajectory_near": 20261103,
+    "legacy_ood_families": ["Edinburgh", "FullExtension"]
+  },
+  "method_comparison_real_pairs": 100,
+  "output_mode_comparison_real_pairs": 621,
+  "awac_transfer": {
+    "full_observation_dim": 18,
+    "bc_feature_indices": [0, 1, 2, 3, 4, 5]
+  }
+}
