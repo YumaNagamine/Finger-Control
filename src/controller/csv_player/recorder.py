@@ -18,7 +18,7 @@ def _format(value: object) -> object:
 
 
 class ControlTraceWriter:
-    """Write one wide control/force row per control tick."""
+    """Write one wide control/force row per supplied sample."""
 
     def __init__(
         self,

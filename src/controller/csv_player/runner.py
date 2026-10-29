@@ -11,6 +11,10 @@ from controller.csv_player.force_estimator import CalibratedForceEstimator
 from controller.csv_player.recorder import ControlTraceWriter
 from controller.csv_player.speed_controller import SpeedController
 from controller.csv_player.trajectory import ExcursionTrajectory
+from controller.rl.action_schedule import (
+    INTERPOLATED_PLAYBACK_MODE,
+    PLAYBACK_MODES,
+)
 from controller.servo.hardware_session import ServoHardwareSession
 from controller.servo_mapping import TENDONS
 
@@ -66,6 +70,9 @@ class PlaybackConfig:
     return_timeout_s: float = 5.0
     return_stable_frames: int = 3
     hard_force_limits_n_by_tendon: Mapping[str, float] | None = None
+    playback_mode: str = INTERPOLATED_PLAYBACK_MODE
+    decision_hz: float = 5.0
+    control_period_tolerance_fraction: float = 0.25
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.control_hz) or self.control_hz <= 0.0:
@@ -80,6 +87,21 @@ class PlaybackConfig:
             raise ValueError("return settings are invalid")
         if self.return_stable_frames <= 0:
             raise ValueError("return_stable_frames must be positive")
+        if self.playback_mode not in PLAYBACK_MODES:
+            raise ValueError(
+                f"playback_mode must be one of {sorted(PLAYBACK_MODES)}"
+            )
+        if not math.isfinite(self.decision_hz) or self.decision_hz <= 0.0:
+            raise ValueError("decision_hz must be finite and positive")
+        if self.decision_hz > self.control_hz:
+            raise ValueError("decision_hz must not exceed control_hz")
+        if (
+            not math.isfinite(self.control_period_tolerance_fraction)
+            or self.control_period_tolerance_fraction < 0.0
+        ):
+            raise ValueError(
+                "control_period_tolerance_fraction must be finite and non-negative"
+            )
         if self.hard_force_limits_n_by_tendon is not None:
             missing = [
                 tendon

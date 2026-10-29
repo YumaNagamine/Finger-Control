@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from controller.csv_player.encoder_calibration import EncoderExcursionCalibration
 from controller.csv_player.encoder_runner import EncoderPositionTrajectoryRunner
@@ -11,6 +11,8 @@ from controller.csv_player.force_estimator import CalibratedForceEstimator
 from controller.csv_player.recorder import ControlTraceWriter
 from controller.csv_player.runner import PlaybackConfig
 from controller.csv_player.trajectory import ExcursionTrajectory
+from controller.rl.raw_event_logger import AsyncRawEventLogger, RawLoggerStats
+from controller.rl.action_safety_filter import ActionSafetyFilter
 from controller.servo.hardware_session import ServoHardwareSession
 from controller.servo_mapping import (
     ENCODER_SENSOR_IDS_BY_SERVO_ID,
@@ -31,6 +33,9 @@ def build_encoder_playback_config(
     return_timeout_s: float = 5.0,
     return_stable_frames: int = 3,
     hard_force_limits_n_by_tendon: Mapping[str, float] | None = None,
+    playback_mode: str = "interpolated",
+    decision_hz: float = 5.0,
+    control_period_tolerance_fraction: float = 0.25,
 ) -> PlaybackConfig:
     """Build the common trajectory settings, including calibrated return tolerance."""
 
@@ -44,6 +49,9 @@ def build_encoder_playback_config(
         return_timeout_s=return_timeout_s,
         return_stable_frames=return_stable_frames,
         hard_force_limits_n_by_tendon=hard_force_limits_n_by_tendon,
+        playback_mode=playback_mode,
+        decision_hz=decision_hz,
+        control_period_tolerance_fraction=control_period_tolerance_fraction,
     )
 
 
@@ -62,7 +70,22 @@ class EncoderPlaybackService:
         config: PlaybackConfig,
         record_force: bool = True,
         on_sample: Callable[[dict[str, Any]], None] | None = None,
+        on_playback_clock: Callable[[float, float, bool], None] | None = None,
         stop_event: Any | None = None,
+        force_quit_event: Any | None = None,
+        raw_event_logger: AsyncRawEventLogger | None = None,
+        raw_event_path: Path | None = None,
+        action_safety_filter: ActionSafetyFilter | None = None,
+        start_state_validator: (
+            Callable[[Any, Mapping[int, float]], Mapping[str, Any]] | None
+        ) = None,
+        feedback_action_provider: (
+            Callable[[float, tuple[float, ...]], Sequence[float]] | None
+        ) = None,
+        joint_safety_state_provider: (
+            Callable[[], tuple[Mapping[str, float | None], float | None] | None]
+            | None
+        ) = None,
     ) -> None:
         self.trajectory = trajectory
         self.calibration = calibration
@@ -71,7 +94,26 @@ class EncoderPlaybackService:
         self.config = config
         self.record_force = bool(record_force)
         self.on_sample = on_sample
+        self.on_playback_clock = on_playback_clock
         self.stop_event = stop_event
+        self.force_quit_event = force_quit_event
+        self.action_safety_filter = action_safety_filter
+        self.start_state_validator = start_state_validator
+        self.feedback_action_provider = feedback_action_provider
+        self.joint_safety_state_provider = joint_safety_state_provider
+        if raw_event_logger is not None and raw_event_path is not None:
+            raise ValueError(
+                "Provide raw_event_logger or raw_event_path, not both"
+            )
+        self.raw_event_logger = raw_event_logger
+        self._owns_raw_event_logger = False
+        if self.raw_event_logger is None and raw_event_path is not None:
+            self.raw_event_logger = AsyncRawEventLogger(
+                raw_event_path,
+                run_id=run_id,
+            )
+            self._owns_raw_event_logger = True
+        self.raw_logger_stats: RawLoggerStats | None = None
         self.recorder = ControlTraceWriter(
             trace_path,
             SERVO_IDS_BY_TENDON,
@@ -107,7 +149,14 @@ class EncoderPlaybackService:
             recorder=self.recorder,
             force_estimator=force_estimator,
             on_sample=self.on_sample,
+            on_playback_clock=self.on_playback_clock,
             stop_event=self.stop_event,
+            force_quit_event=self.force_quit_event,
+            raw_event_logger=self.raw_event_logger,
+            action_safety_filter=self.action_safety_filter,
+            start_state_validator=self.start_state_validator,
+            feedback_action_provider=self.feedback_action_provider,
+            joint_safety_state_provider=self.joint_safety_state_provider,
         )
         runner.run()
 
@@ -116,3 +165,5 @@ class EncoderPlaybackService:
             return
         self._closed = True
         self.recorder.close()
+        if self._owns_raw_event_logger and self.raw_event_logger is not None:
+            self.raw_logger_stats = self.raw_event_logger.close()
