@@ -40,6 +40,13 @@ def _finite(value: Any, field_name: str) -> float:
     return number
 
 
+def _sign(value: Any, field_name: str) -> float:
+    number = _finite(value, field_name)
+    if number not in (-1.0, 1.0):
+        raise ValueError(f"{field_name} must be either -1 or 1")
+    return number
+
+
 def _servo_id(value: Any, field_name: str = "servo_id") -> int:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be an integer")
@@ -213,7 +220,7 @@ def save_torque_intercept_calibration(
 def load_encoder_calibration_positions(
     path: Path | str = DEFAULT_ENCODER_POSITION_PATH,
 ) -> dict[int, dict[str, Any]]:
-    """Load remembered magnetic-encoder positions for future automatic calibration."""
+    """Load remembered magnetic-encoder return positions."""
 
     position_path = Path(path)
     if not position_path.is_file():
@@ -241,6 +248,9 @@ def load_encoder_calibration_positions(
         record["encoder_position_deg"] = _finite(
             record.get("encoder_position_deg"), "encoder_position_deg"
         )
+        for key in ("encoder_direction", "control_sign"):
+            if key in record:
+                record[key] = _sign(record[key], key)
         records[servo_id] = record
     return records
 
@@ -264,6 +274,9 @@ def save_encoder_calibration_positions(
         record["encoder_position_deg"] = _finite(
             record.get("encoder_position_deg"), "encoder_position_deg"
         )
+        for key in ("encoder_direction", "control_sign"):
+            if key in record:
+                record[key] = _sign(record[key], key)
         channels[str(servo_id)] = record
 
     payload = {

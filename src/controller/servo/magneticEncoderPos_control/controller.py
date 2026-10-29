@@ -38,6 +38,7 @@ class MagneticEncoderPositionControlConfig:
     min_position_deg: Optional[float] = None
     max_position_deg: Optional[float] = None
     control_sign: float = 1.0
+    allow_multiturn_uncertain: bool = False
 
     def __post_init__(self) -> None:
         values = (
@@ -79,19 +80,24 @@ def encoder_position_from_sample(
     sample: Mapping[str, Any],
     *,
     encoder_direction: float = 1.0,
+    allow_multiturn_uncertain: bool = False,
 ) -> float:
     """Return the continuous encoder position used by the control loop.
 
     The AS5048A firmware exposes ``relative_multi_turn_deg`` relative to its
     configured encoder zero.  The single-turn ``relative_deg`` field is not a
     safe fallback for position control because it wraps at the revolution
-    boundary.
+    boundary. ``MULTITURN_UNCERTAIN`` is accepted only when explicitly enabled
+    by the caller and a finite continuous multi-turn angle is still present.
     """
 
     if encoder_direction not in (-1.0, 1.0):
         raise ValueError("encoder_direction must be either -1 or 1")
     status = str(sample.get("status", "")).strip().upper()
-    if status != "OK":
+    allowed_statuses = {"OK"}
+    if allow_multiturn_uncertain:
+        allowed_statuses.add("MULTITURN_UNCERTAIN")
+    if status not in allowed_statuses:
         raise MagneticEncoderPositionSafetyError(
             f"Magnetic encoder status is not safe for position control: {status or 'MISSING'}"
         )
@@ -192,7 +198,11 @@ class MagneticEncoderPositionPIDController:
             raise MagneticEncoderPositionSafetyError(
                 "Magnetic encoder feedback contains a non-finite value"
             )
-        if str(feedback.status).strip().upper() != "OK":
+        status = str(feedback.status).strip().upper()
+        allowed_statuses = {"OK"}
+        if self.config.allow_multiturn_uncertain:
+            allowed_statuses.add("MULTITURN_UNCERTAIN")
+        if status not in allowed_statuses:
             raise MagneticEncoderPositionSafetyError(
                 f"Magnetic encoder status is not safe: {feedback.status}"
             )

@@ -33,6 +33,7 @@ TARGET_PLOT_COLOR = "#d84315"
 POLL_INTERVAL_MS = 33
 PLOT_INTERVAL_MS = 100
 PLOT_AXIS_REFRESH_INTERVAL_S = 1.0
+PLOT_WINDOW_S = 30.0
 
 
 class SharedPlotPanel(ttk.LabelFrame):
@@ -67,7 +68,7 @@ class SharedPlotPanel(ttk.LabelFrame):
             axis.set_ylabel("force (N)", fontsize=9)
             axis.tick_params(labelsize=8)
             axis.grid(True, alpha=0.25, linewidth=0.7)
-            axis.set_xlim(0.0, 10.0)
+            axis.set_xlim(0.0, PLOT_WINDOW_S)
             axis.set_ylim(0.0, max(2.2, tendon_max * 1.2))
             actual_line, = axis.plot(
                 [],
@@ -138,7 +139,7 @@ class SharedPlotPanel(ttk.LabelFrame):
             samples = list(history[servo_id])
             if not samples:
                 continue
-            visible_start = samples[-1].received_at - 10.0
+            visible_start = samples[-1].received_at - PLOT_WINDOW_S
             samples = [
                 sample for sample in samples if sample.received_at >= visible_start
             ]
@@ -149,15 +150,21 @@ class SharedPlotPanel(ttk.LabelFrame):
             actual_line.set_data(times, actual)
             target_line.set_data(times, target)
 
-            end_time = max(times[-1], 10.0)
-            axis.set_xlim(max(0.0, end_time - 10.0), max(10.0, end_time))
+            end_time = max(times[-1], PLOT_WINDOW_S)
+            axis.set_xlim(
+                max(0.0, end_time - PLOT_WINDOW_S),
+                max(PLOT_WINDOW_S, end_time),
+            )
             low = min(0.0, min(actual) * 1.1)
             tendon_max = self._tendon_max_by_servo[servo_id]
             high = max(tendon_max * 1.1, max(actual + target + [0.0]) * 1.2)
             if high <= low:
                 high = low + 1.0
             desired_limits[servo_id] = (
-                (max(0.0, end_time - 10.0), max(10.0, end_time)),
+                (
+                    max(0.0, end_time - PLOT_WINDOW_S),
+                    max(PLOT_WINDOW_S, end_time),
+                ),
                 (low, high),
             )
             current_low, current_high = axis.get_ylim()
@@ -198,7 +205,7 @@ class SharedPlotPanel(ttk.LabelFrame):
             actual_line, target_line = self.plot_lines[servo_id]
             actual_line.set_data([], [])
             target_line.set_data([], [])
-            axis.set_xlim(0.0, 10.0)
+            axis.set_xlim(0.0, PLOT_WINDOW_S)
             axis.set_ylim(0.0, max(2.2, self._tendon_max_by_servo[servo_id] * 1.2))
             self.value_texts[servo_id].set_text("A --  |  T --")
         if redraw:
@@ -235,7 +242,7 @@ class MultiSignalPlotPanel(ttk.LabelFrame):
         self.axis.set_ylabel(ylabel, fontsize=9)
         self.axis.tick_params(labelsize=8)
         self.axis.grid(True, alpha=0.25, linewidth=0.7)
-        self.axis.set_xlim(0.0, 10.0)
+        self.axis.set_xlim(0.0, PLOT_WINDOW_S)
         self.lines = {}
         for servo_id, tendon in zip(SERVO_IDS, SERVO_NAMES):
             line, = self.axis.plot([], [], linewidth=1.5, label=f"ID{servo_id} {tendon}")
@@ -273,7 +280,7 @@ class MultiSignalPlotPanel(ttk.LabelFrame):
         )
         if latest_received_at is None:
             return
-        visible_start = latest_received_at - 10.0
+        visible_start = latest_received_at - PLOT_WINDOW_S
         for servo_id in SERVO_IDS:
             samples = [
                 sample
@@ -288,8 +295,11 @@ class MultiSignalPlotPanel(ttk.LabelFrame):
             self.lines[servo_id].set_data(times, values)
             all_values.extend(values)
 
-        end_time = max(latest_received_at - start_time, 10.0)
-        desired_xlim = (max(0.0, end_time - 10.0), max(10.0, end_time))
+        end_time = max(latest_received_at - start_time, PLOT_WINDOW_S)
+        desired_xlim = (
+            max(0.0, end_time - PLOT_WINDOW_S),
+            max(PLOT_WINDOW_S, end_time),
+        )
         desired_ylim = None
         urgent_rescale = False
         if all_values:
@@ -323,7 +333,7 @@ class MultiSignalPlotPanel(ttk.LabelFrame):
     def clear(self, *, redraw: bool = True) -> None:
         for line in self.lines.values():
             line.set_data([], [])
-        self.axis.set_xlim(0.0, 10.0)
+        self.axis.set_xlim(0.0, PLOT_WINDOW_S)
         if redraw:
             self.canvas.draw()
             self._last_full_draw_at = time.monotonic()
@@ -383,8 +393,10 @@ class ForceControlApp(tk.Tk):
         self._speed_buttons = {}
         self._calibration_row_vars = {}
         self._calibrate_all_button = None
+        self._return_all_calibration_button = None
         self._calibrate_buttons = {}
         self._remember_calibration_buttons = {}
+        self._return_calibration_buttons = {}
         self._target_buttons = []
         self._stop_servo_buttons = []
         self._build_variables()
@@ -405,7 +417,7 @@ class ForceControlApp(tk.Tk):
         self.ramp_duration_var = tk.StringVar(
             value=f"{self.config_model.ramp_duration_s:g}"
         )
-        self.kp_var = tk.StringVar(value="5.0")
+        self.kp_var = tk.StringVar(value="20.0")
         self.ki_var = tk.StringVar(value="0.0")
         self.kd_var = tk.StringVar(value="0.0")
         self.max_speed_var = tk.StringVar(value="500.0")
@@ -865,7 +877,10 @@ class ForceControlApp(tk.Tk):
             text=(
                 "Use Speed control to place the tendon(s) at the repeatable loose position, "
                 "set every speed to 0, then calibrate. The 1 s mean is treated as zero "
-                "torque; the fixed slope k is never changed."
+                "torque; the fixed slope k is never changed. Return uses the remembered "
+                "encoder position with max speed 100, a 1 degree tolerance, and a 720 "
+                "degree error limit. The current Control sign is saved when remembering "
+                "a position. STOP ALL cancels a return."
             ),
             wraplength=1350,
         ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
@@ -880,6 +895,14 @@ class ForceControlApp(tk.Tk):
         )
         all_calibration_button.pack(side="left")
         self._calibrate_all_button = all_calibration_button
+        return_all_button = ttk.Button(
+            actions,
+            text="Return all to remembered positions",
+            command=self._return_all_calibration_positions,
+            style="Control.TButton",
+        )
+        return_all_button.pack(side="left", padx=(8, 0))
+        self._return_all_calibration_button = return_all_button
         ttk.Label(
             actions,
             textvariable=self.calibration_status_var,
@@ -892,7 +915,7 @@ class ForceControlApp(tk.Tk):
             "ID", "Tendon", "Servo pos", "Encoder deg", "Delta theta deg",
             "k Nmm/deg", "b Nmm", "Remembered deg", "Actions",
         )
-        widths = (44, 74, 90, 110, 120, 110, 120, 120, 470)
+        widths = (44, 74, 90, 110, 120, 110, 120, 120, 700)
         for column, (header, width) in enumerate(zip(headers, widths)):
             table.columnconfigure(column, minsize=width)
             ttk.Label(table, text=header, style="TableHeader.TLabel").grid(
@@ -925,9 +948,17 @@ class ForceControlApp(tk.Tk):
                 command=lambda sid=servo_id: self._remember_calibration_position(sid),
                 style="Small.TButton",
             )
-            remember_button.pack(side="left")
+            remember_button.pack(side="left", padx=(0, 4))
+            return_button = ttk.Button(
+                actions,
+                text="Return to remembered position",
+                command=lambda sid=servo_id: self._return_calibration_position(sid),
+                style="Small.TButton",
+            )
+            return_button.pack(side="left")
             self._calibrate_buttons[servo_id] = calibrate_button
             self._remember_calibration_buttons[servo_id] = remember_button
+            self._return_calibration_buttons[servo_id] = return_button
 
     def _build_logger_widgets(self, parent) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1272,9 +1303,29 @@ class ForceControlApp(tk.Tk):
         )
 
     def _remember_calibration_position(self, servo_id: int) -> None:
+        try:
+            control_sign = float(self.control_sign_var.get())
+        except ValueError as exc:
+            self.session._emit(f"ERROR: remember encoder calibration position: {exc}")
+            return
         self._start_calibration_action(
-            lambda: self.session.remember_encoder_position_for_calibration(servo_id),
+            lambda: self.session.remember_encoder_position_for_calibration(
+                servo_id,
+                control_sign=control_sign,
+            ),
             "remember encoder calibration position",
+        )
+
+    def _return_calibration_position(self, servo_id: int) -> None:
+        self._start_calibration_action(
+            lambda: self.session.return_to_calibration_position(servo_id),
+            "return to remembered encoder position",
+        )
+
+    def _return_all_calibration_positions(self) -> None:
+        self._start_calibration_action(
+            self.session.return_all_to_calibration_positions,
+            "return all to remembered encoder positions",
         )
 
     def _stop_servo(self, servo_id: int) -> None:
@@ -1512,6 +1563,20 @@ class ForceControlApp(tk.Tk):
         self._calibrate_all_button.configure(
             state="normal" if all_calibration_reason is None else "disabled"
         )
+        calibration_states = self.session.calibration_state_snapshot()
+        all_positions_remembered = bool(calibration_states) and all(
+            calibration_states.get(servo_id, {}).get(
+                "has_remembered_encoder_position", False
+            )
+            for servo_id in SERVO_IDS
+        )
+        self._return_all_calibration_button.configure(
+            state=(
+                "normal"
+                if all_calibration_reason is None and all_positions_remembered
+                else "disabled"
+            )
+        )
         ready_ids = []
         for servo_id in SERVO_IDS:
             row_reason = (
@@ -1521,6 +1586,18 @@ class ForceControlApp(tk.Tk):
             row_state = "normal" if row_reason is None else "disabled"
             self._calibrate_buttons[servo_id].configure(state=row_state)
             self._remember_calibration_buttons[servo_id].configure(state=row_state)
+            has_remembered_position = bool(
+                calibration_states.get(servo_id, {}).get(
+                    "has_remembered_encoder_position", False
+                )
+            )
+            self._return_calibration_buttons[servo_id].configure(
+                state=(
+                    "normal"
+                    if row_reason is None and has_remembered_position
+                    else "disabled"
+                )
+            )
             if row_reason is None:
                 ready_ids.append(servo_id)
 

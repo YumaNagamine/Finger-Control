@@ -21,7 +21,17 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from statistics import median
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+)
 
 from controller.servo.torque_calibration.storage import (
     DEFAULT_ENCODER_POSITION_PATH,
@@ -30,6 +40,14 @@ from controller.servo.torque_calibration.storage import (
     load_torque_intercept_calibration,
     save_encoder_calibration_positions,
     save_torque_intercept_calibration,
+)
+from controller.servo.magneticEncoderPos_control import (
+    MagneticEncoderPositionControlConfig,
+    MagneticEncoderPositionFeedback,
+    MagneticEncoderPositionPIDController,
+    PID,
+    PIDConfig,
+    encoder_position_from_sample,
 )
 
 
@@ -51,6 +69,12 @@ CALIBRATION_SAMPLE_WAIT_S = 3.0
 COMMUNICATION_STATS_WINDOW_S = 5.0
 COMMUNICATION_STATS_MAX_SAMPLES = 1024
 VALID_ENCODER_STATUSES = {"OK", "MULTITURN_UNCERTAIN"}
+CALIBRATION_RETURN_KP = 1.0
+CALIBRATION_RETURN_MAX_SPEED = 100.0
+CALIBRATION_RETURN_HARD_ERROR_DEG = 720.0
+CALIBRATION_RETURN_TOLERANCE_DEG = 1.0
+CALIBRATION_RETURN_SETTLE_S = 0.25
+CALIBRATION_RETURN_TIMEOUT_S = 60.0
 FEEDBACK_HISTORY_DURATION_S = 0.5
 FEEDBACK_HISTORY_MAX_SAMPLES = 128
 MONITORING_FORCE_JUMP_THRESHOLD_N = 2.0
@@ -265,6 +289,7 @@ class _ServoState:
     active: bool = False
     latest_force_n: Optional[float] = None
     latest_position: Optional[float] = None
+    latest_feedback: Optional[dict] = None
     pending_monitoring_jump: Optional[dict] = None
     pending_monitoring_jump_received_at: Optional[float] = None
     last_monitoring_jump_log_at: float = 0.0
@@ -435,6 +460,9 @@ class ForceControlSession:
         self._encoder_position_path = DEFAULT_ENCODER_POSITION_PATH
         self._zero_offsets: Dict[int, dict] = {}
         self._encoder_calibration_positions: Dict[int, dict] = {}
+        self._calibration_return_cancel_event: Optional[threading.Event] = None
+        self._calibration_return_servo_id: Optional[int] = None
+        self._calibration_return_all_cancel_event: Optional[threading.Event] = None
         self._connect_cancel_event: Optional[threading.Event] = None
 
     @property
@@ -607,6 +635,7 @@ class ForceControlSession:
                         if servo_id not in positions
                         else float(positions[servo_id]["encoder_position_deg"])
                     ),
+                    "has_remembered_encoder_position": servo_id in positions,
                 }
                 for servo_id, state in self._states.items()
             }
@@ -1213,6 +1242,81 @@ class ForceControlSession:
         with self._feedback_lock:
             return self._feedback_unlocked()
 
+    def force_feedback_snapshot(self) -> dict:
+        """Return a detached force/target snapshot in Force Control tendon order."""
+
+        sampled_at = time.monotonic()
+        with self._lock:
+            states = dict(self._states)
+            errors = dict(self._feedback_errors)
+            feedback = {
+                servo_id: (
+                    None
+                    if state.latest_feedback is None
+                    else dict(state.latest_feedback)
+                )
+                for servo_id, state in states.items()
+            }
+            connection = {
+                "connected": self._connected,
+                "armed": self._armed,
+                "running": self._running,
+                "faulted": self._faulted,
+            }
+
+        ordered = []
+        for servo_id, tendon in zip(SERVO_IDS, SERVO_NAMES):
+            state = states.get(servo_id)
+            item = feedback.get(servo_id)
+            servo_age_s = (
+                None
+                if item is None
+                else max(0.0, sampled_at - item["servo_received_at"])
+            )
+            encoder_age_s = (
+                None
+                if item is None
+                else max(0.0, sampled_at - item["encoder_received_at"])
+            )
+            ordered.append(
+                {
+                    "tendon": tendon,
+                    "servo_id": servo_id,
+                    "force_n": None if item is None else item["force_n"],
+                    "target_force_n": (
+                        None if state is None else float(state.target_force_n)
+                    ),
+                    "servo_position": None if item is None else item["position"],
+                    "encoder_position_deg": (
+                        None if item is None else item["encoder_position_deg"]
+                    ),
+                    "servo_age_s": servo_age_s,
+                    "encoder_age_s": encoder_age_s,
+                    "servo_received_at": (
+                        None if item is None else item["servo_received_at"]
+                    ),
+                    "encoder_received_at": (
+                        None if item is None else item["encoder_received_at"]
+                    ),
+                    "sync_age_s": None if item is None else item["sync_age_s"],
+                    "fresh": bool(
+                        servo_age_s is not None
+                        and encoder_age_s is not None
+                        and servo_age_s <= self.config.feedback_timeout_s
+                        and encoder_age_s <= self.config.feedback_timeout_s
+                    ),
+                    "active": bool(state is not None and state.active),
+                    "feedback_error": errors.get(servo_id),
+                }
+            )
+
+        return {
+            "tendon_order": SERVO_NAMES,
+            "sampled_at_monotonic_s": sampled_at,
+            "connection": connection,
+            "tendons": tuple(ordered),
+        }
+
     def _filter_monitoring_jump(
         self,
         state: _ServoState,
@@ -1395,23 +1499,26 @@ class ForceControlSession:
                 self._emit(jump_message)
             force_n = float(snapshot["force_n"])
             position = float(telemetry["positions"][servo_index])
-            with self._lock:
-                if self._states.get(state.servo_id) is not state:
-                    raise RuntimeError("Session changed during feedback capture")
-                state.previous_snapshot = snapshot
-                state.latest_force_n = force_n
-                state.latest_position = position
-            result[state.servo_id] = {
+            feedback_item = {
                 "force_n": force_n,
                 "position": position,
                 "encoder_position_deg": float(snapshot["encoder_angle_deg"]),
                 "angle_delta_deg": float(snapshot["angle_delta_deg"]),
+                "servo_received_at": float(servo_received_at),
                 "encoder_received_at": float(encoder_received_at),
                 "multiturn_angle_model": bool(snapshot["multiturn_angle_model"]),
                 "servo_age_s": servo_age_s,
                 "encoder_age_s": encoder_age_s,
                 "sync_age_s": sync_age_s,
             }
+            with self._lock:
+                if self._states.get(state.servo_id) is not state:
+                    raise RuntimeError("Session changed during feedback capture")
+                state.previous_snapshot = snapshot
+                state.latest_force_n = force_n
+                state.latest_position = position
+                state.latest_feedback = feedback_item
+            result[state.servo_id] = feedback_item
         self._update_feedback_errors(
             feedback_errors,
             all_feedback_failed=bool(states) and not result,
@@ -1652,9 +1759,14 @@ class ForceControlSession:
         finally:
             self._calibration_lock.release()
 
-    def remember_encoder_position_for_calibration(self, servo_id: int) -> dict:
-        """Persist the current magnetic-encoder position for future auto calibration."""
+    def remember_encoder_position_for_calibration(
+        self, servo_id: int, *, control_sign: float = 1.0
+    ) -> dict:
+        """Persist the current magnetic-encoder position for later return."""
 
+        control_sign = float(control_sign)
+        if control_sign not in (-1.0, 1.0):
+            raise ValueError("control_sign must be either -1 or 1")
         if not self._calibration_lock.acquire(blocking=False):
             raise RuntimeError("Another torque calibration action is already in progress")
         try:
@@ -1669,10 +1781,14 @@ class ForceControlSession:
                 raise RuntimeError(f"Remember calibration position stopped: {reason}")
             if not item["multiturn_angle_model"]:
                 raise RuntimeError("Multi-turn magnetic-encoder position is unavailable")
+            model = getattr(state, "model", {})
+            encoder_direction = float(model.get("encoder_direction", 1.0))
             record = {
                 "servo_id": int(servo_id),
                 "encoder_sensor_id": int(state.sensor_id),
                 "encoder_position_deg": float(item["encoder_position_deg"]),
+                "encoder_direction": -1.0 if encoder_direction < 0.0 else 1.0,
+                "control_sign": control_sign,
                 "recorded_at_unix_s": time.time(),
             }
             with self._lock:
@@ -1688,6 +1804,241 @@ class ForceControlSession:
             return dict(record)
         finally:
             self._calibration_lock.release()
+
+    def _calibration_position_feedback(
+        self, state: _ServoState, now: float
+    ) -> tuple[MagneticEncoderPositionFeedback, float]:
+        servo_index = self._servo_index.get(state.servo_id)
+        if servo_index is None:
+            raise RuntimeError(f"Servo ID {state.servo_id} is not configured")
+        with self._feedback_history_lock:
+            servo_history = list(self._servo_feedback_history)
+            encoder_history = list(
+                self._encoder_feedback_histories.get(state.sensor_id, ())
+            )
+        synchronized, reason = self._synchronized_feedback_pair(
+            state.servo_id,
+            state.sensor_id,
+            servo_index,
+            now,
+            sync_tolerance_s=FEEDBACK_SYNC_TOLERANCE_S,
+            feedback_timeout_s=self.config.feedback_timeout_s,
+            servo_history=servo_history,
+            encoder_history=encoder_history,
+        )
+        if synchronized is None:
+            raise RuntimeError(reason or "Synchronized position feedback is unavailable")
+        servo_entry, encoder_entry, _ = synchronized
+        servo_received_at, telemetry = servo_entry
+        encoder_received_at, sample = encoder_entry
+        encoder_status = str(sample.get("status", "")).strip().upper()
+        if encoder_status not in VALID_ENCODER_STATUSES:
+            raise RuntimeError(
+                "Magnetic-encoder position return requires a valid multi-turn status; "
+                f"received {encoder_status or 'MISSING'}"
+            )
+        if not telemetry.get("valid", [])[servo_index]:
+            raise RuntimeError(f"Servo telemetry is invalid for ID {state.servo_id}")
+        encoder_direction = (
+            -1.0 if float(state.model["encoder_direction"]) < 0.0 else 1.0
+        )
+        position_deg = encoder_position_from_sample(
+            sample,
+            encoder_direction=encoder_direction,
+            allow_multiturn_uncertain=True,
+        )
+        feedback = MagneticEncoderPositionFeedback(
+            position_deg=position_deg,
+            servo_age_s=max(0.0, now - servo_received_at),
+            encoder_age_s=max(0.0, now - encoder_received_at),
+            status=encoder_status,
+        )
+        return feedback, float(encoder_received_at)
+
+    def return_to_calibration_position(self, servo_id: int) -> dict:
+        """Move one disarmed servo to its remembered AS5048A multi-turn position."""
+
+        servo_id = int(servo_id)
+        if not self._calibration_lock.acquire(blocking=False):
+            raise RuntimeError("Another torque calibration action is already in progress")
+        cancel_event = threading.Event()
+        servo = None
+        cancelled = False
+        try:
+            state = self._validate_calibration_ready(servo_id)
+            with self._lock:
+                record = dict(self._encoder_calibration_positions.get(servo_id, {}))
+            if not record:
+                raise RuntimeError(f"No remembered calibration position for servo {servo_id}")
+            if int(record.get("encoder_sensor_id", state.sensor_id)) != state.sensor_id:
+                raise RuntimeError(
+                    f"Remembered encoder channel does not match servo {servo_id}'s calibration"
+                )
+            saved_encoder_direction = (
+                -1.0
+                if float(record.get("encoder_direction", state.model["encoder_direction"])) < 0.0
+                else 1.0
+            )
+            active_encoder_direction = (
+                -1.0 if float(state.model["encoder_direction"]) < 0.0 else 1.0
+            )
+            target_position_deg = (
+                float(record["encoder_position_deg"])
+                * active_encoder_direction
+                / saved_encoder_direction
+            )
+            control_sign = float(record.get("control_sign", 1.0))
+            if control_sign not in (-1.0, 1.0):
+                raise ValueError("Remembered control_sign must be either -1 or 1")
+            controller = MagneticEncoderPositionPIDController(
+                PID(
+                    PIDConfig(
+                        kp=CALIBRATION_RETURN_KP,
+                        ki=0.0,
+                        kd=0.0,
+                        output_min=-CALIBRATION_RETURN_MAX_SPEED,
+                        output_max=CALIBRATION_RETURN_MAX_SPEED,
+                        integral_min=-CALIBRATION_RETURN_MAX_SPEED,
+                        integral_max=CALIBRATION_RETURN_MAX_SPEED,
+                    )
+                ),
+                MagneticEncoderPositionControlConfig(
+                    target_position_deg=target_position_deg,
+                    max_speed=CALIBRATION_RETURN_MAX_SPEED,
+                    hard_position_error_deg=CALIBRATION_RETURN_HARD_ERROR_DEG,
+                    max_feedback_age_s=self.config.feedback_timeout_s,
+                    control_sign=control_sign,
+                    allow_multiturn_uncertain=True,
+                ),
+            )
+            with self._lock:
+                self._calibration_return_cancel_event = cancel_event
+                self._calibration_return_servo_id = servo_id
+                servo = self._servo
+            if servo is None:
+                raise RuntimeError("Servo controller is not connected")
+
+            self._emit(
+                f"Returning servo {servo_id} to remembered encoder position "
+                f"{target_position_deg:.4f} deg..."
+            )
+            deadline = time.monotonic() + CALIBRATION_RETURN_TIMEOUT_S
+            reached_since = None
+            period_s = 1.0 / self.config.control_hz
+            next_tick = time.monotonic()
+            while time.monotonic() < deadline:
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+                self._validate_calibration_ready(servo_id)
+                now = time.monotonic()
+                feedback, _ = self._calibration_position_feedback(state, now)
+                output = controller.step(feedback, now=now)
+                within_tolerance = (
+                    abs(output.position_error_deg)
+                    <= CALIBRATION_RETURN_TOLERANCE_DEG
+                )
+                speed_command = 0 if within_tolerance else output.speed_command
+                with self._command_lock:
+                    with self._lock:
+                        if cancel_event.is_set():
+                            cancelled = True
+                            break
+                        if not self._connected or self._servo is not servo:
+                            raise RuntimeError("Connection changed during position return")
+                    servo.send_speed_by_id(servo_id, speed_command)
+
+                if within_tolerance:
+                    if reached_since is None:
+                        reached_since = now
+                    elif now - reached_since >= CALIBRATION_RETURN_SETTLE_S:
+                        self._emit(
+                            f"Servo {servo_id} returned to remembered encoder position "
+                            f"{target_position_deg:.4f} deg "
+                            f"(error {output.position_error_deg:+.4f} deg)."
+                        )
+                        return dict(record)
+                else:
+                    reached_since = None
+
+                next_tick += period_s
+                sleep_s = next_tick - time.monotonic()
+                if sleep_s > 0.0:
+                    cancel_event.wait(sleep_s)
+                else:
+                    next_tick = time.monotonic()
+            if cancelled:
+                self._emit(f"Return to calibration position for servo {servo_id} cancelled.")
+                return {**record, "cancelled": True}
+            raise TimeoutError(
+                f"Servo {servo_id} did not reach remembered position within "
+                f"{CALIBRATION_RETURN_TIMEOUT_S:g} s"
+            )
+        finally:
+            if servo is not None:
+                try:
+                    with self._command_lock:
+                        servo.send_speed_by_id(servo_id, 0)
+                except Exception as exc:
+                    self._emit(
+                        f"WARNING: failed to stop servo {servo_id} after position return: {exc}"
+                    )
+            with self._lock:
+                if self._calibration_return_cancel_event is cancel_event:
+                    self._calibration_return_cancel_event = None
+                    self._calibration_return_servo_id = None
+            self._calibration_lock.release()
+
+    def return_all_to_calibration_positions(self) -> Dict[int, dict]:
+        """Return every servo sequentially using the existing safe return path."""
+
+        with self._lock:
+            positions = dict(self._encoder_calibration_positions)
+            states = dict(self._states)
+        missing = [servo_id for servo_id in SERVO_IDS if servo_id not in positions]
+        if missing:
+            raise RuntimeError(
+                "Remember positions for every servo before Return All; missing IDs: "
+                + ", ".join(str(servo_id) for servo_id in missing)
+            )
+        for servo_id in SERVO_IDS:
+            state = states.get(servo_id)
+            if state is None:
+                raise RuntimeError(f"Servo {servo_id} is not configured")
+            if int(positions[servo_id].get("encoder_sensor_id", state.sensor_id)) != state.sensor_id:
+                raise RuntimeError(
+                    f"Remembered encoder channel does not match servo {servo_id}'s calibration"
+                )
+            self._validate_calibration_ready(servo_id)
+
+        cancel_event = threading.Event()
+        with self._lock:
+            if self._calibration_return_all_cancel_event is not None:
+                raise RuntimeError("Another Return All action is already in progress")
+            self._calibration_return_all_cancel_event = cancel_event
+
+        results: Dict[int, dict] = {}
+        try:
+            self._emit("Returning all servos to remembered encoder positions...")
+            for servo_id in SERVO_IDS:
+                if cancel_event.is_set():
+                    break
+                result = self.return_to_calibration_position(servo_id)
+                results[servo_id] = result
+                if result.get("cancelled"):
+                    cancel_event.set()
+                    break
+            if cancel_event.is_set():
+                self._emit("Return All to remembered encoder positions cancelled.")
+            else:
+                self._emit("All servos returned to remembered encoder positions.")
+            return results
+        finally:
+            if cancel_event.is_set() or len(results) != len(SERVO_IDS):
+                self._send_zero_all()
+            with self._lock:
+                if self._calibration_return_all_cancel_event is cancel_event:
+                    self._calibration_return_all_cancel_event = None
 
     def capture_baseline(self, duration_s: float = 0.5) -> Dict[int, float]:
         if not self._calibration_lock.acquire(blocking=False):
@@ -1867,6 +2218,10 @@ class ForceControlSession:
 
     def stop_all(self) -> None:
         with self._lock:
+            if self._calibration_return_all_cancel_event is not None:
+                self._calibration_return_all_cancel_event.set()
+            if self._calibration_return_cancel_event is not None:
+                self._calibration_return_cancel_event.set()
             self._running = False
             self._armed = False
             for state in self._states.values():
@@ -1883,11 +2238,97 @@ class ForceControlSession:
                 state = self._states.get(int(servo_id))
                 if state is None:
                     raise ValueError(f"Unknown servo ID: {servo_id}")
+                if (
+                    self._calibration_return_servo_id == int(servo_id)
+                    and self._calibration_return_cancel_event is not None
+                ):
+                    self._calibration_return_cancel_event.set()
                 state.active = False
                 self._manual_speed_commands[int(servo_id)] = 0
                 servo = self._servo
             if servo is not None:
                 servo.send_speed_by_id(int(servo_id), 0)
+
+    def set_target_vector(
+        self,
+        target_force_n_by_tendon: Mapping[str, float],
+        *,
+        mode: str = "Step",
+        duration_s: float = 1.0,
+    ) -> tuple[float, ...]:
+        """Set all six tendon targets together in Force Control tendon order."""
+
+        if not isinstance(target_force_n_by_tendon, Mapping):
+            raise ValueError("target_force_n_by_tendon must be a mapping")
+        if set(target_force_n_by_tendon) != set(SERVO_NAMES):
+            raise ValueError(
+                "target_force_n_by_tendon must define exactly: "
+                + ", ".join(SERVO_NAMES)
+            )
+        if mode not in ("Step", "Ramp"):
+            raise ValueError("mode must be Step or Ramp")
+        duration = _finite_number(duration_s, "duration_s")
+        if duration <= 0.0:
+            raise ValueError("duration_s must be greater than zero")
+
+        targets = {
+            tendon: _finite_number(
+                target_force_n_by_tendon[tendon],
+                f"target_force_n_by_tendon[{tendon}]",
+            )
+            for tendon in SERVO_NAMES
+        }
+        for tendon, target in targets.items():
+            if (
+                target < self.config.min_target_force_n
+                or target > self.config.max_target_force_n
+            ):
+                raise ValueError(
+                    f"Target force for {tendon} must be between "
+                    f"{self.config.min_target_force_n:g} and "
+                    f"{self.config.max_target_force_n:g} N"
+                )
+
+        with self._lock:
+            if not self._connected:
+                raise RuntimeError("Connect before setting target forces")
+            if self._faulted:
+                raise RuntimeError("Disconnect and reconnect after a fault")
+            states_by_tendon = {
+                state.tendon: state for state in self._states.values()
+            }
+            if set(states_by_tendon) != set(SERVO_NAMES):
+                raise RuntimeError("All six tendon calibrations must be connected")
+
+            for tendon, target in targets.items():
+                state = states_by_tendon[tendon]
+                hard_limit = (
+                    state.controller.config.hard_force_limit_n
+                    if self._armed and state.controller is not None
+                    else self.config.hard_force_limits_n_by_tendon[tendon]
+                )
+                if target >= hard_limit:
+                    raise ValueError(
+                        f"Target force for {tendon} must be below its hard force limit "
+                        f"({hard_limit:g} N)"
+                    )
+
+            started_at = time.monotonic()
+            for tendon in SERVO_NAMES:
+                state = states_by_tendon[tendon]
+                target = targets[tendon]
+                if mode == "Step":
+                    state.target_force_n = target
+                    state.ramp_started_at = None
+                    state.ramp_start_n = target
+                    state.ramp_end_n = target
+                else:
+                    state.ramp_start_n = state.target_force_n
+                    state.ramp_end_n = target
+                    state.ramp_duration_s = duration
+                    state.ramp_started_at = started_at
+
+        return tuple(targets[tendon] for tendon in SERVO_NAMES)
 
     def set_target(self, servo_id: int, target_force_n: float, mode: str, duration_s: float) -> None:
         target = float(target_force_n)
@@ -2023,6 +2464,22 @@ class ForceControlSession:
                 with self._lock:
                     self._manual_feedback_recovering = bool(feedback_errors)
                 now = time.monotonic()
+                with self._lock:
+                    control_settings = {}
+                    for state in states:
+                        if self._states.get(state.servo_id) is not state:
+                            continue
+                        active = bool(
+                            self._running and self._armed and state.active
+                        )
+                        if active:
+                            self._update_ramp(state, now)
+                        control_settings[state.servo_id] = (
+                            active,
+                            state.controller if active else None,
+                            state.target_force_n,
+                            self._manual_speed_commands.get(state.servo_id, 0),
+                        )
                 commands: List[tuple] = []
                 for state in states:
                     item = feedback.get(state.servo_id)
@@ -2061,20 +2518,10 @@ class ForceControlSession:
                             f"Feedback recovered for ID {state.servo_id}; "
                             "resuming control."
                         )
-                    with self._lock:
-                        if self._states.get(state.servo_id) is not state:
-                            continue
-                        active = bool(self._running and self._armed and state.active)
-                        if active:
-                            self._update_ramp(state, now)
-                            controller = state.controller
-                            target_force_n = state.target_force_n
-                        else:
-                            controller = None
-                            target_force_n = state.target_force_n
-                            manual_speed = self._manual_speed_commands.get(
-                                state.servo_id, 0
-                            )
+                    settings = control_settings.get(state.servo_id)
+                    if settings is None:
+                        continue
+                    active, controller, target_force_n, manual_speed = settings
                     speed_command = 0
                     if active:
                         if controller is None:
@@ -2235,6 +2682,10 @@ class ForceControlSession:
             was_connected = self._connected or servo_transport is not None or encoder_transport is not None
             self._running = False
             self._armed = False
+            if self._calibration_return_all_cancel_event is not None:
+                self._calibration_return_all_cancel_event.set()
+            if self._calibration_return_cancel_event is not None:
+                self._calibration_return_cancel_event.set()
             stop_event.set()
             if connect_cancel_event is not None:
                 connect_cancel_event.set()

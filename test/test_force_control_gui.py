@@ -99,7 +99,7 @@ class ForceControlGuiConfigTest(unittest.TestCase):
                 "DI": 20.0,
                 "FDS": 35.0,
                 "FDP": 35.0,
-                "LU": 10.0,
+                "LU": 20.0,
                 "PI": 20.0,
             },
         )

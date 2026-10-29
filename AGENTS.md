@@ -21,3 +21,10 @@
 - For one-off commands from the current shell, use: `cmd.exe /d /s /c 'call "C:\Users\ynaga\anaconda3\condabin\conda.bat" activate FingerControl && python <arguments>'`
 - The expected interpreter is `C:\Users\ynaga\anaconda3\envs\FingerControl\python.exe`. Do not create or seek another environment unless this one fails.
 - Give users `cmd.exe` commands to run after activation unless they explicitly request PowerShell. Use `python -m pip`, never bare `pip`.
+
+## Servo hardware implementation
+
+- Use only the current servo implementation based on `third_party/ServoHardwareAPI` for all new work.
+- Treat the removed legacy `src/servo` package and imports such as `servo.control` as retired. Do not restore, reuse, or add new dependencies on them.
+- When an old controller or test still imports the retired package, migrate the required behavior to the current `controller.servo` / `third_party/ServoHardwareAPI` path or mark the legacy entry point for removal; do not repair it by recreating the old package.
+- The approved LU tendon hard-force limit is 20 N. Keep runtime configuration, tests, and experiment documentation consistent with this value unless the user explicitly approves a new calibrated limit.
